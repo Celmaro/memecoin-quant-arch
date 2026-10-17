@@ -62,6 +62,14 @@ def load_config():
     if m: cfg["COINSTATS_KEY"] = m.group(1)
     m = re.search(r"DexPaprika:\s*(api_[A-Za-z0-9_]+)", text)
     if m: cfg["DEXPAPRIKA_KEY"] = m.group(1)
+    m = re.search(r"Sol\.wales[^\n]*?:\s*(sw_[A-Za-z0-9_]+)", text)
+    if m: cfg["SOLWALES_KEY"] = m.group(1)
+    m = re.search(r"CabalSpy[^\n]*?:\s*([A-Za-z0-9_-]{20,})", text)
+    if m: cfg["CABALSPY_KEY"] = m.group(1)
+    m = re.search(r"MadeOnSol[^\n]*?:\s*(msk_[A-Za-z0-9_-]+)", text)
+    if m: cfg["MADEONSOL_KEY"] = m.group(1)
+    m = re.search(r"Solscan Pro JWT[^\n]*?:\s*(eyJ[A-Za-z0-9._-]+)", text)
+    if m: cfg["SOLSCAN_JWT"] = m.group(1)
     _cfg_cache = cfg
     return cfg
 
@@ -605,6 +613,106 @@ def ave_risk(mint):
         }
     except Exception:
         return None
+
+# --- NEW PROVIDERS (Oct 17 2026 audit — sol.wales/walletintel/solscan verified live) ---
+SOL_WALES = "https://sol.wales/api/v1"
+SOL_WALES_HEALTH = "https://sol.wales/api/health"  # NOTE: health lives at /api/health, not /api/v1/health (404)
+
+def sol_wales_health():
+    """Sol.wales health — VERIFIED live (x-api-key, 600/min w/ key)."""
+    try:
+        cfg = load_config()
+        key = cfg.get("SOLWALES_KEY")
+        hdrs = {"User-Agent": UA}
+        if key: hdrs["x-api-key"] = key
+        st, d = http_json(SOL_WALES_HEALTH, headers=hdrs)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+def sol_wales_traders(limit=10, source="discovered"):
+    """Sol.wales tracked whale wallets — VERIFIED live.
+    Returns [{address, label, sol, tokenCount, moves24h, moves7d, lastMoveAt}]."""
+    try:
+        cfg = load_config()
+        key = cfg.get("SOLWALES_KEY")
+        hdrs = {"User-Agent": UA}
+        if key: hdrs["x-api-key"] = key
+        st, d = http_json(f"{SOL_WALES}/traders?source={source}&limit={limit}", headers=hdrs)
+        return (d or {}).get("traders") or []
+    except Exception:
+        return []
+
+def sol_wales_moves_recent(limit=50):
+    """Newest moves across all tracked whale wallets — VERIFIED live.
+    Returns [{signature, at, kind, mint, amount, trader{address,label}}].
+    kinds: sol_in|sol_out|token_in|token_out|swap|other. THE whale tape poll."""
+    try:
+        cfg = load_config()
+        key = cfg.get("SOLWALES_KEY")
+        hdrs = {"User-Agent": UA}
+        if key: hdrs["x-api-key"] = key
+        st, d = http_json(f"{SOL_WALES}/moves/recent?limit={limit}", headers=hdrs)
+        return (d or {}).get("moves") or []
+    except Exception:
+        return []
+
+def walletintel_summary(wallet, max_tx=1000):
+    """WalletIntel free wallet PnL summary — VERIFIED (10 req/day, 24h cache).
+    Returns {total_realized_pnl_sol, win_rate, strategy, score, unique_tokens} or None."""
+    try:
+        st, d = http_json(f"https://api.walletintel.dev/wallet/{wallet}/summary?max_tx={max_tx}",
+                          timeout=60)
+        if isinstance(d, dict) and "error" not in d:
+            return d
+        return None
+    except Exception:
+        return None
+
+def walletintel_leaderboard(sort="score", limit=10):
+    """WalletIntel top-wallet leaderboard — VERIFIED live."""
+    try:
+        st, d = http_json(f"https://api.walletintel.dev/leaderboard?sort={sort}&limit={limit}")
+        return (d or {}).get("wallets") or []
+    except Exception:
+        return []
+
+def solscan_chaininfo():
+    """Solscan free chaininfo — VERIFIED live (token JWT header, NOT Bearer)."""
+    try:
+        cfg = load_config()
+        jwt = cfg.get("SOLSCAN_JWT")
+        hdrs = {"User-Agent": UA}
+        if jwt: hdrs["token"] = jwt
+        st, d = http_json("https://public-api.solscan.io/chaininfo", headers=hdrs)
+        return (d or {}).get("data")
+    except Exception:
+        return None
+
+def cabalspy_wallets(chain="solana", wtype="kol", limit=20):
+    """CabalSpy labeled KOL/smart/whale roster (10k credits free/mo)."""
+    try:
+        cfg = load_config()
+        key = cfg.get("CABALSPY_KEY")
+        if not key: return []
+        st, d = http_json(f"https://api.cabalspy.xyz/v1/wallets?blockchain={chain}&type={wtype}&limit={limit}",
+                          headers={"Authorization": f"Bearer {key}"})
+        return ((d or {}).get("data") or {}).get("wallets") or []
+    except Exception:
+        return []
+
+def madeonsol_kol_feed(limit=10):
+    """MadeOnSol KOL trade feed — CF-blocked from this box; returns [] here.
+    Works from user-network/x402. Base: madeonsol.com/api/v1 (NOT api.madeonsol.com)."""
+    try:
+        cfg = load_config()
+        key = cfg.get("MADEONSOL_KEY")
+        if not key: return []
+        st, d = http_json("https://madeonsol.com/api/v1/kol/feed?limit=%d" % limit,
+                          headers={"Authorization": f"Bearer {key}"})
+        return (d or {}).get("trades") or []
+    except Exception:
+        return []
 
 def log_event(entry, fname=None):
     os.makedirs(JOURNAL_DIR, exist_ok=True)

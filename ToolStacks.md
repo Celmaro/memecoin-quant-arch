@@ -271,6 +271,16 @@ Browser automation currently BROKEN in this env (Chrome won't start) → used vi
 | Multi-hop fund tracing | Bitquery Coinpath (after historical add-on) |
 | Portfolio / wallet balance | CoinStats wallet + portfolio endpoints |
 | Trending boards / narrative | Ave ranks/topics + Birdeye trending + FomoAPI token boards |
+| Whale/KOL flow tape (free) | **Sol.wales `/api/v1/moves/recent`** (keyless) — all-wallet moves poll |
+| Wallet PnL / strategy score (free, tiny) | **WalletIntel `/wallet/{addr}/pnl|summary`** (10 req/day) |
+| KOL/smart-money roster + per-token holdings tape | **CabalSpy** `/v1/wallets` + `/v1/tokens/transactions` (10k credits free/mo) |
+| KOL coordination / first-touch / entry order | **MadeOnSol** `/kol/coordination`, `/kol/first-touches`, `/kol/tokens/{mint}/entry-order` |
+| Deployer reputation (no-lookahead) | **MadeOnSol** `/deployer-hunter/{wallet}` + `/{wallet}/history` (PRO) |
+| Buyer-quality / dump-cluster / bundle residual | **MadeOnSol** `/tokens/{mint}/buyer-quality`, `/tokens/{mint}/bundle` |
+| Rug-risk w/ dev-exit read | **MadeOnSol** `/tokens/{mint}/risk` (PRO) — auditable factors + wallet_empty |
+| Real pool depth / price impact | **MadeOnSol** `/tokens/{mint}/depth` (PRO) — SOL to move 1/5/10% |
+| Block/chain info (free) | **Solscan** `/chaininfo` (public, token JWT) |
+| Market snapshot / event stream | **Blixvip** `/api/overview` + `/api/stream` (login-gated) |
 
 ## Quick fixes learned (setup corrections 2026-10-15)
 1. **Ave.ai**: header must be `X-API-KEY` (not `Ave-Auth`), host `prod.ave-api.com/v2` — search + price + contracts verified 200.
@@ -278,3 +288,63 @@ Browser automation currently BROKEN in this env (Chrome won't start) → used vi
 3. **Bitquery**: Solana/EVM live on **V2** `streaming.bitquery.io/graphql` with `dataset: realtime` — earlier V1 probe was wrong host. Bearer ory_at_ verified.
 4. **Nansen**: header `apikey` + body `wallet_address` is correct; key has 0 credits → top up at app.nansen.ai.
 5. **Dune**: auth works; `POST /sql/execute` performance="small" → 402 free-tier datapoint cap; use saved query ids or upgrade.
+---
+
+## 7. NEW PROVIDERS (audited + mapped Oct 17 2026 — six tools)
+
+### Sol.wales — ✅ WORKS (keyed whale-flow tracker, FREE, live-verified)
+Docs: https://sol.wales/api · Base: `https://sol.wales/api/v1` · Auth: `x-api-key: sw_…` (60/min per IP no key, 600/min with key; 429 + Retry-After)
+- ✅ **`GET /api/v1/traders?source=discovered|verified&limit=&cursor=`** — tracked whales (promoted at ≥1000 SOL held or ≥250 SOL single move): address, label (hand-curated), tags, source, active, solLamports (STRING BigInt), sol, tokenCount, moves24h, moves7d, lastMoveAt. Verified live.
+- ✅ **`GET /api/v1/traders/{address}`** — trader + 60 balance snapshots + last 20 moves (404 if untracked).
+- ✅ **`GET /api/v1/traders/{address}/moves?since=&limit=`** — moves newest-first (default 50, max 200). kinds: sol_in|sol_out|token_in|token_out|swap|other; each: signature, at, mint|null, amount, counterparty, detail{pre/post deltas}.
+- ✅ **`GET /api/v1/moves/recent?limit=`** — NEWEST moves across ALL active wallets (default 50, max 200) — "follow everyone" poll. Verified live.
+- ✅ `GET /api/v1/health` → `{"ok":true}`. CORS open; Cache-Control 30s; sync every few min; window = 25 latest sigs per wallet (gaps for hyperactive).
+- **AEGIS mapping:** whale move feed → GOOD_WALLET_SELLING early warning (tracked whale dumping a held mint), whale accumulation signal, moves24h/7d = wallet activity delta. Poll `/moves/recent` = all-wallet tape at zero cost (replaces bits of FomoAPI/WalletIntel). KEY: solLamports is a STRING (BigInt), amounts are UI-unit strings.
+
+### CabalSpy — ⚠️ API HOST TIMEOUT from this box (docs + key VALID; connectivity blocked)
+Docs: https://docs.cabalspy.xyz (llms.txt index) · Base: `https://api.cabalspy.xyz/v1` · Auth: `Authorization: Bearer cQu…` OR `api_key=` query · Demo: `demo-api.cabalspy.xyz` (20 req/IP/day, 15-min delay, ≤5 rows)
+- **Free tier: 10,000 credits/mo (REST 10/req, WS event 1/credit), 5 req/s, 1 key, historical since Feb 2025.**
+- `GET /v1/wallets?blockchain=solana&type=kol|smart|whale&limit=&cursor=` — 3000+ labeled wallets (name, twitter, telegram, copytrade link).
+- `GET /v1/transactions/latest?blockchain=&type=` — latest tracked-wallet trades.
+- `GET /v1/tokens/transactions?blockchain=solana&mint=&type=&limit=` — per-token tape; each tx has profile + **holdings_after** (token_amount, supply_pct, bag_pct, still_holding) → replay position build/unwind.
+- `GET /v1/wallet/leaderboard?period=6h|1d|7d|30d&limit=` — volume-ranked: realized_pnl, win rate, avg hold min, buy/sell counts.
+- `GET /v1/wallets/tracker?address=&period=` — full wallet profile + win-rate buckets + realized PnL chart + recent trades.
+- `GET /v1/wallets/holdings?address=` — live on-chain balances (Moralis, no cost basis). `GET /v1/wallet/pnl_calendar` — day PnL + streaks.
+- `GET /v1/tokens/{mint}/bundles` + WSS bundle stream — KOL + side-wallet coordinated buys w/ confidence + proof.
+- `GET /v1/signals` + WSS signal stream — cluster entry/exit alerts (own thresholds).
+- WSS `wss://stream.cabalspy.xyz?apiKey=KEY` — tx/bundle/signal streams (1 credit/event).
+- 403 = invalid key/credits; 429 = rate limit. Chains: solana, bnb, base, eth, rh.
+- **AEGIS mapping:** labeled KOL/SMART/WHALE roster → behavior index; per-token holdings_after tape → GOOD_WALLET_SELLING / whale-dump detection; coordination signals → confluence boost; bundle detection → insider/bundle flag (complements Rugcheck graph_insiders). Credential stored: CONFIG.md `CABALSPY_KEY`.
+
+### MadeOnSol — ⚠️ CF-BLOCKED from this box (docs fully mapped; 95 endpoints; free tier real)
+Docs: https://madeonsol.com/api-docs · Base: `https://madeonsol.com/api/v1` · Auth: `Authorization: Bearer msk_…` (x402: USDC per call $0.005–0.02)
+- **Free: 200 calls/day, 10/min, full response shape, real wallets+tx. Pro €43/mo 10k/day; Ultra €131/mo 100k/day (DEX firehose, linked-wallet clustering). Demo key: `msk_demo_try_the_solana_api_2026` (3 read-only).**
+- **KOL:** `/kol/feed` (real-time trades w/ mc_at_trade) · `/kol/leaderboard` (PnL/winrate/ROI/early-entry; today-180d) · `/kol/{wallet}` (+pnl_by_token) · `/kol/coordination` (3+ KOLs same token = convergence) · `/kol/tokens/{mint}` (KOL net flow per token) · `/kol/pairs` (co-trade affinity) · `/kol/{wallet}/timing` (hold dist 1h/6h/24h, avg sizes, hour-of-day) · `/kol/tokens/hot` (acceleration) · `/kol/tokens/trending` · `/kol/{wallet}/pnl` (equity curve + closed) · `/kol/tokens/{mint}/entry-order` (first buyers, seconds_after_first, percentile_pnl_7d) · `/kol/compare` · `/kol/alerts/recent` · `/kol/first-touches` (S/A/B/C scouts; top scouts → ≥3 follow-on KOLs in 4h ~50%) · `/kol/scouts/leaderboard`
+- **Deployer Hunter:** `/deployer-hunter/stats|leaderboard|{wallet}|{wallet}/tokens|alerts|alert-stats|best-tokens|recent-bonds|{wallet}/trajectory|{wallet}/history` (PRO history = daily reputation time-series, NO lookahead bias; tiers elite/good/rising; bond rates; recent_outcomes string).
+- **Alpha:** `/alpha/leaderboard` (1.2M+ first-20 buyers scored) · `/alpha/{wallet}` (ULTRA + bot_signals) · `/alpha/{wallet}/linked` (ULTRA same-actor co-buy clusters).
+- **Token Intel:** `/tokens/{mint}/kol-consensus` (accumulating/distributing + conviction) · `/tokens/{mint}/peak-history` (ATH, drawdown) · `/tokens/{mint}/cap-table` (first 10-20 buyers enriched: hist win rate, PnL, bundle flags, realized on mint, still_holding) · `/tokens/{mint}/top-traders` (ranked by realized PnL + reputation) · `/tokens/{mint}/bundle` (same-slot cohort + **held_pct_of_supply** = insider residual) · `/tokens/{mint}/buyer-quality` (0-100: avg WR of non-bot early buyers, KOL bonus, bundle penalty, bot dominance; **dump_cluster_count** — 3+ → sub-15min peak 94% of time) · `/tokens/batch/buyer-quality` (POST 50) · `/tokens/{mint}/risk` (PRO: auditable rug-risk, factors[] w/ supply_inflation, sniper_footprint, **dev wallet_empty = dev exited**) · `/tokens/{mint}/candles` (PRO: OHLCV + net-flow + liq) · `/tokens/{mint}/flow` (PRO: unique wallets, trades_per_wallet = wash proxy) · `/tokens/{mint}/trades` (PRO tape) · `/tokens/{mint}/pools` (PRO liquidity map + top_pool_share_pct) · `/tokens/{mint}/depth` (PRO: per-pool impact, SOL to move 1/5/10%)
+- `GET /signals/{name}/performance` — out-of-sample efficacy backtest per signal (lift over base) — free, empirical signal weighting.
+- **AEGIS mapping (biggest new source):** `/tokens/{mint}/risk` = auditable rug-risk + DEV-EXIT read; `/buyer-quality` = new factor (dump_cluster_count); `/bundle` held_pct = insider residual; `/deployer-hunter/*` = deployer memory upgrade (bond rates/tiers/no-lookahead); `/kol/coordination` + `/kol-consensus` = confluence/smart-money conviction; `/alpha/{wallet}/linked` = sybil clustering; `/depth` = the liq-quality gate. Free covers /kol/* + /deployer-hunter/alerts + /alpha/leaderboard + buyer-quality; PRO+ unlocks risk/candles/flow/trades/pools/depth.
+- ⚠️ Connectivity: `api.madeonsol.com` DOESN'T RESOLVE; `madeonsol.com/api/v1` Cloudflare-403 from this datacenter IP (curl AND browser). Docs + demo confirm the API; live probes must come from user's network or x402/MCP path. Credential: CONFIG.md `MADEONSOL_KEY`.
+
+### WalletIntel — ✅ WORKS (free, keyless wallet PnL)
+Docs: https://walletintel.dev/docs + github.com/ace8ecar-source/walletintel-v2 · Base: `https://api.walletintel.dev` · No key. Free: 10 req/day, max_tx 1000→5000, 24h cache, 3 concurrent scans.
+- ✅ **`GET /wallet/{address}/pnl`** — FIFO PnL per token: total_realized_pnl_sol, win_rate, strategy (sniper/scalper/smart_money/diamond_hands/degen), score 0-100, unique_tokens, tokens[] per-mint pnl.
+- ✅ **`GET /wallet/{address}/summary`** — quick; server-busy when >3 concurrent (observed) → retry.
+- ✅ **`GET /leaderboard?sort=score|pnl|win_rate|popular&limit=`** — verified live (score 95-96, win_rate 92-100, pnl_sol, strategy, trades, unique_tokens).
+- ✅ `GET /health` (verified: 2 healthy providers, cache 90.9% hit), `GET /stats` (verified: alchemy-free + solana-public RPC pool).
+- **AEGIS mapping:** strategy tag + score for deployer/insider/first-buyer wallets → behavior index; per-token PnL of cap-table buyers = quality filter; leaderboard = cohort discovery. 10 req/day → cache 24h, use only for high-value wallets. PnL in SOL.
+
+### Solscan — ⚠️ FREE=chaininfo only; PRO needs higher key tier (JWT valid, paid-gated)
+Docs: https://pro-api.solscan.io/pro-api-docs/v2.0 · Public: `https://public-api.solscan.io` · Pro: `https://pro-api.solscan.io/v2.0` · Auth: `token: <JWT>` header (NOT Bearer)
+- ✅ **`GET /chaininfo`** (public, FREE, verified live): blockHeight, currentEpoch, absoluteSlot, transactionCount.
+- ❌ Pro v2.0 (token/holders, token/meta, monitor/usage, account/*, market/*) → **401 "Please upgrade your api key level"** — JWT valid but free key tier; paid upgrade required.
+- Pro surface (documented): Account detail/transfer/defi/balance/transactions/portfolio/token-accounts/stake/metadata/funded-by/leaderboard/funding · Token transfer/defi/markets/meta/price/holders/list/trending/latest/search/statistic/OHLCV · NFT · Transaction last/detail/decoded/fees · Block · Market list/info/volume/positions/OHLCV · Program · Monitor usage.
+- **AEGIS mapping (after upgrade):** token holders (T10 concentration backup), token markets, token price OHLCV, account portfolio/funded-by (mother-wallet/funder), transaction decoded (behavior labels). For now: chaininfo only. Credential: CONFIG.md `SOLSCAN_JWT`.
+
+### Blixvip — ⚠️ LOGIN-GATED (no public key; endpoints known)
+Docs: https://blixvip.com/app#/api · Base: `https://blixvip.com/api`
+- `GET /api/overview` — market snapshot (verified: "Sign in at blixvip.com to use Blix" without auth).
+- `GET /api/stream` — every event as it happens (SSE/NDJSON market stream).
+- App is Next.js SPA; `/app` → `/start` login wall. No anonymous API key endpoint; needs Blix account/credentials.
+- **AEGIS mapping:** market-regime context once auth exists; not wired until credentials supplied.

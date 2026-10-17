@@ -240,6 +240,47 @@ def main():
         print("  (paper plan only — no execution until user enables trading)")
         return 0
 
+    if cmd == "whales":
+        """NEW PROVIDERS (Oct 17): whale-flow tape + wallet PnL + chain metrics.
+        Usage: desk.py whales [recent|traders|wallets|chain|pf] [n]"""
+        from desk_common import (sol_wales_traders, sol_wales_moves_recent,
+                                 walletintel_leaderboard, solscan_chaininfo,
+                                 walletintel_summary)
+        sub = args[1] if len(args) > 1 else "recent"
+        n = int(args[2]) if len(args) > 2 else 10
+        if sub == "recent":
+            moves = sol_wales_moves_recent(limit=n)
+            print(f"🐋 Sol.wales recent moves ({len(moves)}):")
+            for m in moves[:n]:
+                _mn = m.get('mint') or 'SOL'
+                print(f"  {m.get('kind','?'):10s} {_mn[:12]:14s} {str(m.get('amount','?')):>14s}  "
+                      f"@ {(m.get('trader') or {}).get('label') or (m.get('trader') or {}).get('address','?')[:10]}")
+        elif sub == "traders":
+            tr = sol_wales_traders(limit=n)
+            print(f"🐋 Sol.wales tracked whales ({len(tr)}):")
+            for t in tr[:n]:
+                print(f"  {t.get('label') or t.get('address','?')[:10]:20s} sol={t.get('sol',0):,} "
+                      f"tokens={t.get('tokenCount',0)} moves24h={t.get('moves24h',0)} moves7d={t.get('moves7d',0)}")
+        elif sub == "wallets":
+            lb = walletintel_leaderboard(limit=n)
+            print(f"💎 WalletIntel leaderboard ({len(lb)}):")
+            for w in lb[:n]:
+                print(f"  {w.get('wallet','?')[:12]}  score={w.get('score')} wr={w.get('win_rate')}% "
+                      f"pnl={w.get('pnl_sol'):+.2f}SOL {w.get('strategy')} trades={w.get('total_trades')}")
+        elif sub == "chain":
+            ci = solscan_chaininfo()
+            print("⛓ Solscan chaininfo:", ci)
+        elif sub == "pf":
+            # portfolio of a specific wallet (walletintel PnL)
+            w = args[2] if len(args) > 2 else None
+            if not w:
+                print("usage: desk.py whales pf <wallet>"); return 1
+            s = walletintel_summary(w)
+            print("💎 WalletIntel summary:", s)
+        else:
+            print(__doc__); return 1
+        return 0
+
     print(f"unknown command: {cmd}"); print(__doc__); return 1
 
 if __name__ == "__main__":
