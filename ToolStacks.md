@@ -282,6 +282,29 @@ Browser automation currently BROKEN in this env (Chrome won't start) → used vi
 | Block/chain info (free) | **Solscan** `/chaininfo` (public, token JWT) |
 | Market snapshot / event stream | **Blixvip** `/api/overview` + `/api/stream` (login-gated) |
 
+### Blixvip — ⚠️ SELF-HOSTED LOCALHOST APP (not a hosted public API!)
+Repo: https://github.com/blixvip/blixtrade · Docs: `docs/API.md` · Base: **`http://localhost:4420`** (RADAR_PORT), SSE stream at `/api/stream`
+- **Hosted blixvip.com = sign-in + account permissions (NOT anonymous)**; execution spends real SOL through authenticated workflows. BUT the whole app is open-source and self-hostable — run it locally and ALL endpoints are free/instant.
+- ✅ Full API surface (self-hosted): `GET /api/overview` (KPIs: launches/hr, tracking, pass-safety, signals 24h, graduations) · `/api/pulse` (4 columns: new/final-stretch/migrated/running w/ per-coin stats + AI verdicts) · `/api/tokens` (coins table filters) · `/api/token/{mint}` (full detail: price history, safety report, holders summary, socials, research, signals) · `/api/token/{mint}/explain` · `/api/holders/{mint}?top=25` (**live holder ledger: top holders tagged dev/sniper/bundle + top-10 share**) · `/api/candles/{mint}?tf=5s|15s|1m|5m|15m|1h` (MC candles from real trades) · `/api/quote?mint=&side=buy|sell&amount=&slip=` (real Jupiter quote)
+- Signals/narratives: `/api/signals` (type, safety, group) · `/api/narratives` (heat, lift, emerging words, lead coins) · `/api/clusters` (narrative bursts + Grok calls) · `/api/briefs`
+- Research/picks: `/api/research` + `/api/research/{mint}` (first read, deep read, grade, thesis, plan) · `/api/triage` · `/api/picks` + `/api/picks/all` (entry/exit/peak/rule result = backtest feed) · `/api/perf` (track record per signal type: checked, up 20%+, down 50%+, median, worst, reached 2x — 60s cache)
+- Wallets/Fomo: `/api/wallets` · `/api/wallet/{addr}` (swaps, realized/open/sellable PnL, positions, **linked wallets**, alert rule) · `/api/fomo` (learned fee payer, what Fomo is buying, top Fomo traders) · `/api/fomo/bars/{mint}` (Fomo's chart bars)
+- Paper desk: `/api/paper` + `/quoted`/`/sellq` (real quote fills) — nothing is ever bought.
+- Stream events: `tick`, `launch` (sub-second pump.fun), `live`, `signal` (type, mint, symbol, text, safety, score), `mig` (graduation), `pic`, `paper`, `brief` — SSE stateless.
+- ⚠️ From THIS box: hosted `blixvip.com/api/overview` → "Sign in at blixvip.com" (needs account creds); the localhost app would be free if self-hosted here.
+- **AEGIS mapping (if self-hosted locally):** `/api/holders/{mint}` top-holders dev/sniper/bundle tags = direct AEGIS holder-quality factor; `/api/perf` + `/api/picks/all` = empirical signal-efficiency backtests; `/api/token/{mint}/explain` + research grade = AI narrative layer; `/api/fomo` = FomoAPi-style smart-money tracker; `/api/signals?group=coin` = confluence enrichment. Execution stays paper.
+
+### GMGN Agent API — ⚠️ KEY VALID, openapi.gmgn.ai Cloudflare-blocked from this box
+Docs: https://docs.gmgn.ai/index/gmgn-agent-api.md · Base: `https://openapi.gmgn.ai/api/v1` · Auth: `X-API-KEY: gmgn_…` (user key Oct 17: stored CONFIG.md `GMGN_AGENT_KEY`)
+- Two API families: **Agent API** (this key, REST: token search/detail/security/holders/traders, market candles, trending, wallet PnL/holdings/history, agent_score, swap) and **Callout OpenAPI** (`https://papi.gmgn.ai/callout/openapi/v1` — POST-only, AK/SK HMAC-SHA256 signature, X-Ak/X-Timestamp/X-Signature headers; endpoints /global, /token, /get_record, /create; 1 QPS on /global).
+- Agent API endpoints (documented surface): `GET /api/v1/token/search?query=` · `GET /api/v1/token/sol/{address}` · `.../token/sol/{address}/security` · `.../top_holders` · `.../top_traders` · `GET /api/v1/market/sol/candles?token=&period=&amount=` · `GET /api/v1/tokens/sol/trending` · `GET /api/v1/wallet/sol/{wallet}/pnl|holdings|history` · `GET /api/v1/agent_score/sol/token?address=&refresh=` · trade: `/api/v1/trade/swap` (hosted wallet, needs private key — NOT configured).
+- ⚠️ Connectivity: `openapi.gmgn.ai` → 403 Cloudflare "Just a moment..." from this datacenter IP (curl + browser-style headers both); `api.gmgn.ai` doesn't resolve. The free `gmgn.ai/defi/quotation/v1/rank` endpoint still works keyless.
+- **AEGIS mapping (when reachable):** agent_score (bot-confidence / sniper/insider/bundle flags), token security + top_holders + top_traders = direct AEGIS checks, wallet PnL/holdings for deployer/insider vett, trending = discovery feed (never entries).
+
+### CabalSpy api-id host — ⚠️ also network-blocked from this box
+- `https://api-id.cabalspy.xyz/v1/health` → **connect timeout** (148.230.111.181:443, 35s no connect). Same for `stream.cabalspy.xyz`. Docs host (`docs.cabalspy.xyz`) resolves fine — API infrastructure is blocked at network level from this datacenter IP, not a key/auth issue.
+- Key `cQuH…` + endpoint map already in §7 above. Probe from user's home/VPN network.
+
 ## Quick fixes learned (setup corrections 2026-10-15)
 1. **Ave.ai**: header must be `X-API-KEY` (not `Ave-Auth`), host `prod.ave-api.com/v2` — search + price + contracts verified 200.
 2. **Birdeye**: key works for `defi/price` + `defi/token_overview`; `defi/token_security` needs paid package (401).

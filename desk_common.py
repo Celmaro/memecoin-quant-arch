@@ -70,6 +70,8 @@ def load_config():
     if m: cfg["MADEONSOL_KEY"] = m.group(1)
     m = re.search(r"Solscan Pro JWT[^\n]*?:\s*(eyJ[A-Za-z0-9._-]+)", text)
     if m: cfg["SOLSCAN_JWT"] = m.group(1)
+    m = re.search(r"GMGN Agent API[^\n]*?:\s*(gmgn_[A-Za-z0-9]+)", text)
+    if m: cfg["GMGN_AGENT_KEY"] = m.group(1)
     _cfg_cache = cfg
     return cfg
 
