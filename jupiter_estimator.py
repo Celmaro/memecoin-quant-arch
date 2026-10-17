@@ -49,9 +49,10 @@ def quote(mint, usd=20, slippage_bps=500):
     })
     try:
         hdrs = {"User-Agent": "Mozilla/5.0"}
-        if key: hdrs["Authorization"] = f"Bearer {key}"
+        if key: hdrs["x-api-key"] = key
         data = http_json(f"{QUOTE}?{params}", headers=hdrs)[1]
         out_amt = int(data.get("outAmount") or 0)
+        # Jupiter docs: priceImpactPct is a DECIMAL FRACTION (0.05 = 5%), not a percentage.
         price_impact = float(data.get("priceImpactPct") or 0)
     except Exception as e:
         # Fallback: estimate straight from DexScreener price (no impact data)
@@ -62,19 +63,19 @@ def quote(mint, usd=20, slippage_bps=500):
         if tok_px <= 0:
             return {"error": "token has no USD price"}
         out_amt = usd / tok_px
-        price_impact = 1.0  # assumed
+        price_impact = 1.0  # assumed (fraction: 100%)
         via = "dexscreener"
     else:
         via = "jupiter"
     dec = token_decimals(mint)
     expected_tokens = out_amt / (10 ** dec) if via == "jupiter" else out_amt
-    price_impact_usd = usd * price_impact / 100
+    price_impact_usd = usd * price_impact
     fee_total = usd * FEE_BPS / 100
     total = fee_total + price_impact_usd
     return {
         "via": via, "usd_in": usd, "sol_price": round(s, 2),
         "out_tokens": expected_tokens, "out_decimals": dec,
-        "price_impact_pct": round(price_impact, 3),
+        "price_impact_pct": round(price_impact * 100, 3),
         "price_impact_usd": round(price_impact_usd, 3),
         "fee_drag_usd": round(fee_total, 3),
         "total_cost_usd": round(total, 3),
@@ -83,7 +84,11 @@ def quote(mint, usd=20, slippage_bps=500):
 
 
 def quote_impact(mint, usd=20):
-    """Returns price impact as a fraction (0.05 = 5%) for a $usd buy, or None."""
+    """Returns price impact as a FRACTION (0.05 = 5%) for a $usd buy, or None.
+
+    Internal representation is the decimal fraction — Jupiter returns it that way
+    (0.05 = 5%). quote() converts to % only for the human-readable field.
+    """
     r = quote(mint, usd)
     if "error" in r or r.get("via") != "jupiter":
         return None  # fallback estimates are not real impact

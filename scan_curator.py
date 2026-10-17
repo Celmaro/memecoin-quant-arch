@@ -22,7 +22,7 @@ sys.path.insert(0, DESK)
 STATE = os.path.join(DESK, "hmq_curator_state.json")
 BOTS_FILE = os.path.join(DESK, "hmq_bots.json")
 GROUP = "HMQcheckergroup"
-COLLECT_WINDOW = 90        # seconds to wait for ALL scanner cards (bots reply 15-90s)
+COLLECT_WINDOW = 45        # seconds to wait for scanner cards (bots reply 15-45s; was 90 — cuts latency)
 PULL_LIMIT = 500           # wide window so late cards are still caught
 MINT_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -221,11 +221,10 @@ def parse_card(text, sender="?"):
 def creds():
     return json.load(open(f"{DESK}/.tg_credentials.json"))
 
-async def _client():
+async def _client(session="tg_session_curator"):
     from telethon import TelegramClient
-    # own session file — never share tg_session with the live listener (the shared
-    # sqlite file caused recurring "database is locked" crashes in the listener)
-    c = TelegramClient(f"{DESK}/tg_session_curator", creds()["api_id"], creds()["api_hash"])
+    # dedicated session file so the curator never fights the listener over tg_session
+    c = TelegramClient(f"{DESK}/{session}", creds()["api_id"], creds()["api_hash"])
     await c.connect()
     if not await c.is_user_authorized():
         raise RuntimeError("NOT_AUTHORIZED")
@@ -266,6 +265,74 @@ async def collect_for_mint(client, mint, limit=PULL_LIMIT, after_ts=None):
     return out
 
 # ── curation ──────────────────────────────────────────────────────────────────
+def _forensics_block(mint, rep):
+    """AEGIS deep-scan section (was the gateway's narrative — now deterministic)."""
+    aeg = rep or {}
+    checks = aeg.get("checks") or {}
+    risks = checks.get("risks") or {}
+    auth = checks.get("authorities") or {}
+    market = checks.get("market") or {}
+    score = aeg.get("score")
+    verdict = aeg.get("verdict") or ""
+    strat = aeg.get("strategy") or "default"
+    flags = aeg.get("flags") or []
+
+    lines = [f"🛡 AEGIS: {score or 'n/a'}/100 — {verdict} · strategy={strat}"]
+    if flags:
+        shown = flags[:6]
+        for f in shown:
+            lines.append(f"  ⚠ {f}")
+    if aeg.get("deployer"):
+        lines.append(f"  👨‍💻 deployer {aeg['deployer'][:8]}…{aeg['deployer'][-4:]}")
+    # market tape
+    mc = market.get("mc") or aeg.get("mc")
+    liq = market.get("liq") or aeg.get("liq")
+    vol = market.get("vol_h24")
+    b24, s24 = market.get("buys24"), market.get("sells24")
+    bits = []
+    if mc: bits.append(f"MC ${mc:,.0f}")
+    if liq: bits.append(f"liq ${liq:,.0f}")
+    if vol: bits.append(f"vol ${vol:,.0f}")
+    if b24 is not None or s24 is not None:
+        bits.append(f"B/S {b24 or 0}/{s24 or 0}")
+    if bits:
+        lines.append("  📊 " + " · ".join(bits))
+    # holder concentration
+    top10 = risks.get("top10_pct")
+    top1 = None
+    th = risks.get("topHolders") or []
+    if th and isinstance(th, list):
+        try: top1 = float(th[0].get("pct")) if th[0].get("pct") else None
+        except Exception: top1 = None
+    hbits = []
+    if top10 is not None: hbits.append(f"T10 {top10:.1f}%")
+    if top1 is not None: hbits.append(f"top1 {top1:.1f}%")
+    if hbits:
+        lines.append("  👥 " + " · ".join(hbits))
+    # authorities
+    abits = []
+    if "mint_authority" in auth: abits.append(f"mint {'PRESENT' if auth['mint_authority'] else 'revoked'}")
+    if "freeze_authority" in auth: abits.append(f"freeze {'PRESENT' if auth['freeze_authority'] else 'revoked'}")
+    if abits:
+        lines.append("  🔏 " + " · ".join(abits))
+    # action plan (rule-based, mirrors the desk playbook)
+    plan = None
+    if verdict == "RUGGED" or (score is not None and score < 30):
+        plan = "🚫 AVOID — contract verdict overrides tape"
+    else:
+        insider = any("insider" in (f or "") for f in flags)
+        lp_risk = any("lp_" in (f or "") or "unlocked" in (f or "") for f in flags)
+        if intent := insider or lp_risk:
+            plan = ("flip sizing · stop −22% · clip +30% fast · whale-watch if "
+                    + ("insider + " if insider else "") + ("partial LP" if lp_risk else "top holder sells"))
+        elif score is not None and score >= 60:
+            plan = "conviction-candidate: scale slower, respect narrative stop"
+        else:
+            plan = "default flip: stop −22%, first clip +30%"
+    if plan:
+        lines.append("  🧭 " + plan)
+    return "\n".join(lines)
+
 def _card_bits(d):
     bits = []
     if d.get("rug_prob") is not None: bits.append(f"rug {d['rug_prob']:.0f}%")
@@ -295,8 +362,9 @@ def _card_bits(d):
             bits.append(f.upper())
     return bits[:9]
 
-def curate_card(mint, msgs, aegis_rep):
-    """ONE card: every scanned bot parsed (known + discovered) + consensus + AEGIS."""
+def curate_card(mint, msgs, aegis_rep, channel=None):
+    """ONE card: every scanned bot parsed (known + discovered) + consensus + AEGIS.
+    channel = source Telegram channel of the original call (confluence attribution)."""
     by_bot = {}
     for m in msgs:
         sender = m.get("sender") or "?"
@@ -323,8 +391,16 @@ def curate_card(mint, msgs, aegis_rep):
     else: verdict = "✅ PROCEED"
     strong = "🔥 STRONG" if bear >= 3 else ("⚡ MODERATE" if bear == 2 else ("✨ WEAK" if (bear + neut) >= 1 else "—"))
 
-    lines = [f"🧠 HMQuant curated scan — {aeg.get('symbol') or mint[:10]} ({mint[:16]}…)",
+    lines = [f"🧠 HMQuant curated scan — ${aeg.get('symbol') or mint[:10]}",
              "━━━━━━━━━━━━━━━━━━"]
+    if channel:
+        lines.append(f"📡 source: {channel}")
+    lines.append(f"💠 CA: {mint}")
+    forensics = _forensics_block(mint, aeg)
+    if forensics:
+        lines.append(forensics)
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append("🔎 SCANNER CONSENSUS:")
     for d in sorted(parsed, key=lambda x: (x.get("verdict") == "BEARISH", -(x.get("score") or 99))):
         v = {"BEARISH": "🔴", "NEUTRAL": "🟡"}.get(d.get("verdict"), "⚪")
         sc = f"{d.get('score')}/100" if d.get("score") is not None else ""
@@ -333,31 +409,31 @@ def curate_card(mint, msgs, aegis_rep):
         lines.append(f"  {v} {d.get('bot','?')}: {sc}{extra}")
     lines.append("━━━━━━━━━━━━━━━━━━")
     lines.append(f"📊 {len(parsed)} scanners · 🔴{bear} 🟡{neut} · bot avg {avg_bot or 'n/a'}/100 · {strong}")
-    lines.append(f"🛡 AEGIS: {aeg_score or 'n/a'}/100 [{aeg.get('verdict') or ''}]")
-    lines.append(f"🧭 VERDICT: {verdict} (merged {merged}/100)")
+    lines.append(f"🧭 VERDICT: {verdict}")
     return "\n".join(lines)
 
 
 async def run_once(mint):
     """Post CA as human -> collect ALL -> curate -> post ONE card via HMQuant."""
     from desk_common import load_config, http_json
-    client = await _client()
+    client = await _client("tg_session_curator_once")  # own session copy: no lock vs daemon
     try:
         me = await client.get_me()
         g = await client.get_entity(GROUP)
         await client.send_message(g, f"scan this: {mint}")
+        post_ts = time.time()  # audit F10: pass trigger so auto-discovery branch works
         print(f"posted as human ({me.username or me.id}), waiting {COLLECT_WINDOW}s…", flush=True)
         await asyncio.sleep(COLLECT_WINDOW)
     finally:
         await client.disconnect()
-    client = await _client()
+    client = await _client("tg_session_curator_once")  # own session copy: no lock vs daemon
     try:
-        msgs = await collect_for_mint(client, mint)
+        msgs = await collect_for_mint(client, mint, after_ts=post_ts)
         print(f"collected {len(msgs)} messages mentioning {mint[:12]}", flush=True)
     finally:
         await client.disconnect()
     import aegis
-    rep = aegis.score_coin(mint, deep=False)
+    rep = aegis.score_coin(mint, deep=True)  # deep: deployer memory + full checks
     card = curate_card(mint, msgs, rep)
     print(card, flush=True)
     tok = load_config().get("HMQ_BOT_TOKEN")
@@ -366,6 +442,10 @@ async def run_once(mint):
                           body={"chat_id": -1004430296219, "text": card},
                           headers={"Content-Type": "application/json"}, retries=1)
         print(f"posted curated card to group: {st}", flush=True)
+        st2, _ = http_json(f"https://api.telegram.org/bot{tok}/sendMessage", method="POST",
+                           body={"chat_id": 1223241788, "text": card},
+                           headers={"Content-Type": "application/json"}, retries=1)
+        print(f"sent curated card to DM via bot: {st2}", flush=True)
     return card
 
 

@@ -15,8 +15,8 @@ only; real keys never enter the repo.
 ## Bankroll & risk
 - $100 bankroll, Solana. Learning phase: NO live execution (research/scan/monitor only;
   user pulls every trigger).
-- MC-adaptive exits: <$40K → 50%@+30% / rest@+60% / stop -22%; higher MC tiers scale out
-  slower, stops wider (see position_monitor.py).
+- MC-adaptive exits (single source: position_monitor.EXIT_TIERS): <$40K → clip 50%@+10% / rest@+30% / stop -15%;
+  higher MC tiers scale out slower, stops wider (see position_monitor.py).
 
 ## Telegram Call Channels (curated — WE BUY ALL CALLS)
 - sol_trend, solwhaletrending, solearlytrending, PIRBViewTrending, soltrenchtrending,
@@ -28,20 +28,25 @@ only; real keys never enter the repo.
   NEVER an entry source; do not add to listener allowlist (feedback loop).
 
 ## Credentials (placeholders — fill real values in local CONFIG.md)
-- HELIUS_KEY: <helius-api-key>
-- FLUXRPC_KEY: <fluxrpc-key>           # Rugcheck API key
-- AVE_KEY: <ave-api-key>               # X-API-KEY, v2 host
-- BITQUERY_KEY: <bitquery-api-key>
-- FOMO_KEY: <fomoapi-key>
-- BIRDEYE_KEY: <birdeye-key>           # market endpoints OK; security endpoints paid
-- NANSEN_KEY: <nansen-key>             # 0 credits currently
-- DUNE_API_KEY: <dune-key>             # free tier view-only (credits_included 0)
-- DEXPAPRIKA_KEY: <dexpaprika-key>
-- COINSTATS_KEY: <coinstats-key>       # currently 406 (credits)
-- SOLANATRACKER_KEY: <solanatracker-key>
-- HMQ_BOT_TOKEN: <hmq-bot-token>       # same bot as gateway token (sendMessage only)
-- SHYFT_KEY: <shyft-key>
-- PUMPDEV_KEY: <pumpdev-ws-key>
+# NOTE: labels/values below MUST match desk_common.load_config() regexes — copy
+# these lines verbatim into CONFIG.md and replace the placeholder hex values.
+# Placeholder values are 32-hex dummy strings (replace with real keys).
+- Helius (Solana RPC/DAS): 1111111111111111111111111111111111111111111111111111111111111111
+- Helius: 1111111111111111111111111111111111111111111111111111111111111111
+- FluxRPC API key: 1111111111111111111111111111111111111111111111111111111111111111
+- Ave.ai: 1111111111111111111111111111111111111111111111111111111111111111
+- Jupiter (swap/quote API): jup_pub_11111111111111111111111111
+- Bitquery: ory_at_111111111111111111111111111111
+- FomoAPI: fapi_11111111111111111111111111
+- Birdeye: 1111111111111111111111111111111111111111111111111111111111111111
+- CoinStats: 1111111111111111111111111111111111111111111111111111111111111111
+- DexPaprika: api_111111111111111111111111
+- Nansen: 1111111111111111111111111111111111111111111111111111111111111111
+- Dune: 1111111111111111111111111111111111111111111111111111111111111111
+- SolanaTracker: 1111111111111111111111111111111111111111111111111111111111111111
+- Shyft.to: 11111111111111111111111111111111
+- PumpDev WS key: 11111111111111111111111111111111
+- HMQ_BOT_TOKEN: 1111111111111111111111111111111111111111111111111111111111111111
 - PUBLIC RPC (free fallback): https://solana-rpc.publicnode.com + wss
 
 ## Metrics framework (from user's original quant spec)

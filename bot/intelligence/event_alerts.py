@@ -59,13 +59,23 @@ def signal_reversal(followups):
     return None
 
 def detect_all(mint, wallet_signal=None, exit_info=None, micro=None, mult=None, followups=None):
-    """Run all detectors; returns list of structured events."""
+    """Run all detectors; returns list of structured events.
+
+    Each detector takes ONLY its declared params (audit F3C fix) — passing a
+    uniform 5-arg tuple previously shifted arguments and silently TypeError'd.
+    """
     evs = []
-    for fn in (large_holder_distribution, liquidity_withdrawal, abnormal_sell_pressure,
-               buyer_quality_deterioration, profit_liq_divergence, signal_reversal):
+    calls = [
+        (large_holder_distribution, (wallet_signal,)),
+        (liquidity_withdrawal, (exit_info,)),
+        (abnormal_sell_pressure, (micro,)),
+        (buyer_quality_deterioration, (micro, wallet_signal)),
+        (profit_liq_divergence, (exit_info, mult)),
+        (signal_reversal, (followups,)),
+    ]
+    for fn, args in calls:
         try:
-            e = fn(wallet_signal, exit_info, micro, mult, followups) if fn in (abnormal_sell_pressure, buyer_quality_deterioration, profit_liq_divergence, signal_reversal) else \
-                (fn(wallet_signal) if fn is large_holder_distribution else fn(exit_info))
+            e = fn(*args)
             if e: evs.append(e)
         except Exception:
             pass

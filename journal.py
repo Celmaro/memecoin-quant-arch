@@ -28,8 +28,8 @@ def run_followups(verbose=True):
             if mc < 2000 and liq < 500: outcome = "DEAD"
             elif liq < 300: outcome = "DRAINED"
         else:
-            result = "no pair data"
-            outcome = "DEAD"
+            result = "no pair data (provider down or delisted)"
+            outcome = "UNKNOWN_DATA"
         con.execute("UPDATE followups SET done=1, result=? WHERE mint=?", (result, f["mint"]))
         log_event({"event": "FOLLOWUP", "mint": f["mint"], "kind": f["kind"], "outcome": outcome, "result": result})
         if verbose:

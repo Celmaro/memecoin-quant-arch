@@ -109,13 +109,13 @@ def decide(mint, pos, signals, mc, liq, mult, age_min, extra=None):
     sell_fraction = 0.0
     confidence = 50.0
 
-    em_triggered = [s for s in signals if any(k in s for k in ("LIQ_COLLAPSE", "LIQ=0", "EMERGENCY", "STOP", "EXIT_ALL"))]
+    em_triggered = [s for s in signals if s.startswith(("LIQ_COLLAPSE", "LIQ=0", "EMERGENCY", "STOP", "EXIT_ALL"))]
     if em_triggered:
         action = ACTION_EMERGENCY
         sell_fraction = 1.0
         confidence = 92
         reason_codes = ["EMERGENCY_TRIGGERED"]
-    elif any("FULL" in s or "EXIT" in s for s in signals):
+    elif any(s.startswith(("FULL_EXIT", "EXIT_ALL")) for s in signals):
         action = ACTION_FULL_EXIT
         sell_fraction = 1.0
         confidence = 80

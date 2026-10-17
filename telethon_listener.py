@@ -46,6 +46,20 @@ def load_allowlist():
             u = m.group(1)
             if u not in chans and not u.isdigit():
                 chans.append(u)
+        # bare names (e.g. "- sol_trend, solwhaletrending" as documented in CONFIG.example.md)
+        # STRICT: only bullet lines whose ENTIRE content is comma-separated usernames
+        for line in sec.splitlines():
+            line = line.strip()
+            if not line.startswith("-"):
+                continue
+            items = [t.strip() for t in line[1:].split(",")]
+            items = [t for t in items if t]
+            if not items:
+                continue
+            if all(re.fullmatch(r"[A-Za-z0-9_]{4,}", t or "") for t in items):
+                for u in items:
+                    if u not in chans and not u.isdigit():
+                        chans.append(u)
         return chans
     except Exception:
         return []

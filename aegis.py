@@ -133,10 +133,28 @@ def remember_deployer(deployer, mint, ts):
     con.commit(); con.close()
 
 def record_first_buyers(mint, deployer, n=5):
-    """First n signatures on the mint => signers (first-block buyers)."""
+    """Oldest n signatures on the mint => signers (first-block buyers).
+
+    getSignaturesForAddress returns NEWEST first; walk to the oldest page to
+    avoid labeling recent traders as early buyers (audit F: chronological order).
+    """
     try:
-        res = rpc("getSignaturesForAddress", [mint, {"limit": n}]) or []
-        for i, s in enumerate(res[:n]):
+        sigs = []
+        before = None
+        for _ in range(40):  # max 40 pages back
+            params = [mint, {"limit": 100}]
+            if before:
+                params[1]["before"] = before
+            page = rpc("getSignaturesForAddress", params) or []
+            if not page:
+                break
+            sigs.extend(page)
+            if len(page) < 100:
+                break
+            before = page[-1]["signature"]
+        # oldest first: we walked newest->oldest, so reverse, take first n
+        sigs.sort(key=lambda s: s.get("blockTime") or 0)
+        for i, s in enumerate(sigs[:n]):
             tx = rpc("getTransaction", [s["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 0}])
             if not tx: continue
             signer = tx.get("transaction", {}).get("message", {}).get("accountKeys", [None])[0]
@@ -289,19 +307,22 @@ def score_coin(mint, deep=False):
     if r.get("transfer_fee"):
         score -= 10; flags.append("transfer_fee_present")
     if isinstance(r.get("risks"), list):
+        # Dedupe penalties by category (audit F6): several "bundle/sniper" rows
+        # were each subtracting -15, over-punishing a single underlying issue.
+        applied = set()
         for risk in r["risks"]:
             name = (risk.get("name") or "").lower()
             lvl = (risk.get("level") or "").lower()
-            if "bundle" in name or "snip" in name or "insider" in name:
-                score -= 15; flags.append("bundle_or_sniper_risk")
-            if "liquidity" in name and "lock" in name and "unlocked" in lvl:
-                score -= 15; flags.append("lp_unlocked")
-            if "mint" in name:
-                score -= 10; flags.append("mint_risk")
-            if "freeze" in name:
-                score -= 10; flags.append("freeze_risk")
-            if "copy" in name or "duplicate" in name:
-                score -= 10; flags.append("copycat")
+            if ("bundle" in name or "snip" in name or "insider" in name) and "bundle_or_sniper" not in applied:
+                score -= 15; flags.append("bundle_or_sniper_risk"); applied.add("bundle_or_sniper")
+            if "liquidity" in name and "lock" in name and "unlocked" in lvl and "lp_unlocked" not in applied:
+                score -= 15; flags.append("lp_unlocked"); applied.add("lp_unlocked")
+            if "mint" in name and "mint_risk" not in applied:
+                score -= 10; flags.append("mint_risk"); applied.add("mint_risk")
+            if "freeze" in name and "freeze_risk" not in applied:
+                score -= 10; flags.append("freeze_risk"); applied.add("freeze_risk")
+            if ("copy" in name or "duplicate" in name) and "copycat" not in applied:
+                score -= 10; flags.append("copycat"); applied.add("copycat")
     if isinstance(r.get("top10_pct"), (int, float)) and r["top10_pct"] > 70:
         score -= 10; flags.append("top10_concentration")
     lp = r.get("lp_locked_pct")
@@ -465,8 +486,15 @@ def score_coin(mint, deep=False):
                         score -= 10; flags.append("known_rugger_in_first_buys")
 
     score = max(0.0, min(100.0, score))
-    # Clean token bonus: no negative flags + LP locked => genuinely clean snapshot
-    if not flags and verdict != "RUGGED" and isinstance(r.get("lp_locked_pct"), (int, float)) and r["lp_locked_pct"] >= 90:
+    # Clean token bonus: no NEGATIVE flags + LP locked => genuinely clean snapshot.
+    # Positive/neutral flags (smart_money, deep_pool_liq, deployer_other_coins,
+    # clean_snapshot itself) must NOT block the bonus (audit F6).
+    _NEG_PREFIXES = ("insider", "transfer_fee", "bundle", "lp_", "mint_", "freeze_",
+                     "copycat", "top10", "AVE_", "dirty", "rugger", "wash",
+                     "slow", "fragility", "vol_liq", "slippage", "RUGGED", "drained",
+                     "lp_unlocked", "mint_risk", "freeze_risk")
+    _neg = [f for f in flags if any(f.startswith(p) for p in _NEG_PREFIXES)]
+    if not _neg and verdict != "RUGGED" and isinstance(r.get("lp_locked_pct"), (int, float)) and r["lp_locked_pct"] >= 90:
         score += 15
         flags.append("clean_snapshot(+15)")
     score = max(0.0, min(100.0, score))

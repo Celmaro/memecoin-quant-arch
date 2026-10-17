@@ -306,7 +306,7 @@ def analyze(mint, pos):
     exit_info = micro = wallet_sig = None
     try:
         from bot.intelligence.exit_intel import exit_intel
-        exit_info = exit_intel(mint, size_tokens=(size / px if px else None), entry_usd=size, entry_liq=entry_liq or liq, mult=mult)
+        exit_info = exit_intel(mint, pos, entry_usd=size, entry_liq=entry_liq or liq, mark_px=px)
         if exit_info:
             pos["last_exit_intel"] = exit_info
             ec = exit_info.get("exit_capacity_ratio")
@@ -359,11 +359,13 @@ def analyze(mint, pos):
     try:
         from bot.intelligence.thesis import evaluate as thesis_evaluate
         retention = (pos.get("holder_churn") or {}).get("retention")
-        thesis = thesis_evaluate(mult=mult, age_min=age_min, retention=retention,
-                                 fresh_buyers=(pos.get("wallet_power") or {}).get("new_buyer_count"),
-                                 vol_ratio=(vol_h1 / entry_v) if entry_v else None,
-                                 liq_ratio=(liq / entry_liq) if entry_liq else None,
-                                 cvd=(micro or {}).get("cvd"))
+        thesis = thesis_evaluate(mint, pos, signals, extra={
+            "retention": retention,
+            "fresh_buyers": (pos.get("wallet_power") or {}).get("new_buyer_count"),
+            "vol_ratio": (vol_h1 / entry_v) if entry_v else None,
+            "liq_pct_of_entry": (liq / entry_liq * 100) if entry_liq else None,
+            "mult": mult,
+        })
         pos["thesis"] = thesis
         if thesis.get("confidence") is not None and thesis["confidence"] < 35:
             signals.append(f"THESIS WEAK ({thesis['confidence']:.0f}/100): {', '.join(thesis.get('weak', [])[:2])}")
@@ -388,9 +390,15 @@ def analyze(mint, pos):
             except Exception:
                 pass
         ttl_weights = weight_signals([(s, now_ev) for s in signals])
+        # Pass real paper-book cash so ADD decisions are possible (audit F5)
+        try:
+            pb = json.load(open("/home/agentuser/memecoin-quant/paper_book.json"))
+            book_cash = float(pb.get("cash") or 0)
+        except Exception:
+            book_cash = 0.0
         # doc-1 decision contract: log every tick's decision with full evidence
         contract = decide(mint, pos, signals, mc, liq, mult, age_min,
-                          extra={"cash": 0, "ttl": (ttl_weights[0], ttl_weights[1])})
+                          extra={"cash": book_cash, "ttl": (ttl_weights[0], ttl_weights[1])})
         log_decision(contract, mint)
         pos["last_decision"] = {k: contract[k] for k in ("action", "sell_fraction", "confidence", "thesis_state")}
         pos["last_decision_px"] = px
