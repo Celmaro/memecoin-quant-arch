@@ -412,13 +412,16 @@ def analyze(mint, pos):
             from bot.decision_engine.risk_gate import gate
             sym_key = book_pos.get(mint)
             if sym_key:
-                allowed, gnotes = gate(contract, pb, sym_key, quote_ts=None)
+                # audit P1 (Oct 18): pass a real market observation timestamp so the
+                # gate's staleness rule is ACTIVE, not silently disabled by None.
+                allowed, gnotes = gate(contract, pb, sym_key, market_ts=now_ev, quote_ts=None)
                 if allowed != contract.get("action"):
                     contract = dict(contract)
                     contract["action"] = allowed
                     contract["reason_codes"] = list(contract.get("reason_codes") or []) + ["RISK_GATE:" + ";".join(gnotes)]
-        except Exception:
-            pass
+        except Exception as e:
+            # audit P1 (Oct 18): a broken gate must be OBSERVABLE, never a silent pass
+            signals.append(f"RISK_GATE_UNAVAILABLE: {str(e)[:60]}")
         log_decision(contract, mint)
         pos["last_decision"] = {k: contract[k] for k in ("action", "sell_fraction", "confidence", "thesis_state")}
         pos["last_decision_px"] = px

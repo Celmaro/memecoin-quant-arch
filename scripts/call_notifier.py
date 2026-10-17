@@ -87,16 +87,19 @@ def main():
                 ts = float(c.get("ts") or c.get("dt_ts") or 0)
                 if ts > last:
                     fresh.append(c)
-                if ts > last:
-                    last = max(last, ts)
     except FileNotFoundError:
         pass
 
     if not fresh:
         return 0  # silent
 
+    # audit P2 (Oct 18): watermark must advance ONLY past calls actually POSTED,
+    # not to the max across all fresh — a >4-call burst silently dropped later calls.
+    posted = fresh[:MAX_POST]
+    next_ts = max((float(c.get("ts") or 0) for c in posted), default=last)
+
     out = []
-    for c in fresh[:MAX_POST]:
+    for c in posted:
         mint = c.get("mint") or "?"
         chan = (c.get("channel") or "?").replace("Trending", "").replace("trending", "")
         sym, mc = c.get("symbol"), None
@@ -115,7 +118,7 @@ def main():
         # queue with channel + mint so the curator card can attribute the source
         queue_hmq_post(hmq_text, mint=mint, channel=chan)  # curator sends as human -> scan bots -> curated card
 
-    save_state({"last_ts": last})
+    save_state({"last_ts": next_ts})
     if out:
         print("\n".join(out))
     return 0

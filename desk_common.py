@@ -46,7 +46,7 @@ def load_config():
     if m: cfg["HELIUS_KEY"] = m.group(1)
     m = re.search(r"Shyft\.to:\s*([A-Za-z0-9_]+)", text)
     if m: cfg["SHYFT_KEY"] = m.group(1)
-    m = re.search(r"FluxRPC[^\n]*key\s+([0-9a-fA-F-]{20,})", text)
+    m = re.search(r"FluxRPC[^\n]*key\s*[:=]?\s*([0-9a-fA-F-]{20,})", text)
     if m: cfg["FLUX_KEY"] = m.group(1)
     m = re.search(r"Birdeye:\s*([0-9a-fA-F]{20,})", text)
     if m: cfg["BIRDEYE_KEY"] = m.group(1)
@@ -780,11 +780,21 @@ def init_schema():
     CREATE TABLE IF NOT EXISTS scan_log(
         mint TEXT, ts REAL, score REAL, verdict TEXT, strategy TEXT, checks_json TEXT);
     CREATE TABLE IF NOT EXISTS followups(
-        mint TEXT PRIMARY KEY, due_ts REAL, kind TEXT, note TEXT, result TEXT, done INTEGER DEFAULT 0);
+        mint TEXT PRIMARY KEY, due_ts REAL, kind TEXT, note TEXT, result TEXT, done INTEGER DEFAULT 0,
+        outcome TEXT);
     CREATE TABLE IF NOT EXISTS positions(
         mint TEXT PRIMARY KEY, entry_px REAL, size REAL, entry_mc REAL, entry_liq REAL,
         opened_ts REAL, strategy TEXT, conviction INTEGER DEFAULT 0, notes TEXT);
     """)
+    # audit P1 (Oct 18): older DBs lack the `outcome` column -> filter_precision's
+    # `SELECT outcome FROM followups` was failing silently. Migrate if missing.
+    cols = [r[1] for r in con.execute("PRAGMA table_info(followups)")]
+    if "outcome" not in cols:
+        try:
+            con.execute("ALTER TABLE followups ADD COLUMN outcome TEXT")
+            log_event({"event": "SCHEMA_MIGRATION", "table": "followups", "added": "outcome"})
+        except Exception:
+            pass
     con.commit(); con.close()
 
 def mark_status(mint, status):

@@ -18,7 +18,9 @@ def _jupiter_impact(mint, usd):
     try:
         from jupiter_estimator import quote
         q = quote(mint, usd=usd, slippage_bps=500)
-        if q and q.get("price_impact_pct") is not None:
+        # audit P2 (Oct 18): NEVER treat the dexscreener fallback (hardcoded
+        # 1.0 = 100% impact) as a real quote — that skews executable-exit math.
+        if q and q.get("via") == "jupiter" and q.get("price_impact_pct") is not None:
             return q["price_impact_pct"]
     except Exception:
         pass

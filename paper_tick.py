@@ -61,7 +61,8 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
         b["trades"][-1]["how"] = f"{how}_{reason.lower()}" if how == "decision" else f"{how}"
     save_book(b)
     if res["closed"]:
-        pos.pop(sym, None)  # pm positions cleanup
+        pos.pop(sym, None)  # pm positions cleanup (symbol key, legacy)
+        pos.pop(mint, None)  # audit P1 (Oct 18): positions.json is keyed by MINT; pop(sym) never removed it
         try:
             from bot.research.attribution import attribute, record_event
             path = [(0, entry_px), (1, peak if peak > 0 else entry_px), (2, px)]
@@ -92,7 +93,9 @@ def auto_buy():
         return []
     bought = []
     import json as _j
-    seen_syms = {p.get("symbol") or "?" for p in b["positions"].values()}
+    # audit P2 (Oct 18): dedupe by MINT only, never by ticker symbol — two
+    # distinct contracts sharing a symbol (buy-all mandate) must both be bought.
+    seen_mints = {p.get("mint") for p in b["positions"].values()}
     try:
         lines = open("/home/agentuser/memecoin-quant/calls.jsonl").read().strip().split("\n")[-80:]
     except FileNotFoundError:
@@ -127,7 +130,7 @@ def auto_buy():
             continue
         sym = d.get("symbol") or "?"
         mint = d["mint"]
-        if sym in seen_syms or any(p["mint"] == mint for p in b["positions"].values()):
+        if any(p["mint"] == mint for p in b["positions"].values()) or mint in seen_mints:
             continue
         # FIX 3: minimum liquidity gate ($10K per user spec Oct 17) — below: skip+log
         from desk_common import dex_pair
@@ -157,9 +160,14 @@ def auto_buy():
         b["positions"][sym] = {"mint": mint, "entry_px": float(px), "size_usd": size,
                                "entry_usd": size, "initial_usd": size, "opened": time.time(),
                                "state": "full", "age_at_buy": age, "reserved_exit_usd": 0.0,
-                               "stages_done": [], "peak_price": float(px), "trough_price": float(px)}
+                               "stages_done": [], "peak_price": float(px), "trough_price": float(px),
+                               # audit P1 (Oct 18): persist IMMUTABLE entry baselines so the
+                               # monitor's liq-collapse / volume-drying rules compare entry->now
+                               "entry_liq": ((mkt.get("liquidity") or {}).get("usd")) or 0,
+                               "entry_vol_h1": (mkt.get("volume") or {}).get("h1") or 0,
+                               "entry_mc": float(mkt.get("marketCap") or 0)}
         b["cash"] = round(b["cash"] - size, 2)
-        seen_syms.add(sym)
+        seen_mints.add(mint)
         bought.append(f"BUY ${sym} @ ${px} (${size:.0f}, call {age:.0f}m old) {mint[:10]}")
         import position_monitor as _pm
         pos = _pm.load_positions()
@@ -172,7 +180,7 @@ def main():
     for line in auto_buy():
         print(line)
     b = load_book()
-    pos = pm.load_positions()
+    pos = pm.load_positions()  # SINGLE authoritative monitor snapshot (audit P1 Oct 18)
     out = []
     tick_no = 0
     for sym, p in list(b["positions"].items()):
@@ -204,34 +212,48 @@ def main():
         decision_action = None
         if not skip_deep:
             try:
-                mon_pos = pm.load_positions()
-                mp = mon_pos.get(mint) or {"entry_px": p["entry_px"], "size": entry_usd,
+                mp = pos.get(mint) or {"entry_px": p["entry_px"], "size": entry_usd,
                                            "ts": p.get("opened", time.time()), "paper": True,
                                            "symbol": sym, "entry_liq": p.get("entry_liq"),
                                            "entry_vol_h1": p.get("entry_vol_h1")}
                 r = pm.analyze(mint, mp)
-                mon_pos[mint] = mp
-                pm.save_positions(mon_pos)
+                pos[mint] = mp  # merge monitor metadata into the SAME dict saved at end
                 if r.get("ok"):
                     decision_action = r.get("action")
             except Exception:
                 r = None
-        if decision_action in ("CLIP_50", "CLIP_100", "EXIT_ALL", "EMERGENCY_EXIT", "DEAD"):
-            stage = 1 if decision_action == "CLIP_50" else 3
-            if sell_via_stage(b, pos, sym, mint, stage, mult, px,
-                              reason=decision_action, how="decision", out=out):
-                save_book(b); pm.save_positions(pos)
-                continue
+        if decision_action in ("CLIP_50", "CLIP_100", "EXIT_ALL", "EMERGENCY_EXIT", "DEAD",
+                               "SCALE_OUT", "FULL_EXIT"):
+            # audit P0-1 (Oct 18): decision engine returns SCALE_OUT/FULL_EXIT; the
+            # executor previously only knew CLIP_50/CLIP_100/EXIT_ALL/EMERGENCY_EXIT/DEAD,
+            # so contract-driven partial exits were silently ignored.
+            cd = mp.get("last_decision") or {}
+            cfrac = float(cd.get("sell_fraction") or 0.0)
+            if decision_action in ("FULL_EXIT", "EXIT_ALL", "EMERGENCY_EXIT", "DEAD") or cfrac >= 0.99:
+                stage, frac = 3, 1.0
+            elif decision_action in ("SCALE_OUT", "CLIP_50", "CLIP_100") or cfrac > 0.0:
+                stage, frac = 1, 0.5 if cfrac < 0.85 else 1.0
+                if frac >= 0.99:
+                    stage = 3
+            else:
+                stage, frac = None, 0.0
+            if stage:
+                res = sell_via_stage(b, pos, sym, mint, stage, mult, px,
+                                     reason=decision_action, how="decision", out=out)
+                if res:
+                    save_book(b); pm.save_positions(pos)
+                    continue
             # fallback to legacy inline path if stage engine unavailable
-            if "unavailable" in (out[-1] if out else ""):
-                frac = 0.5 if decision_action == "CLIP_50" else 1.0
+            if stage is None or "unavailable" in (out[-1] if out else ""):
+                frac = frac or (0.5 if decision_action == "CLIP_50" else 1.0)
                 sold = entry_usd * frac * mult
                 pnl = sold - entry_usd * frac
                 b["realized"] = round(b.get("realized", 0.0) + pnl, 2)
                 b["cash"] = round(b.get("cash", 0.0) + sold, 2)
                 b.setdefault("trades", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                     "entry_px": p["entry_px"], "exit_px": px, "mult": mult,
-                    "pnl": round(pnl, 2), "how": f"decision_{decision_action.lower()}"})
+                    "pnl": round(pnl, 2), "how": f"decision_{decision_action.lower()}",
+                    "closed": frac >= 0.99})
                 if frac >= 1.0:
                     b["positions"].pop(sym, None)
                     pos.pop(mint, None)

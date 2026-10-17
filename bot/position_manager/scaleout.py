@@ -81,8 +81,15 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage"):
         return None
     delta = sell_delta(book, sym, stage)
     if delta <= 0 and float(p.get("reserved_exit_usd") or 0) > 0:
-        # everything is reserved for THIS intent — the reservation IS the sellable slice
-        delta = float(p["reserved_exit_usd"])
+        # audit P1 (Oct 18): only consume THIS intent's reservation, never the
+        # whole reserved pool (other intents may have reserved inventory for a
+        # different sell). Match by intent_key `{sym}:{how}{stage}`.
+        intent_key = f"{sym}:{how}{stage}"
+        mine = [r for r in (p.get("reservations") or []) if r.get("key") == intent_key]
+        if mine:
+            delta = sum(float(r.get("usd") or 0) for r in mine)
+        else:
+            delta = 0.0
     if delta <= 0:
         p.setdefault("stages_done", []).append(stage)
         save_book(book)
@@ -96,6 +103,11 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage"):
     p["size_usd"] = p["entry_usd"]
     p["reserved_exit_usd"] = 0.0
     p.setdefault("stages_done", []).append(stage)
+    # audit P0-2 (Oct 18): after stage-1 partial, the book position MUST become
+    # "half" so the `state == "half"` bracket branch (TP2/exit) can ever run.
+    # Previously state stayed "full" forever -> stage-2 conditions unreachable.
+    if stage == 1 and not p.get("state") == "half":
+        p["state"] = "half"
     closed = float(p["entry_usd"]) < 0.01 or stage == 3
     if closed:
         b["positions"].pop(sym, None)

@@ -30,7 +30,7 @@ def run_followups(verbose=True):
         else:
             result = "no pair data (provider down or delisted)"
             outcome = "UNKNOWN_DATA"
-        con.execute("UPDATE followups SET done=1, result=? WHERE mint=?", (result, f["mint"]))
+        con.execute("UPDATE followups SET done=1, result=?, outcome=? WHERE mint=?", (result, outcome, f["mint"]))
         log_event({"event": "FOLLOWUP", "mint": f["mint"], "kind": f["kind"], "outcome": outcome, "result": result})
         if verbose:
             print(f"  [{f['kind']}] {f['mint'][:12]}... -> {outcome}: {result}")
@@ -58,6 +58,10 @@ def trade_stats(days=14):
         for t in (pb.get("trades") or []):
             ts = t.get("ts") or 0
             if ts < cutoff:
+                continue
+            # audit P2 (Oct 18): stage-1 partial clips (closed:false) are NOT
+            # position closes — counting them inflated trade count + win rate.
+            if not t.get("closed", True):
                 continue
             k = (t.get("mint"), round(ts))
             if k in seen:

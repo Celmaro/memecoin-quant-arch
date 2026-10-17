@@ -84,12 +84,17 @@ def historical_weight_signals(mint, current_signals, now=None):
     try:
         from bot.persistence import ensure_schema
         from desk_common import db
+        from bot.decision_engine.evidence_ttl import HALF_LIVES
         ensure_schema()
+        # audit P1 (Oct 18): query per configured expiry, not a fixed 1h window —
+        # forensic features (creator_history, aegis_forensic) have 7d hard expiry,
+        # so a 3600s cutoff silently dropped them from the weight.
+        max_expire = max(exp for _h, exp in HALF_LIVES.values())
         con = db()
         rows = con.execute(
             "SELECT signal_text, observed_at, confidence FROM evidence_events "
             "WHERE mint=? AND observed_at > ? ORDER BY observed_at DESC",
-            (mint, now - 3600)).fetchall()
+            (mint, now - max_expire)).fetchall()
         con.close()
     except Exception:
         rows = []
