@@ -67,6 +67,25 @@ def load_allowlist():
 def valid_mint(s):
     return 32 <= len(s) <= 44 and s != SOL_MINT and not s.startswith("0x") and not s.isdigit()
 
+_MINT_VALID_CACHE = {}  # address -> bool, to avoid re-hitting RPC every digest scan
+
+def believable_mint(s):
+    """Audit §3: reject base58-shaped WALLET addresses masquerading as mints.
+    Syntactic check in valid_mint(); on-chain owner check via is_token_mint
+    (cached 5 min in desk_common). A wallet address would be owned by the System
+    program and is not a callable CA."""
+    if not valid_mint(s):
+        return False
+    if s in _MINT_VALID_CACHE:
+        return _MINT_VALID_CACHE[s]
+    try:
+        from desk_common import is_token_mint
+        ok = is_token_mint(s)
+    except Exception:
+        ok = True  # RPC down: be permissive (still caught by freshness gate + scanner path)
+    _MINT_VALID_CACHE[s] = ok
+    return ok
+
 def parse_mints(msg):
     """Extract the REAL CA(s) from a message, correctly.
 
@@ -316,7 +335,12 @@ def process_message(msg, channel):
         return None
     text_mints, dominant = parse_mints(msg)
     rec["mints"], rec["dominant_url_mint"] = text_mints, dominant
-    append_jsonl(MSG_LEDGER, rec)
+    # audit §3: require a POSITIVE call classification — a base58-shaped address
+    # with symbol+MC but no recognized channel call marker is commentary, not a call.
+    if kind == 'none':
+        rec["skip"] = "no_call_marker"
+        append_jsonl(MSG_LEDGER, rec)
+        return None
     lines = []
     calls = []
     if text_mints:
@@ -330,6 +354,10 @@ def process_message(msg, channel):
         calls.append({"mint": dominant, "symbol": sym, "mc": mc,
                       "text": text[:300], "msg_id": msg.id})
     for c in calls:
+        if not believable_mint(c["mint"]):
+            # audit §3: base58 wallet address (System-program owner) is NOT a call
+            c["_rej"] = True
+            continue
         fresh = is_new_mint(c["mint"])
         if fresh:
             rec2 = {"mint": c["mint"], "channel": channel, "dt": rec["dt"], "ts": post_ts,
@@ -340,6 +368,9 @@ def process_message(msg, channel):
                 rec2["mc"] = c["mc"]
             append_jsonl(CALLS, rec2)
             lines.append(f"NEW ${c.get('symbol') or c['mint'][:10]} from {channel} ({rec['dt']})")
+    rec["emitted"] = [c["mint"] for c in calls if not c.get("_rej")]
+    rec["wallet_addr_rejected"] = [c["mint"] for c in calls if c.get("_rej")]
+    append_jsonl(MSG_LEDGER, rec)
     return "; ".join(lines) if lines else None
 
 async def run():
@@ -403,6 +434,18 @@ async def run():
         save_state(state)
         if line:
             print(line, flush=True)
+
+    # audit §3 (Telegram intake boundary): edited messages are revisions — a
+    # channel may add/fix the CA in an edit, or a signal may be reversed.
+    # Re-run the classifier on edits so the ledger records the revision and a
+    # new CA that appears in an edit still becomes a call (freshness gate keeps
+    # late edits from re-buying old calls).
+    @client.on(events.MessageEdited(chats=list(ids_to_name.keys())))
+    async def edit_handler(ev):
+        ch = chan_name(ev.chat_id)
+        line = process_message(ev.message, ch)
+        if line:
+            print(f"EDIT->{line}", flush=True)
 
     await client.run_until_disconnected()
 

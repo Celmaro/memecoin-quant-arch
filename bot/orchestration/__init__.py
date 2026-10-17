@@ -39,26 +39,32 @@ def position_workers():
 
 
 def tick_positions():
-    """Run the decision chain for every open position; returns plain-language lines."""
+    """Run the decision chain for every open position; returns plain-language lines.
+
+    Audit P1-7 fixes:
+      - iterate ALL positions (no `[:8]` skip)
+      - persist the SAME in-memory dict that was mutated (no reload-discard)
+      - no duplicate decision: pm.analyze() already runs decide()+log_decision();
+        this worker surfaces pos['last_decision'] instead of deciding again.
+    """
     import position_monitor as pm
-    from bot.decision_engine import decide
-    from bot.persistence import log_decision
     out = []
-    for mint, pos in list(pm.load_positions().items())[:8]:
+    positions = pm.load_positions()          # single authoritative snapshot
+    for mint, pos in list(positions.items()):
         try:
-            r = pm.analyze(mint, pos)
+            r = pm.analyze(mint, pos)        # logs the decision contract itself
             if not r.get("ok"):
                 continue
-            contract = decide(mint, pos, r.get("signals") or [], r.get("mc"), r.get("liq"),
-                              r.get("mult"), r.get("age_min"), extra={"cash": 0})
-            log_decision(contract, mint)
+            contract = pos.get("last_decision") or {}
+            action = contract.get("action") or "HOLD"
+            frac = contract.get("sell_fraction") or 0
             pos["last_decision_ts"] = time.time()
-            if contract["action"] != "HOLD":
-                out.append(f"${r.get('symbol')} -> {contract['action']} ({contract['sell_fraction']*100:.0f}%) "
-                           f"conf {contract['confidence']:.0f} [{','.join(contract['reason_codes'])}]")
+            if action != "HOLD":
+                out.append(f"${r.get('symbol')} -> {action} ({frac*100:.0f}%) "
+                           f"conf {contract.get('confidence', 0):.0f} [{','.join(contract.get('reason_codes') or [])}]")
         except Exception as e:
             out.append(f"⚠ worker err {mint[:8]}: {str(e)[:60]}")
-    pm.save_positions(pm.load_positions())
+    pm.save_positions(positions)             # persists the same mutated objects
     return out
 
 

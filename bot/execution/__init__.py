@@ -24,6 +24,7 @@ def auto_entry(b, c, px):
                 "why": f"insufficient_cash_{b['cash']:.2f}"}
         return None, None, skip
     pos = {"mint": c["mint"], "entry_px": float(px), "size_usd": size, "entry_usd": size,
+           "initial_usd": size,  # audit P1-4: preserve ORIGINAL basis for the scaleout curve
            "opened": time.time(), "state": "full", "age_at_buy": c.get("age"),
            "channel": c.get("channel"), "confluence": conf, "symbol": c.get("symbol")}
     line = f"BUY ${c.get('symbol')} @ ${px} (${size:.0f}, call {c.get('age', 0):.0f}m old) {c['mint'][:10]}"

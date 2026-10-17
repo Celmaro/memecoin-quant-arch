@@ -68,3 +68,60 @@ def weight_signals(signals_with_ts, now=None):
         details.append({"signal": text[:60], "feature": feature_of(text),
                         "age_s": round(now - ts, 1), "weight": round(w, 3)})
     return round(wfor, 3), round(wagainst, 3), details
+
+
+def historical_weight_signals(mint, current_signals, now=None):
+    """Audit P1-5: decay uses REAL observation timestamps from evidence_events,
+    not a fresh 'now' stamp per signal. Dedupes recurring signals (same text)
+    so a persistent condition doesn't gain weight just because the monitor
+    re-emits it each tick.
+
+    Returns (weighted_for, weighted_against, details) with current_signals
+    stamped at `now` (they are genuinely fresh) + unexpired historical rows
+    weighted by their actual observed_at.
+    """
+    now = now or time.time()
+    try:
+        from bot.persistence import ensure_schema
+        from desk_common import db
+        ensure_schema()
+        con = db()
+        rows = con.execute(
+            "SELECT signal_text, observed_at, confidence FROM evidence_events "
+            "WHERE mint=? AND observed_at > ? ORDER BY observed_at DESC",
+            (mint, now - 3600)).fetchall()
+        con.close()
+    except Exception:
+        rows = []
+    # Dedupe: keep the most recent row per identical signal text
+    latest = {}
+    for r in rows:
+        txt = r["signal_text"] or ""
+        if txt and txt not in latest:
+            latest[txt] = (float(r["observed_at"]), float(r["confidence"] or 1.0))
+    signals_with_ts = [(s, now) for s in current_signals]
+    for txt, (ts, conf) in latest.items():
+        signals_with_ts.append((txt, ts))
+    # collapse duplicate current vs historical same-text (current wins)
+    seen = {}
+    for txt, ts in signals_with_ts:
+        seen[txt] = ts
+    merged = list(seen.items())
+    # weight with per-row confidence from evidence rows
+    try:
+        from bot.decision_engine import _evidences
+    except Exception:
+        from decision_engine import _evidences
+    wfor, wagainst, details = 0.0, 0.0, []
+    for txt, ts in merged:
+        pol_for, pol_against = _evidences([txt])
+        conf = latest.get(txt, (0, 1.0))[1] if txt in latest else 1.0
+        w = w_eff(feature_of(txt), ts, conf, now)
+        if pol_for:
+            wfor += w
+        elif pol_against:
+            wagainst += w
+        details.append({"signal": txt[:60], "feature": feature_of(txt),
+                        "age_s": round(now - ts, 1), "weight": round(w, 3),
+                        "historical": txt in latest})
+    return round(wfor, 3), round(wagainst, 3), details

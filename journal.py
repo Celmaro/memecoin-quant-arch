@@ -38,16 +38,36 @@ def run_followups(verbose=True):
     return len(due)
 
 def trade_stats(days=14):
-    """Aggregate POSITION_CLOSE events: win rate, avg hold, avg mult, PnL sum."""
+    """Aggregate POSITION_CLOSE events + paper_book trades (audit P2-7: the two
+    ledgers must both count, deduped by (mint, ts), so win-rate is unified)."""
     closes = []
     cutoff = time.time() - days * 86400
+    seen = set()
     for path in glob.glob(os.path.join(os.path.expanduser("~/memecoin-quant/journal"), "*.jsonl")):
         with open(path) as f:
             for line in f:
                 try: e = json.loads(line)
                 except Exception: continue
                 if e.get("event") == "POSITION_CLOSE" and e.get("ts", 0) >= cutoff:
-                    closes.append(e)
+                    k = (e.get("mint"), round(e.get("ts", 0)))
+                    if k not in seen:
+                        seen.add(k); closes.append(e)
+    # paper_book trades carry real fills from the exit engine
+    try:
+        pb = json.load(open(os.path.expanduser("~/memecoin-quant/paper_book.json")))
+        for t in (pb.get("trades") or []):
+            ts = t.get("ts") or 0
+            if ts < cutoff:
+                continue
+            k = (t.get("mint"), round(ts))
+            if k in seen:
+                continue
+            seen.add(k)
+            closes.append({"event": "POSITION_CLOSE", "mint": t.get("mint"), "ts": ts,
+                           "realized_usd": t.get("pnl"), "mult": t.get("mult", 1),
+                           "hold_min": (t.get("hold_min") or 0)})
+    except Exception:
+        pass
     if not closes:
         return {"trades": 0}
     wins = [c for c in closes if c.get("realized_usd", 0) > 0]
@@ -64,30 +84,55 @@ def trade_stats(days=14):
     }
 
 def filter_precision(days=14):
-    """PRFS: of scanned coins, did RISK verdicts die while LIVE verdicts survived?"""
+    """PRFS: of scanned coins, did RISK verdicts die while LIVE verdicts survived?
+
+    Audit P2-7: dedupe mints (repeated scans must not double-count) and use
+    scheduled followup outcomes (SURVIVED vs terminal) when available, falling
+    back to current pair existence for coins with no followup yet."""
     con = db()
     cutoff = time.time() - days * 86400
-    rows = con.execute("SELECT * FROM scan_log WHERE ts>=?", (cutoff,)).fetchall()
+    rows = con.execute("SELECT * FROM scan_log WHERE ts>=? ORDER BY ts DESC", (cutoff,)).fetchall()
     if not rows:
         return {"scans": 0}
-    buckets = {"LIVE": [], "CAUTION": [], "RISK": []}
+    buckets = {"LIVE": {}, "CAUTION": {}, "RISK": {}}
     for r in rows:
         b = buckets.get(r["verdict"])
-        if b is not None:
-            b.append(r["mint"])
-    # Alive now?
-    def alive_pct(mints, n=8):
-        alive = 0
+        if b is not None and r["mint"] not in b:
+            b[r["mint"]] = r   # keep latest scan per mint
+    # terminal outcomes from followups (SURVIVED or DEAD/DRAINED)
+    outcome = {}
+    try:
+        for r in con.execute("SELECT mint, outcome FROM followups WHERE done=1 AND outcome IS NOT NULL"):
+            outcome[r["mint"]] = r["outcome"]
+    except Exception:
+        pass
+    con.close()
+
+    def alive_pct(mints, n=20):
+        if not mints:
+            return None
+        alive = 0; counted = 0
         for m in mints[:n]:
+            o = outcome.get(m)
+            if o == "SURVIVED":
+                alive += 1; counted += 1
+                continue
+            if o in ("DEAD", "DRAINED"):
+                counted += 1
+                continue
+            # no followup yet: live check (note: provider down != dead)
             try:
-                if dex_pair(m): alive += 1
+                if dex_pair(m):
+                    alive += 1
+                counted += 1
             except Exception:
                 pass
-        return round(alive / max(1, len(mints[:n])) * 100, 1)
-    return {"scans": len(rows), "live_bucket": len(buckets["LIVE"]), "caution": len(buckets["CAUTION"]),
-            "risk": len(buckets["RISK"]),
-            "live_alive_pct": alive_pct(buckets["LIVE"]),
-            "risk_alive_pct": alive_pct(buckets["RISK"])}
+        return round(alive / max(1, counted) * 100, 1) if counted else None
+
+    l, c, rk = list(buckets["LIVE"]), list(buckets["CAUTION"]), list(buckets["RISK"])
+    return {"scans": sum(len(v) for v in buckets.values()), "live_bucket": len(l), "caution": len(c), "risk": len(rk),
+            "live_alive_pct": alive_pct(l),
+            "risk_alive_pct": alive_pct(rk)}
 
 def report(days=14):
     print(f"=== DESK JOURNAL ({days}d) ===")

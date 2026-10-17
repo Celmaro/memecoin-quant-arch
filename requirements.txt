@@ -1,0 +1,18 @@
+# memecoin-quant-arch — Python dependencies (run-time)
+# Python 3.12 is the primary interpreter. The Telegram intake runs inside a
+# venv (.venv) because Telethon is only needed there.
+# Install for the desk core:
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install -r requirements.txt
+# The listener additionally needs: pip install telethon==1.45.0
+
+# --- core desk ---
+# (stdlib-only by design for the analysis engine: urllib, json, sqlite3, re,
+#  statistics — no third-party runtime deps required for desk_common/aegis/
+#  position_monitor/journal)
+
+# --- Telegram intake (MTProto) ---
+telethon==1.45.0
+
+# --- dev/test ---
+# pytest         # when the test suite under tests/ is run

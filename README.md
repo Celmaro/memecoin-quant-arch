@@ -2,12 +2,25 @@
 
 Solana memecoin **quick-flip research desk** running as a Hermes Agent, $100 bankroll,
 learning phase (no live execution — the agent researches/scans/monitors, the user pulls
-every trigger).
+every trigger). **Auto paper-trading is live**: fresh curated calls auto-buy paper
+positions (hard `$10K` liquidity gate), then a 1-minute monitor tick manages exits
+(MC-adaptive scale-out). No real funds are ever touched by the code.
 
 > **ENTRY SIGNALS COME ONLY FROM THE USER'S CURATED TELEGRAM LIST. WE BUY ALL CALLS.**
 > Every other tool (DexScreener, GMGN, FomoAPI, Bitquery, Birdeye, Ave, WS streams,
 > trending boards, scan-group bots) is analysis/monitoring/enrichment of calls already
 > received — **never an entry source**.
+
+## Audit status (Oct 17 2026 — P0/P1/P2 + Telegram boundary implemented)
+
+All findings from the two independent audits of commit `aee6a18` are addressed and
+regression-tested (`audit_regression_test.py`): Jupiter impact 100× fix, config/
+allowlist agreement, intelligence signatures, risk-gate wiring, evidence TTL from
+historical timestamps, wallet unit separation, single-tier exit authority, unified
+ledger counting, mint-vs-wallet on-chain validation, positive call classification,
+MessageEdited tracking, AEGIS risk dedupe, CoinStats circuit breaker, rpc() through
+the shared limiter. Missing runtime files (`paper_tick`, `desk_tick`, watchdogs,
+notifier) are now in-repo under `scripts/` so the repository is runnable as documented.
 
 ---
 

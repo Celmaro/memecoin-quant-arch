@@ -41,7 +41,9 @@ def _helius_das_owners(mint, limit=1000):
 _LP_EXCLUDE = {"so11111111111111111111111111111111111111112", "675kxpm8g7eh9tofc2x3k2ylj5ylowykfzr5", ""}
 
 def top_holder_balances(mint, n=10):
-    """Top n holder balances + classify each as accumulating/distributing vs last record."""
+    """Top n holder balances + classify each as accumulating/distributing vs last
+    TOKEN-BALANCE SNAPSHOT record (audit P1-6: never compare against USD-notional
+    buy rows — only compatible token-quantity 'snapshot' events)."""
     accts = _helius_das_owners(mint)
     if not accts:
         return None
@@ -49,8 +51,10 @@ def top_holder_balances(mint, n=10):
     accts.sort(key=lambda x: -x[1])
     out = []
     for owner, amt in accts[:n]:
-        prev = wallet_balances(owner, mint, limit=1)
-        prev_amt = prev[0]["balance"] if prev else None
+        # find the most recent *snapshot* row for this wallet+mint
+        hist = wallet_balances(owner, mint, limit=50)
+        snaps = [h for h in hist if h.get("event") == "snapshot"]
+        prev_amt = float(snaps[0]["balance"]) if snaps else None
         delta = None
         if prev_amt is not None:
             delta = (amt - prev_amt) / prev_amt if prev_amt else None

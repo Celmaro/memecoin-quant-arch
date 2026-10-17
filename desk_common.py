@@ -144,13 +144,23 @@ DEFAULT_RATE_LIMITS = {
 }
 set_rate_limits(DEFAULT_RATE_LIMITS)
 
-def rpc(method, params, rpc_url=None):
+def rpc(method, params, rpc_url=None, retries=2):
+    """RPC call through the shared limiter + retry (audit P2-6: rpc() bypassed
+    the central _limiter and had no retry; now both are consistent)."""
     cfg = load_config()
     url = rpc_url or f"https://mainnet.helius-rpc.com/?api-key={cfg['HELIUS_KEY']}"
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read().decode()).get("result")
+    last = None
+    for attempt in range(retries + 1):
+        _limiter.acquire(_host_of(url))
+        try:
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                return json.loads(r.read().decode()).get("result")
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (attempt + 1))
+    return None  # soft-fail contract: callers treat None as missing data
 
 # ---------- GMGN quotation rank (verified free, no key — Oct 16 2026) ----------
 # Endpoint: gmgn.ai/defi/quotation/v1/rank/sol/swaps/{1m|5m|1h|6h|24h}
@@ -486,6 +496,86 @@ def rugcheck(mint, full=False):
         return http_json(url)[1]
     except Exception:
         return None
+
+# --- TTL cache (audit P2-5: slow forensics cached across the position lifecycle) ---
+import threading as _threading
+_CACHE = {}
+_CACHE_LOCK = _threading.Lock()
+
+def ttl_cache_get(key, max_age_s):
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit and time.time() - hit[0] <= max_age_s:
+            return hit[1]
+        _CACHE.pop(key, None)
+        return None
+
+def ttl_cache_put(key, val):
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.time(), val)
+        if len(_CACHE) > 512:  # bound memory
+            oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
+            _CACHE.pop(oldest, None)
+
+# CoinStats is quota-exhausted (every call 406) — circuit-break so the monitor
+# never burns a tick on it (audit P2-5: "still tries it for top holders each analysis").
+_COINSTATS_DEAD_UNTIL = [0.0]
+
+def coinstats_balance(wallet, connection="solana"):
+    """CoinStats wallet balance (X-API-KEY). Returns LIST directly.
+
+    ⚠️ Oct 16 2026: free-tier credits exhausted -> every endpoint 406. Circuit
+    breaker: after the first 406 the path returns [] for 30 min without calling
+    (audit P2-5). Logs a degraded marker once so the desk knows, not silently.
+    """
+    if time.time() < _COINSTATS_DEAD_UNTIL[0]:
+        return []
+    cfg = load_config()
+    ck = cfg.get("COINSTATS_KEY")
+    if not ck: return []
+    try:
+        url = f"https://openapiv1.coinstats.app/v1/wallet/balance?address={wallet}&connectionId={connection}"
+        st, data = http_json(url, headers={"X-API-KEY": ck, "Accept": "application/json"})
+        if isinstance(data, list):
+            return data
+        res = data.get("result") or []
+        return res if isinstance(res, list) else []
+    except Exception:
+        # 406 = credits exhausted; mark degraded once + circuit-break 30 min
+        _COINSTATS_DEAD_UNTIL[0] = time.time() + 1800
+        try:
+            log_event({"event": "COINSTATS_DEGRADED", "detail": "406 credits limit"})
+        except Exception:
+            pass
+        return []
+
+# mint-vs-wallet discrimination: a valid SPL token MINT is owned by the Token
+# program (or is a token-2022/metadata mint); a plain wallet is owned by the
+# System program. Cached per address (Telegram-intake boundary, audit §3).
+def is_token_mint(address, timeout_cache=300):
+    """Return True if `address` is an SPL token/Token-2022/Metaplex MINT account.
+
+    Wallets are owned by the System program; token mints are owned by the
+    Token programs. Cached per address (Telegram-intake boundary, audit §3).
+    """
+    if not (32 <= len(str(address)) <= 44) or address == "So11111111111111111111111111111111111111112":
+        return False
+    cached = ttl_cache_get(("mint?", address), timeout_cache)
+    if cached is not None:
+        return cached
+    TOKEN_PROGRAMS = {
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   # Token-2022 (correct address)
+        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",    # Metaplex metadata
+    }
+    try:
+        acc = rpc("getAccountInfo", [address, {"encoding": "jsonParsed"}])
+        owner = (acc or {}).get("value", {}).get("owner") or ""
+        ok = owner in TOKEN_PROGRAMS
+        ttl_cache_put(("mint?", address), ok)
+        return ok
+    except Exception:
+        return False
 
 def ave_risk(mint):
     """Ave.ai Contract Risk Detection Report — verified working (X-API-KEY header).

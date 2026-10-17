@@ -293,7 +293,9 @@ def analyze(mint, pos):
                     try:
                         from bot.persistence import wallet_history_add
                         for wb in (power.get("wallet_buys") or [])[:15]:
-                            wallet_history_add(wb["wallet"], mint, wb.get("usd", 0.0), "buy")
+                            # audit P1-6: mark as NOTIONAL USD explicitly — never feed
+                            # this into token-balance comparisons (wallet_intel filters snapshots)
+                            wallet_history_add(wb["wallet"], mint, wb.get("usd", 0.0), "buy_usd_notional")
                     except Exception:
                         pass
             except Exception:
@@ -389,16 +391,34 @@ def analyze(mint, pos):
                 log_evidence(mint, s, observed_ts=now_ev)
             except Exception:
                 pass
-        ttl_weights = weight_signals([(s, now_ev) for s in signals])
+        try:
+            from bot.decision_engine.evidence_ttl import historical_weight_signals
+            ttl_weights = historical_weight_signals(mint, signals, now=now_ev)  # audit P1-5: real observed timestamps + dedupe
+        except Exception:
+            ttl_weights = weight_signals([(s, now_ev) for s in signals])
         # Pass real paper-book cash so ADD decisions are possible (audit F5)
         try:
             pb = json.load(open("/home/agentuser/memecoin-quant/paper_book.json"))
             book_cash = float(pb.get("cash") or 0)
+            book_pos = {(p.get("mint") or ""): s for s, p in (pb.get("positions") or {}).items()}
         except Exception:
             book_cash = 0.0
+            book_pos = {}
         # doc-1 decision contract: log every tick's decision with full evidence
         contract = decide(mint, pos, signals, mc, liq, mult, age_min,
                           extra={"cash": book_cash, "ttl": (ttl_weights[0], ttl_weights[1])})
+        # audit P1-2: every contract passes the deterministic risk gate before apply
+        try:
+            from bot.decision_engine.risk_gate import gate
+            sym_key = book_pos.get(mint)
+            if sym_key:
+                allowed, gnotes = gate(contract, pb, sym_key, quote_ts=None)
+                if allowed != contract.get("action"):
+                    contract = dict(contract)
+                    contract["action"] = allowed
+                    contract["reason_codes"] = list(contract.get("reason_codes") or []) + ["RISK_GATE:" + ";".join(gnotes)]
+        except Exception:
+            pass
         log_decision(contract, mint)
         pos["last_decision"] = {k: contract[k] for k in ("action", "sell_fraction", "confidence", "thesis_state")}
         pos["last_decision_px"] = px
