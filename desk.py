@@ -281,6 +281,110 @@ def main():
             print(__doc__); return 1
         return 0
 
+    if cmd == "blix":
+        """Live Blix radar (localhost:4420) — holders, metrics, forensics, signals.
+        Usage: desk.py blix [overview|signals|perf|pulse|fomo|token <mint>|holders <mint>|watch]
+        watch = holders + candles + signals for every OPEN paper position."""
+        import json
+        import urllib.request
+        B = "http://localhost:4420"
+        def _get(path):
+            try:
+                with urllib.request.urlopen(f"{B}{path}", timeout=15) as r:
+                    return json.loads(r.read().decode())
+            except Exception as e:
+                return {"_err": str(e)[:120]}
+        sub = args[1] if len(args) > 1 else "overview"
+        if sub == "overview":
+            d = _get("/api/overview")
+            if "_err" in d: print("❌ blix down:", d["_err"]); return 1
+            s = d.get("stats", {})
+            print(f"🎛 Blix radar: {s.get('tracked',0)} tracked · {s.get('launchesLastHour',0)} launches/hr · "
+                  f"{s.get('graduated',0)} graduated · stage={s.get('stage')} pump={s.get('pump')}")
+            print(f"   signals24h={d.get('counts',{}).get('signals24h',0)} graduations24h={d.get('counts',{}).get('graduated24h',0)}")
+        elif sub == "signals":
+            d = _get("/api/signals?limit=10")
+            if isinstance(d, list):
+                print(f"🔔 Blix signals ({len(d)}):")
+                for s in d[:10]:
+                    print(f"  [{s.get('kind')}]{' ⭐' if s.get('score',0)>=70 else ''} ${s.get('title','')[:40]} mc=${s.get('mcap',0):,}")
+            else: print("  ", d)
+        elif sub == "perf":
+            d = _get("/api/perf")
+            if "_err" in d: print("❌", d["_err"]); return 1
+            a = d.get("all", {}).get("events", {})
+            print(f"📊 Blix track record: {a.get('events',0)} events · up20+={a.get('up20',0)} down50={a.get('down50',0)} "
+                  f"2x={a.get('twoX',0)} medianPeak={a.get('medianPeak')} pending1h={a.get('pending1h')}")
+        elif sub == "pulse":
+            d = _get("/api/pulse")
+            print("🎯 Blix pulse — new pairs:", len(d.get("newPairs", [])), "| final stretch:", len(d.get("finalStretch", [])),
+                  "| migrated:", len(d.get("migrated", [])), "| running:", len(d.get("running", [])))
+            for c in (d.get("newPairs") or [])[:5]:
+                print(f"  NEW ${c.get('symbol','?')} mc=${c.get('mcap',0):,.0f} age={c.get('age',0)}s")
+        elif sub == "fomo":
+            d = _get("/api/fomo")
+            print(f"👥 Blix Fomo: connected={d.get('connected')} wallets={d.get('fomoWallets')} "
+                  f"trades1h={d.get('tradesLastHour')} traders1h={d.get('tradersLastHour')}")
+        elif sub in ("token", "holders"):
+            mint = args[2] if len(args) > 2 else None
+            if not mint and sub == "holders":
+                print("usage: desk.py blix holders <mint>"); return 1
+            if not mint:
+                # find first mint with data in pulse/tokens
+                pulse = _get("/api/pulse")
+                for c in (pulse.get("newPairs") or [])[:3] + (pulse.get("running") or [])[:3]:
+                    mint = c.get("mint")
+                    if mint: break
+            if sub == "token":
+                d = _get(f"/api/token/{mint}")
+                if "_err" in d or "error" in d: print("❌", d); return 1
+                print(f"🔍 Blix token {mint[:12]}...: {str(d)[:600]}")
+            else:
+                d = _get(f"/api/holders/{mint}?top=15")
+                if "_err" in d or "error" in d: print("❌", d); return 1
+                print(f"👥 Blix holders {mint[:12]}...: {d.get('holders','?')} total")
+                top10 = d.get("top10") or d.get("top10Share") or 0
+                if top10: print(f"   top10 share: {top10*100:.1f}%" if top10 <= 1 else f"   top10 share: {top10:.1f}%")
+                for h in (d.get("top") or [])[:15]:
+                    pct = h.get("pct", 0)
+                    pct = pct / 100 if pct > 1 else pct  # blix returns pct as % (2.71 = 2.71%)
+                    tags = ",".join(t for t in ("dev","sniper","bundle") if h.get("tag") == t or h.get(t))
+                    print(f"   {h.get('wallet','?')[:10]}  {pct*100:.2f}%  {h.get('sol',0):,.2f}SOL {h.get('trades',0)}tx [{tags}]")
+        elif sub == "watch":
+            # held positions: holders + candles + signals for each open position
+            positions = __import__("json").load(open("/home/agentuser/memecoin-quant/paper_book.json"))["positions"]
+            if not positions:
+                print("no open positions"); return 0
+            for sym, p in list(positions.items())[:5]:
+                mint = p["mint"]
+                print(f"\n===== ${sym} {mint[:12]}... =====")
+                h = _get(f"/api/holders/{mint}?top=10")
+                if "_err" not in h and "error" not in h:
+                    t10 = h.get("top10") or h.get("top10Share") or 0
+                    print(f"  holders: {h.get('holders','?')} total, T10={t10*100:.1f}%" if t10 <= 1 else f"  holders: {h.get('holders','?')} total, T10={t10:.1f}%")
+                    for hh in (h.get("top") or [])[:5]:
+                        pct = hh.get("pct", 0)
+                        pct = pct / 100 if pct > 1 else pct
+                        tags = ",".join(t for t in ("dev","sniper","bundle") if hh.get("tag") == t or hh.get(t))
+                        print(f"    {hh.get('wallet','?')[:10]} {pct*100:.2f}% {hh.get('sol',0):,.2f}SOL [{tags}]")
+                else:
+                    print("  holders: n/a (radar hasn't tracked)")
+                c = _get(f"/api/candles/{mint}?tf=5m")
+                if "_err" not in c and c.get("rows"):
+                    rows = c["rows"]
+                    last = rows[-1]
+                    print(f"  candles: {len(rows)}x5m, last close={last.get('close',0):,.0f} mcap")
+                else:
+                    print("  candles: n/a")
+            sigs = _get("/api/signals?limit=5")
+            if isinstance(sigs, list) and sigs:
+                print("\n🔔 recent signals:")
+                for s in sigs[:5]:
+                    print(f"  [{s.get('kind')}] ${s.get('title','')[:40]} mc=${s.get('mcap',0):,}")
+        else:
+            print(__doc__); return 1
+        return 0
+
     print(f"unknown command: {cmd}"); print(__doc__); return 1
 
 if __name__ == "__main__":
