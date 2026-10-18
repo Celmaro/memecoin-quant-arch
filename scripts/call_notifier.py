@@ -120,8 +120,12 @@ def main():
     next_ts = st.get("last_ts", 0)
 
     out = []
+    instant = set(st.get("instant_sent") or [])
     for c in posted:
         mint = c.get("mint") or "?"
+        if mint in instant:
+            next_ts = max(next_ts, float(c.get("ts") or 0))  # already carded instantly
+            continue
         chan = (c.get("channel") or "?").replace("Trending", "").replace("trending", "")
         sym, mc = c.get("symbol"), None
         try:

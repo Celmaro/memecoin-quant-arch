@@ -383,6 +383,22 @@ def process_message(msg, channel):
                 rec2["mc"] = c["mc"]
             append_jsonl(CALLS, rec2)
             lines.append(f"NEW ${c.get('symbol') or c['mint'][:10]} from {channel} ({rec['dt']})")
+            # INSTANT-TRIGGER: poke the notifier the moment a call lands (fire-and-forget,
+            # non-blocking for the listener loop; file-lock prevents double-runs).
+            try:
+                import threading, subprocess
+                def _poke(mint=rec2["mint"], ch=channel):
+                    try:
+                        subprocess.run(
+                            [sys.executable,
+                             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "instant_trigger.py"), mint, ch],
+                            timeout=280, capture_output=True)
+                    except Exception:
+                        pass
+                threading.Thread(target=_poke, daemon=True).start()
+            except Exception:
+                pass
     rec["emitted"] = [c["mint"] for c in calls if not c.get("_rej")]
     rec["wallet_addr_rejected"] = [c["mint"] for c in calls if c.get("_rej")]
     append_jsonl(MSG_LEDGER, rec)
