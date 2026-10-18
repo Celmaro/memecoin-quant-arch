@@ -242,6 +242,89 @@ def auto_buy():
         save_book(b)
     return bought
 
+
+def entry_call(d, b=None):
+    """Oct 19: DIRECT single-call paper entry (used by notifier after AEGIS card).
+
+    Applies the same guards as auto_buy's loop (liq >= $10K gate, no 5m dump, no
+    seller flood, fill-latency slip, dedupe vs open positions + consumed ledger) but
+    for ONE call dict — so the DM notifier can trigger the buy immediately after the
+    AEGIS deep card, without waiting for paper_tick's next cron.
+    Returns (bought_line, skip_reason|None)."""
+    import json as _j
+    b = b if b is not None else load_book()
+    if not b.get("autobuy", True):
+        return None, "autobuy_disabled"
+    mint = d.get("mint")
+    sym = d.get("symbol") or "?"
+    if not mint:
+        return None, "no_mint"
+    # dedupe: open positions + consumed ledger
+    if any(p.get("mint") == mint for p in b["positions"].values()) or mint in _consumed_mints():
+        return None, "already_held_or_consumed"
+    mkt = dex_pair(mint) or {}
+    liq = ((mkt.get("liquidity") or {}).get("usd")) or 0
+    if liq < 10000:
+        b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                            "why": f"thin_liquidity_${liq:,.0f}"})
+        save_book(b)
+        return None, f"thin_liquidity_${liq:,.0f}"
+    px = mkt.get("priceUsd")
+    if not px:
+        return None, "no_price"
+    # entry hygiene (Doc1-3)
+    chg = mkt.get("priceChange") or {}
+    txns5 = (mkt.get("txns") or {}).get("m5") or {}
+    b5, s5 = txns5.get("buys") or 0, txns5.get("sells") or 0
+    if float(chg.get("m5") or 0) <= -5.0:
+        b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                            "why": f"dumping_5m_{chg.get('m5'):+.1f}%"})
+        save_book(b)
+        return None, f"dumping_5m_{chg.get('m5'):+.1f}%"
+    if s5 >= 6 and s5 > 2 * b5:
+        b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                            "why": f"seller_flood_{b5}B/{s5}S_5m"})
+        save_book(b)
+        return None, f"seller_flood_{b5}B/{s5}S_5m"
+    FILL_LATENCY_SLIP_PCT = 1.0
+    px = float(px) * (1 + FILL_LATENCY_SLIP_PCT / 100)
+    if sym == "?" or sym == "None":
+        sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
+    conf = d.get("confluence") or len(d.get("channels") or [1])
+    size = 25.0 if conf >= 2 else 20.0
+    size = min(size, b["cash"])
+    if size < 10:
+        b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                            "why": f"insufficient_cash_${b['cash']:.2f}"})
+        save_book(b)
+        return None, f"insufficient_cash_${b['cash']:.2f}"
+    age = (time.time() - float(d.get("ts") or time.time())) / 60
+    b["positions"][mint] = {"mint": mint, "symbol": sym, "entry_px": float(px), "size_usd": size,
+                           "entry_usd": size, "initial_usd": size, "opened": time.time(),
+                           "state": "full", "age_at_buy": max(0, age), "reserved_exit_usd": 0.0,
+                           "stages_done": [], "peak_price": float(px), "trough_price": float(px),
+                           "entry_liq": liq,
+                           "entry_vol_h1": (mkt.get("volume") or {}).get("h1") or 0,
+                           "entry_mc": float(mkt.get("marketCap") or 0)}
+    b["cash"] = round(b["cash"] - size, 2)
+    try:
+        with open(CONSUMED_FILE, "a") as cf:
+            cf.write(_j.dumps({"mint": mint, "symbol": sym, "channel": d.get("channel"),
+                               "msg_id": d.get("msg_id"), "ts": time.time()}) + "\n")
+    except Exception:
+        pass
+    import position_monitor as _pm
+    pos = _pm.load_positions()
+    pos[mint] = {"symbol": sym, "entry_px": float(px), "size": size, "ts": time.time(), "paper": True,
+                 "entry_liq": liq,
+                 "entry_vol_h1": (mkt.get("volume") or {}).get("h1") or 0,
+                 "entry_mc": float(mkt.get("marketCap") or 0)}
+    _pm.save_positions(pos)
+    save_book(b)
+    line = f"🛒 PAPER BUY ${sym} @ ${px} (${size:.0f}, call {max(0,age):.0f}m old) {mint[:10]}"
+    return line, None
+
+
 def main():
     for line in auto_buy():
         print(line)

@@ -1,39 +1,26 @@
 #!/usr/bin/env python3
-"""call_notifier.py — announce FRESH curated calls.
+"""call_notifier.py — DIRECT curated-call pipeline (Oct 19, scanner group REMOVED).
+
+NEW FLOW (user mandate): channel call -> listener -> calls.jsonl -> DEEP AEGIS
+forensics -> one card to DM -> paper_tick auto-buys. NO group post, NO scanner
+collection, NO curator card. The HMQ scan group is OUT of the workflow.
 
 - DM line -> stdout (no_agent cron delivers to the user's DM)
-- HMQ scan group post -> Telethon HUMAN account (treizodemayo) — NOT the bot token
-  (bot token is reserved for the gateway's DM polling; one token = one getUpdates
-  consumer). Posting as human ALSO triggers the scan bots, which the curator then
-  collects into one curated card — the full loop.
+- Deep AEGIS (score_coin deep=True) replaces the old group-scanner aggregation
+- paper_tick auto_buy (its own 1m cron) consumes calls.jsonl independently — it
+  reads the same file, so AEGIS enrichment and the paper entry happen in parallel.
 
 Run via cron every 1m (no_agent). Silent when no fresh calls.
 State: ~/memecoin-quant/notifier_state.json (watermark last_ts)
 """
-import asyncio, json, os, sys, time
+import json, os, sys, time
 
 DESK = os.path.expanduser("~/memecoin-quant")
 CALLS = os.path.join(DESK, "calls.jsonl")
 STATE = os.path.join(DESK, "notifier_state.json")
-POSTBOX = os.path.join(DESK, "pending_group_posts.jsonl")
-GROUP = "HMQcheckergroup"
-MAX_POST = 4  # cap per tick so a burst doesn't flood the group
+MAX_POST = 4  # cap per tick so a burst doesn't flood the DM
 
 sys.path.insert(0, DESK)
-
-
-def queue_hmq_post(text, mint=None, channel=None):
-    """Queue a group post for the scan curator daemon to send (it owns the human
-    account connection). One Telethon connection for group posting = no session
-    conflicts, and the curator naturally triggers scan bots on these posts.
-    mint + channel ride along so the curated card can attribute the source."""
-    try:
-        with open(POSTBOX, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "text": text,
-                                "mint": mint, "channel": channel}) + "\n")
-        return True
-    except Exception:
-        return False
 
 
 def load_state():
@@ -50,27 +37,39 @@ def save_state(s):
     os.replace(tmp, STATE)
 
 
-def post_hmq_human(text):
-    """Post into the HMQ scan group as the human account via Telethon (own session)."""
-    try:
-        import asyncio
-        from telethon import TelegramClient
+def deep_aegis_card(mint, chan, sym, mc):
+    """Run DEEP AEGIS forensics on the mint and build the DM card.
 
-        async def _go():
-            creds = json.load(open(f"{DESK}/.tg_credentials.json"))
-            client = TelegramClient(f"{DESK}/tg_session_curator",
-                                    creds["api_id"], creds["api_hash"])
-            await client.connect()
-            if not await client.is_user_authorized():
-                await client.disconnect()
-                return False
-            g = await client.get_entity(GROUP)
-            await client.send_message(g, text)
-            await client.disconnect()
-            return True
-        return asyncio.run(_go())
-    except Exception:
-        return False
+    Returns (card_text, score, verdict) or (None, None, None) if scan fails.
+    The card carries: source channel, full CA, symbol, AEGIS score/verdict,
+    sub-scores (interpretable layers), and the flags that drove the score.
+    """
+    try:
+        import aegis
+        rep = aegis.score_coin(mint, deep=True)
+        score = rep.get("score")
+        verdict = rep.get("verdict")
+        flags = rep.get("flags") or []
+        sub = rep.get("sub_scores") or {}
+        card = []
+        card.append(f"🧠 AEGIS deep scan — ${sym or rep.get('symbol') or mint[:10]}")
+        card.append(f"📡 source: {chan}")
+        card.append(f"💠 CA: {mint}")
+        if mc:
+            card.append(f"📊 call MC: ${mc:,.0f}")
+        card.append(f"🛡 AEGIS: {score}/100 — {verdict}")
+        if sub.get("bad") or sub.get("good"):
+            bad = sub.get("bad") or {}
+            good = sub.get("good") or {}
+            card.append("  layers: " + " | ".join(
+                f"{k}: {bad.get(k,0)}⚠/{good.get(k,0)}✓" for k in ("security","tape","distribution","ecosystem")))
+        if flags:
+            shown = [f for f in flags if f and not f.startswith(("clean_snapshot", "deployer_wi_score"))]
+            if shown:
+                card.append("  flags: " + ", ".join(shown[:8]))
+        return "\n".join(card), score, verdict
+    except Exception as e:
+        return None, None, None
 
 
 def main():
@@ -93,13 +92,10 @@ def main():
     if not fresh:
         return 0  # silent
 
-    # audit P2 (Oct 18): calls.jsonl is NOT chronological — sort by timestamp ASCENDING
-    # and always consume the OLDEST MAX_POST first. That makes the watermark advance to
-    # exactly the newest of the consumed batch, so a higher-ts record that appeared later
-    # in the file stays fresh (never permanently skipped by an out-of-order max).
+    # calls.jsonl is NOT chronological — sort by ts ascending, consume oldest first
     fresh.sort(key=lambda c: float(c.get("ts") or 0))
     posted = fresh[:MAX_POST]
-    next_ts = st.get("last_ts", 0)  # only advance past calls whose queue actually succeeded
+    next_ts = st.get("last_ts", 0)
 
     out = []
     for c in posted:
@@ -114,21 +110,32 @@ def main():
                 mc = (p.get("marketCap") or 0)
         except Exception:
             pass
-        mc_s = f" at ${mc:,.0f} MC" if mc else ""
-        dm = f"📢 New call: ${sym or '?'} (from {chan}){mc_s}\n   CA: {mint}"
-        out.append(dm)
-        hmq_text = f"📡 Channel call: ${sym or '?'} from {chan}{mc_s}\nCA: {mint}"
-        # queue with channel + mint so the curator card can attribute the source
+        # DEEP AEGIS instead of group scanner aggregation (user mandate Oct 19)
+        card, score, verdict = deep_aegis_card(mint, chan, sym, mc)
+        if card:
+            out.append(card)
+        else:
+            # scan failed — still alert with basic info so the call isn't lost
+            mc_s = f" at ${mc:,.0f} MC" if mc else ""
+            out.append(f"📢 New call: ${sym or '?'} (from {chan}){mc_s}\n   CA: {mint}")
+        # TRIGGER THE BUY IMMEDIATELY after the AEGIS card (user mandate Oct 19):
+        # paper_tick.entry_call applies the $10K liq gate + hygiene + dedupe.
         try:
-            if queue_hmq_post(hmq_text, mint=mint, channel=chan):
-                next_ts = max(next_ts, float(c.get("ts") or 0))
-            # audit P2: on queue failure, do NOT advance the watermark — retry next tick
-        except Exception:
-            pass
+            sys.path.insert(0, DESK)
+            from paper_tick import entry_call, load_book
+            bought_line, skip = entry_call(c)
+            if bought_line:
+                out.append(bought_line)
+            elif skip:
+                out.append(f"⏭ skipped: {skip} (${sym or mint[:8]})")
+        except Exception as e:
+            out.append(f"⚠ auto-buy error {mint[:8]}: {str(e)[:60]}")
+        # watermark advances only if processed
+        next_ts = max(next_ts, float(c.get("ts") or 0))
 
     save_state({"last_ts": next_ts})
     if out:
-        print("\n".join(out))
+        print("\n\n".join(out))
     return 0
 
 
