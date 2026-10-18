@@ -290,7 +290,9 @@ def score_coin(mint, deep=False):
     r = check_top10_and_lp(mint)
     m = check_metadata_and_liquidity(mint)
 
-    score = 50.0
+    score = 65.0  # recalibrated base (Oct 18): base 50 + 15 headroom so typical
+    # memecoins land 30-70 (research: only <30 is a true veto; 55+ strong). The old
+    # base 50 let the stack of independent checks zero most tokens, killing the band.
     verdict = "LIVE"
     flags = []
 
@@ -303,7 +305,7 @@ def score_coin(mint, deep=False):
         score -= 40; flags.append("RUGGED_FLAG")
         verdict = "RUGGED"
     if r.get("graph_insiders"):
-        score -= 15; flags.append("insider_graph_detected")
+        score -= 10; flags.append("insider_graph_detected")  # recalib: -15->-10
     if r.get("transfer_fee"):
         score -= 10; flags.append("transfer_fee_present")
     if isinstance(r.get("risks"), list):
@@ -363,7 +365,7 @@ def score_coin(mint, deep=False):
                     elif ratio >= 0.3:
                         score -= 6; flags.append("ws_sell_pressure")
                     else:
-                        score -= 10; flags.append("ws_dumping")
+                        score -= 6; flags.append("ws_dumping")
             # too few trades = dead tape at scan time
             if not trades or len(trades) < 3:
                 flags.append("ws_quiet_tape")
@@ -487,7 +489,7 @@ def score_coin(mint, deep=False):
             # top-1 concentration
             top1 = th[0].get("balance_ratio") or 0
             if top1 > 0.5:
-                score -= 12; flags.append(f"ave_top1_{top1*100:.0f}%")
+                score -= 6; flags.append(f"ave_top1_{top1*100:.0f}%")  # recalib: -12->-6 (whale-held is common in memecoins)
             # count holders with realized profit taken on this mint (smart exits visible)
             sold_profit = sum(1 for h in th if (h.get("realized_profit") or 0) > 0)
             if sold_profit >= max(3, n // 3):
@@ -513,6 +515,115 @@ def score_coin(mint, deep=False):
                     score -= 5; flags.append(f"rug_trade_insiders_x{trade_nets}")
     except Exception:
         pass  # rugcheck down — never block
+
+    # --- 17th check: LIVE MICROSTRUCTURE (CVD, buy concentration) from GeckoTerminal tape ---
+    # Recalibration Oct 18: the old AEGIS was contract-heavy (mint/freeze/lp/rug).
+    # It ignored the LIVE quality metrics the desk already computes. This overlay
+    # adds bounded market-microstructure scoring so real buyers/flow move the score.
+    try:
+        from bot.intelligence.microstructure import microstructure
+        micro = microstructure(mint)
+        if micro:
+            cvd = micro.get("cvd")
+            n_buys = micro.get("n_buys") or 0
+            n_sells = micro.get("n_sells") or 0
+            bc = micro.get("buy_concentration")
+            if cvd is not None:
+                if cvd > 0.4:
+                    score += 6; flags.append(f"micro_cvd_pos_{cvd:+.2f}")
+                elif cvd < -0.4:
+                    score -= 8; flags.append(f"micro_cvd_neg_{cvd:+.2f}")
+            if bc is not None and bc >= 0.6:
+                score -= 6; flags.append(f"micro_buy_conc_{bc:.0%}")
+            # tx ratio is a SECONDARY read of the same tape — only apply when CVD
+            # gave no signal, to avoid double-counting one snapshot (audit Oct 18)
+            if cvd is None or -0.4 <= (cvd or 0) <= 0.4:
+                if n_buys and n_sells and (n_buys + n_sells) >= 5:
+                    ratio = n_buys / (n_buys + n_sells)
+                    if ratio >= 0.7:
+                        score += 4; flags.append(f"micro_tx_ratio_{ratio:.2f}")
+                    elif ratio <= 0.3:
+                        score -= 4; flags.append(f"micro_tx_ratio_{ratio:.2f}")
+    except Exception:
+        pass
+
+    # --- 18th check: HOLDER CHURN / RETENTION (who's still holding vs leaving) ---
+    try:
+        churn = holder_churn(mint)
+        if churn:
+            ret = churn.get("retention")
+            churned = churn.get("churned") or 0
+            added = churn.get("holders_added") or 0
+            if ret is not None:
+                if ret < 0.60:
+                    score -= 8; flags.append(f"churn_retention_low_{ret:.0%}")
+                elif ret > 0.85:
+                    score += 5; flags.append(f"churn_retention_high_{ret:.0%}")
+            # renewal/loss is a SECONDARY read (same snapshot) — only apply when
+            # retention gave no signal, to avoid double-counting (audit Oct 18)
+            if ret is None or 0.60 <= (ret or 0) <= 0.85:
+                if churned and churned > 0 and added and added > churned * 2:
+                    score += 4; flags.append(f"churn_renewal_{added}_new_vs_{churned}_out")
+                elif churned and churned > 0 and added is not None and added < churned * 0.5:
+                    score -= 4; flags.append(f"churn_loss_{churned}_out_{added}_in")
+    except Exception:
+        pass
+
+    # --- 19th check: FRESH-WALLET PURCHASING POWER (new money coming in) ---
+    try:
+        power = fresh_wallet_power(mint)
+        if power:
+            nb = power.get("new_buyer_count") or 0
+            sum_usd = power.get("sum_buy_usd") or 0
+            if nb >= 5 and sum_usd >= 50:
+                score += 6; flags.append(f"fresh_wallet_power_{nb}_wallets_${sum_usd:.0f}")
+            elif nb >= 2 and sum_usd >= 20:
+                score += 3; flags.append(f"fresh_wallet_power_{nb}_wallets_${sum_usd:.0f}")
+            elif nb == 0:
+                score -= 4; flags.append("fresh_wallet_power_none")
+    except Exception:
+        pass
+
+    # --- 20th check: FILL CLASS + FRAGILITY from the signal engine (flip speed) ---
+    try:
+        intel = token_intel(mint)
+        if intel:
+            fill = intel.get("fill_class")
+            frag = (intel.get("fragility") or {}).get("fragility") or 0
+            if fill == "bots":
+                score -= 6; flags.append("fill_bots_fast_flip")
+            elif fill in ("people", "very_slow"):
+                score += 4; flags.append(f"fill_{fill}_conviction")
+            if frag > 70:
+                score -= 5; flags.append(f"fragility_{frag}")
+    except Exception:
+        pass
+
+    # --- 21st check: COHORT / SMART-MONEY CONSENSUS (solanatracker leaderboard entity) ---
+    try:
+        from bot.intelligence.cohort import cohort_signal_for
+        cs = cohort_signal_for(mint)
+        if cs:
+            sig = cs.get("signal")
+            if sig == "ACCUMULATION":
+                score += 7; flags.append("cohort_accumulation")
+            elif sig == "DISTRIBUTION":
+                score -= 9; flags.append("cohort_distribution")
+    except Exception:
+        pass
+
+    # --- 22nd check: USD buy/sell imbalance (Bitquery) ---
+    try:
+        imb = bitquery_imbalance(mint, limit=25)
+        if imb and (imb.get("buy_usd") or 0) + (imb.get("sell_usd") or 0) > 500:
+            ratio = imb.get("ratio")
+            if ratio is not None:
+                if ratio < 0.35:
+                    score -= 7; flags.append(f"bitquery_sell_imbalance_{ratio:.2f}")
+                elif ratio > 0.65:
+                    score += 5; flags.append(f"bitquery_buy_imbalance_{ratio:.2f}")
+    except Exception:
+        pass
 
     # Second brain: deployer + first buyers
     deployer = None
@@ -582,16 +693,111 @@ def score_coin(mint, deep=False):
                 actors = db().execute("SELECT actor, class FROM actors WHERE actor IN (%s)" % ",".join("?"*len(known)), known).fetchall()
                 for act in actors:
                     if act["class"] in ("rug_deployer",):
-                        score -= 10; flags.append("known_rugger_in_first_buys")
+                        score -= 10; flags.append("known_rugger_in_first_buyers")
+
+    # ============ RECALIBRATION (Oct 18) ============
+    # AEGIS is now interpretable: 4 category sub-scores + 2 new live checks + dedupe.
+    CAT = {
+        "security":  ("mint_", "freeze_", "rugged", "bundle", "insider", "transfer_fee", "lp_",
+                      "top10", "AVE_", "goplus", "deployer_", "known_rugger", "copycat", "slippage",
+                      "ave_smart_exits", "ave_top1"),
+        "tape":      ("ws_", "vol_liq", "thin_pool", "low_liq", "blix_top10", "blix_dev",
+                      "blix_snipers", "micro_", "fill_", "fragility", "wash", "slow-", "bitquery_",
+                      "blix_sol"),
+        "distribution": ("holder_", "retention", "churn", "fresh_wallet", "ave_wallets",
+                         "whale_holds"),
+        "ecosystem": ("smart_money", "cohort_", "fomo_", "rug_insider_nets", "rug_trade_insiders",
+                      "blix_dev_board", "blix_sniper_board", "deep_pool", "clean_snapshot",
+                      "blix_narrative"),
+    }
+
+    # 23rd check: SOL.WALES WHALE INTERSECTION (free, live — the missing whale layer).
+    # If any top-10 holder (Rugcheck or Ave) is a tracked sol.wales whale, that whale's
+    # activity is directly material to this mint.
+    try:
+        from desk_common import sol_wales_traders
+        rc_wallets = set()
+        for h in (r.get("topHolders") or [])[:10]:
+            w = h.get("wallet") if isinstance(h, dict) else h
+            if w: rc_wallets.add(w)
+        if isinstance(th, list):
+            for h in th[:10]:
+                if isinstance(h, dict) and h.get("holder"):
+                    rc_wallets.add(h["holder"])
+                elif isinstance(h, dict) and h.get("address"):
+                    rc_wallets.add(h["address"])
+        if rc_wallets:
+            whale_set = {w.get("address") for w in (sol_wales_traders(limit=200) or []) if isinstance(w, dict)}
+            inter = rc_wallets & whale_set
+            if inter:
+                n = len(inter)
+                score -= 8 * min(n, 3); flags.append(f"whale_holds_top10_x{n}")
+    except Exception:
+        pass  # sol.wales down — never block
+
+    # 24th check: BLIX NARRATIVE HEAT for this symbol (free, live — confluence bonus)
+    try:
+        from desk_common import blix_narratives, blix_alive
+        sym = (m.get("symbol") or "").upper()
+        if not sym:
+            # metadata lookup failed (common for fresh mints) — fall back to DB symbol
+            try:
+                row = db().execute("SELECT symbol FROM coins WHERE mint=?", (mint,)).fetchone()
+                if row and row["symbol"]:
+                    sym = str(row["symbol"]).upper()
+            except Exception:
+                pass
+        if sym and blix_alive():
+            for t in (blix_narratives() or [])[:8]:
+                name = (t.get("name") or "").lower()
+                top = t.get("top") or []
+                if sym.lower() in name or any(sym.lower() in (c.get("symbol") or "").lower() for c in top[:6]):
+                    heat = float(t.get("heat") or 0)
+                    if heat >= 70:
+                        score += 6; flags.append(f"blix_narrative_heat_{heat:.0f}")
+                    elif heat >= 55:
+                        score += 3; flags.append(f"blix_narrative_heat_{heat:.0f}")
+                    else:
+                        flags.append("blix_narrative_cold")
+                    break
+    except Exception:
+        pass
+
+    # Recalibration #1: dedupe top-10 concentration penalty (Rugcheck + Blix + Ave each
+    # may have charged it) — keep ONE concentration penalty, refund the duplicates.
+    conc_flags = [f for f in flags if f.startswith(("top10", "blix_top10", "ave_top1"))]
+    if len(conc_flags) > 1:
+        nominal = {"top10_concentration": 10, "blix_top10": 10, "ave_top1": 12}
+        refund = 0.0
+        for f in conc_flags[1:]:
+            for key, val in nominal.items():
+                if f.startswith(key):
+                    refund += val
+                    break
+        score += refund
+        # collapse to one clear flag (keep the largest source)
+        keep = max(conc_flags, key=lambda f: next((v for k, v in nominal.items() if f.startswith(k)), 0))
+        flags = [f for f in flags if f not in conc_flags] + [keep]
+
+    # Recalibration #2: category sub-scores (signal counts per layer) for interpretability.
+    cat_bad = {k: sum(1 for f in flags if any(f.startswith(p) for p in CAT[k])
+                      and not f.startswith(("blix_narrative_heat", "smart_money_", "deep_pool", "clean_snapshot")))
+               for k in CAT}
+    cat_good = {k: sum(1 for f in flags if any(f.startswith(p) for p in CAT[k])
+                       and f.startswith(("blix_narrative_heat", "smart_money_", "deep_pool", "clean_snapshot")))
+                for k in CAT}
 
     score = max(0.0, min(100.0, score))
-    # Clean token bonus: no NEGATIVE flags + LP locked => genuinely clean snapshot.
-    # Positive/neutral flags (smart_money, deep_pool_liq, deployer_other_coins,
-    # clean_snapshot itself) must NOT block the bonus (audit F6).
+                        # Clean token bonus: no NEGATIVE flags + LP locked => genuinely clean snapshot.
+                        # Positive/neutral flags (smart_money, deep_pool_liq, deployer_other_coins,
+                        # clean_snapshot itself) must NOT block the bonus (audit F6).
     _NEG_PREFIXES = ("insider", "transfer_fee", "bundle", "lp_", "mint_", "freeze_",
                      "copycat", "top10", "AVE_", "dirty", "rugger", "wash",
                      "slow", "fragility", "vol_liq", "slippage", "RUGGED", "drained",
-                     "lp_unlocked", "mint_risk", "freeze_risk")
+                     "lp_unlocked", "mint_risk", "freeze_risk", "micro_cvd_neg",
+                     "micro_buy_conc", "churn_retention_low", "churn_loss",
+                     "fresh_wallet_power_none", "fill_bots", "cohort_distribution",
+                     "bitquery_sell_imbalance")
     _neg = [f for f in flags if any(f.startswith(p) for p in _NEG_PREFIXES)]
     if not _neg and verdict != "RUGGED" and isinstance(r.get("lp_locked_pct"), (int, float)) and r["lp_locked_pct"] >= 90:
         score += 15
@@ -617,4 +823,5 @@ def score_coin(mint, deep=False):
     return {"mint": mint, "symbol": m.get("symbol"), "score": round(score, 1), "verdict": verdict,
             "strategy": strategy, "flags": flags, "deployer": deployer,
             "mc": m.get("mc"), "liq": m.get("liq"), "price": m.get("price_usd"),
+            "sub_scores": {"bad": cat_bad, "good": cat_good},
             "checks": {"authorities": a, "risks": r, "market": m, "ave": ave}}
