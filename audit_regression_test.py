@@ -142,6 +142,55 @@ try:
 except Exception as e:
     check("P1 evidence window setup", "ERR " + str(e)[:60], "no-exception")
 
+# --- Doc1-1: 3%/side paper fee is applied to exit proceeds ---
+try:
+    import json
+    from bot.position_manager import scaleout as so
+    book = {"cash": 0.0, "realized": 0.0, "positions": {
+        "FEE1": {"mint": "fee1", "entry_px": 1e-6, "entry_usd": 100.0, "size_usd": 100.0,
+                 "initial_usd": 100.0, "state": "full", "stages_done": [], "reserved_exit_usd": 0.0,
+                 "peak_price": 1e-6, "trough_price": 1e-6}}}
+    so.load_book = lambda: json.loads(json.dumps(book))
+    so.save_book = lambda b: None
+    res = so.execute_fraction(book, "FEE1", 1.0, 2.0, reason="TP", how="frac", liq=50000.0)
+    # gross $200 - 3% fee = $194 proceeds; pnl = 194 - 100 = +94
+    check("Doc1-1 3% fee on exit", res["pnl"], 94.0)
+    check("Doc1-1 fee recorded on trade", (book.get("trades") or [{}])[-1].get("fee_pct"), 3.0)
+except Exception as e:
+    check("Doc1-1 fee test", "ERR " + str(e)[:60], "no-exception")
+
+# --- Doc1-4: sub-$1K liq exit = unsellable total loss (proceeds 0) ---
+try:
+    import json
+    from bot.position_manager import scaleout as so
+    book = {"cash": 0.0, "realized": 0.0, "positions": {
+        "ILLIQ1": {"mint": "illiq1", "entry_px": 1e-6, "entry_usd": 50.0, "size_usd": 50.0,
+                   "initial_usd": 50.0, "state": "full", "stages_done": [], "reserved_exit_usd": 0.0,
+                   "peak_price": 1e-6, "trough_price": 1e-6}}}
+    so.load_book = lambda: json.loads(json.dumps(book))
+    so.save_book = lambda b: None
+    res = so.execute_fraction(book, "ILLIQ1", 1.0, 0.8, reason="STOP", how="frac", liq=400.0)
+    check("Doc1-4 unsellable -> total loss pnl", res["pnl"], -50.0)
+    check("Doc1-4 illiq flag set", (book.get("trades") or [{}])[-1].get("illiq"), True)
+except Exception as e:
+    check("Doc1-4 unsellable test", "ERR " + str(e)[:60], "no-exception")
+
+# --- Doc2-7: dust tranche (< $2.5) partial is skipped unless it closes ---
+try:
+    import json
+    from bot.position_manager import scaleout as so
+    book = {"cash": 0.0, "realized": 0.0, "positions": {
+        "DUST1": {"mint": "dust1", "entry_px": 1e-6, "entry_usd": 3.0, "size_usd": 3.0,
+                  "initial_usd": 20.0, "state": "full", "stages_done": [], "reserved_exit_usd": 0.0,
+                  "peak_price": 1e-6, "trough_price": 1e-6}}}
+    so.load_book = lambda: json.loads(json.dumps(book))
+    so.save_book = lambda b: None
+    res = so.execute_stage(book, "DUST1", 1, 1.5, reason="CLIP1", how="clip1", liq=50000.0)
+    check("Doc2-7 dust partial skipped", res, None)
+    check("Doc2-7 position still tracked", "DUST1" in book["positions"], True)
+except Exception as e:
+    check("Doc2-7 dust test", "ERR " + str(e)[:60], "no-exception")
+
 print()
 print("FAILURES:", failures if failures else "NONE — all decision-engine regressions pass")
 sys.exit(1 if failures else 0)

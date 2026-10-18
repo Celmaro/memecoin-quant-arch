@@ -27,6 +27,16 @@ STATE_FILE = os.path.join(DESK, "telethon_state.json")
 MINT_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
+def _log_flood(what):
+    """Doc2-10: surface a Telegram FloodWaitError (rate-limit) to the desk journal
+    instead of silently freezing ingestion. Best-effort, never raises."""
+    try:
+        sys.path.insert(0, DESK)
+        from desk_common import log_event
+        log_event({"event": "TELEGRAM_FLOOD", "detail": what})
+    except Exception:
+        pass
+
 def load_allowlist():
     """Curated channel usernames from CONFIG.md §Telegram Call Channels (only that section,
     so OUTPUT groups like HMQcheckergroup are never treated as signal sources)."""
@@ -427,6 +437,13 @@ async def run():
                     state.setdefault("last_msg", {})[ch] = m.id
         except Exception as e:
             print(f"catchup {ch}: {str(e)[:60]}", flush=True)
+            # Doc2-10 (FloodWaitError surfacing): a Telegram rate-limit ban during burst
+            # catch-up can silently freeze ingestion. Surface it to the desk journal so
+            # it's visible in the audit trail instead of vanishing.
+            try:
+                _log_flood(str(e)[:120])
+            except Exception:
+                pass
     save_state(state)
     print("catch-up done — listening", flush=True)
 

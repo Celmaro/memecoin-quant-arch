@@ -16,6 +16,16 @@ STAGES = {  # stage -> (target_remaining_ratio, default_trigger_mult)
     3: (0.00, 1.80),
 }
 
+# Doc1-1 (Blix parity): paper execution cost — 3%/side, same as blixtrade brain.js.
+# Doc1-4 (Blix parity): below this exit liquidity a position is UNSELLABLE and any
+# exit is scored as a total loss (matches blixtrade brain.js minExitLiq + illiq flag).
+PAPER_FEE_PCT = 3.0
+PAPER_COST = (1 - PAPER_FEE_PCT / 100) / (1 + PAPER_FEE_PCT / 100)  # ≈ 0.943
+MIN_EXIT_LIQ_USD = 1000.0
+# Doc2-7: don't sell dust tranches — a planned partial smaller than this collapses
+# into the next tranche (fees eat small sells on Solana under congestion).
+MIN_TRANCHE_USD = 2.5
+
 def load_book():
     return json.load(open(os.path.expanduser("~/memecoin-quant/paper_book.json")))
 
@@ -70,9 +80,14 @@ def release(book, sym, usd):
     p["reserved_exit_usd"] = round(max(0.0, float(p.get("reserved_exit_usd") or 0) - usd), 4)
     save_book(book)
 
-def execute_stage(book, sym, stage, mult, reason="", how="stage"):
+def execute_stage(book, sym, stage, mult, reason="", how="stage", liq=None, fee_pct=None, min_tranche=None):
     """Sell exactly enough to land on the stage-k target. Returns trade record or None.
-    Marks stage done so later ticks never re-sell the same stage."""
+    Marks stage done so later ticks never re-sell the same stage.
+
+    Doc1-1: proceeds carry PAPER_FEE_PCT (3%/side). Doc1-4: when `liq` < MIN_EXIT_LIQ_USD
+    the sale is scored as a TOTAL LOSS (proceeds 0, illiq flag) — you cannot actually
+    exit into dust. Doc2-7: partial tranches below MIN_TRANCHE_USD are skipped (fees
+    would eat them) unless they close the position."""
     p = book["positions"].get(sym)
     if not p:
         return None
@@ -94,12 +109,28 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage"):
         p.setdefault("stages_done", []).append(stage)
         save_book(book)
         return None
-    proceeds = delta * mult
-    pnl = proceeds - delta
+    fee_pct = fee_pct if fee_pct is not None else PAPER_FEE_PCT
+    min_tranche = min_tranche if min_tranche is not None else MIN_TRANCHE_USD
+    current = float(p["entry_usd"])
+    # Doc2-7: skip dust partials unless this sale closes the position
+    if delta < min_tranche and current - delta >= 0.01:
+        save_book(book)  # leave stage undone; next tick can combine
+        return None
+    unsellable = (liq is not None and liq < MIN_EXIT_LIQ_USD)
+    if unsellable:
+        # Doc1-4: total loss — you can't exit into < $1K liquidity
+        proceeds = 0.0
+        pnl = -delta
+        reason = reason + "+UNSELLABLE"
+        illiq = True
+    else:
+        proceeds = delta * mult * (1 - fee_pct / 100)
+        pnl = proceeds - delta
+        illiq = False
     b = book
     b["cash"] = round(b.get("cash", 0) + proceeds, 2)
     b["realized"] = round(b.get("realized", 0) + pnl, 2)
-    p["entry_usd"] = round(float(p["entry_usd"]) - delta, 4)
+    p["entry_usd"] = round(current - delta, 4)
     p["size_usd"] = p["entry_usd"]
     p["reserved_exit_usd"] = 0.0
     p.setdefault("stages_done", []).append(stage)
@@ -115,16 +146,19 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage"):
         b["positions"].pop(sym, None)
     b.setdefault("trades", []).append({"ts": time.time(), "symbol": sym, "mint": p.get("mint"),
         "mult": round(mult, 4), "sold_usd": round(delta, 2), "pnl": round(pnl, 2),
-        "how": f"{how}{stage}", "reason": reason, "closed": closed})
+        "how": f"{how}{stage}", "reason": reason, "closed": closed, "fee_pct": fee_pct,
+        "illiq": illiq, "liq_at_exit": liq})
     save_book(b)
     return {"sold_usd": round(delta, 2), "pnl": round(pnl, 2), "closed": closed,
             "stage": stage, "remaining": 0.0 if closed else p["entry_usd"]}
 
-def execute_fraction(book, sym, frac, mult, reason="", how="frac"):
+def execute_fraction(book, sym, frac, mult, reason="", how="frac", liq=None, fee_pct=None, min_tranche=None):
     """audit P0.3 (Oct 18): honor an EXACT requested sell_fraction of the REMAINING basis
     (e.g. a thesis-deterioration SCALE_OUT of 0.25 sells 25% of what's left — the staged
     executor cannot express that, it only sells to stage-curve targets). Returns trade
-    record or None. Marks state half when a partial remains, closed when basis depleted."""
+    record or None. Marks state half when a partial remains, closed when basis depleted.
+
+    Doc1-1/1-4 + Doc2-7: same fee / unsellable-total-loss / dust-tranche rules as execute_stage."""
     p = book["positions"].get(sym)
     if not p or frac <= 0:
         return None
@@ -134,8 +168,21 @@ def execute_fraction(book, sym, frac, mult, reason="", how="frac"):
     delta = min(sellable, current * frac)
     if delta <= 0.001:
         return None
-    proceeds = delta * mult
-    pnl = proceeds - delta
+    fee_pct = fee_pct if fee_pct is not None else PAPER_FEE_PCT
+    min_tranche = min_tranche if min_tranche is not None else MIN_TRANCHE_USD
+    # Doc2-7: skip dust partials unless this sale closes the position
+    if delta < min_tranche and current - delta >= 0.01:
+        return None
+    unsellable = (liq is not None and liq < MIN_EXIT_LIQ_USD)
+    if unsellable:
+        proceeds = 0.0
+        pnl = -delta
+        reason = reason + "+UNSELLABLE"
+        illiq = True
+    else:
+        proceeds = delta * mult * (1 - fee_pct / 100)
+        pnl = proceeds - delta
+        illiq = False
     b = book
     b["cash"] = round(b.get("cash", 0) + proceeds, 2)
     b["realized"] = round(b.get("realized", 0) + pnl, 2)
@@ -150,7 +197,8 @@ def execute_fraction(book, sym, frac, mult, reason="", how="frac"):
         b["positions"].pop(sym, None)
     b.setdefault("trades", []).append({"ts": time.time(), "symbol": sym, "mint": p.get("mint"),
         "mult": round(mult, 4), "sold_usd": round(delta, 2), "pnl": round(pnl, 2),
-        "how": how, "reason": reason, "closed": closed})
+        "how": how, "reason": reason, "closed": closed, "fee_pct": fee_pct,
+        "illiq": illiq, "liq_at_exit": liq})
     save_book(b)
     return {"sold_usd": round(delta, 2), "pnl": round(pnl, 2), "closed": closed,
             "stage": 3 if closed else 1, "remaining": 0.0 if closed else p["entry_usd"]}

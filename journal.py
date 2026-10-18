@@ -12,9 +12,24 @@ def schedule_followup(mint, kind, hours, note=""):
     con.commit(); con.close()
 
 def run_followups(verbose=True):
-    """Check due followups: is the token dead/alive? Record outcome."""
+    """Check due followups: is the token dead/alive? Record outcome.
+
+    Doc1-5 + Doc2-9 (Blix-parity replay + shadow portfolio): for mints that were
+    scanned/called but are NOT currently held, also replay the FIXED paper exit rule
+    over the observed move (entry MC from call_metrics/coins) so rejected/observed
+    coins score apples-to-apples against held ones — the same rule, same thresholds:
+    2x TP / -40% stop / else in-window. This measures false rejects (post-rejection
+    trajectory) instead of only judging picks we actually took.
+    """
     con = db()
     due = con.execute("SELECT * FROM followups WHERE done=0 AND due_ts<=?", (time.time(),)).fetchall()
+    # fixed rule thresholds (match paper_tick tier + Blix pick rule)
+    FIXED_TP = 2.0
+    FIXED_STOP = 0.6
+    try:
+        held = {p.get("mint") for p in json.load(open("/home/agentuser/memecoin-quant/paper_book.json")).get("positions", {}).values()}
+    except Exception:
+        held = set()
     for f in due:
         try:
             pair = dex_pair(f["mint"])
@@ -27,6 +42,26 @@ def run_followups(verbose=True):
             outcome = "SURVIVED"
             if mc < 2000 and liq < 500: outcome = "DEAD"
             elif liq < 300: outcome = "DRAINED"
+            # Doc1-5/Doc2-9: fixed-rule replay for non-held observed mints
+            entry_mc = None
+            try:
+                row = con.execute("SELECT mc, mc_at_call FROM call_metrics WHERE mint=? UNION ALL SELECT NULL, mc_at_call FROM coins WHERE mint=? LIMIT 1",
+                                  (f["mint"], f["mint"])).fetchone()
+                entry_mc = (row["mc"] or row["mc_at_call"]) if row else None
+            except Exception:
+                entry_mc = None
+            if entry_mc and entry_mc > 0 and f["mint"] not in held:
+                mult = mc / entry_mc
+                if mult >= FIXED_TP:
+                    rule = f"RULE_2X({mult:.2f}x_vs_call)"
+                elif mult <= FIXED_STOP:
+                    rule = f"RULE_STOPPED({mult:.2f}x_vs_call)"
+                else:
+                    rule = f"RULE_WINDOW({mult:.2f}x_vs_call)"
+                outcome = outcome + "_" + rule.split("(")[0]
+                result = result + " | " + rule
+                log_event({"event": "RULE_REPLAY", "mint": f["mint"], "kind": f["kind"],
+                           "entry_mc": entry_mc, "now_mc": mc, "mult": round(mult, 3), "replay": rule})
         else:
             result = "no pair data (provider down or delisted)"
             outcome = "UNKNOWN_DATA"

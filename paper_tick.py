@@ -37,10 +37,12 @@ def save_book(b):
         os.fsync(f.fileno())
     os.replace(tmp, BOOK)
 
-def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=None, market_ts=None):
+def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=None, market_ts=None, liq=None):
     """UNIFIED paper sell: risk gate → reserve → stage-curve execute → attribution.
     Returns True if handled. stage1 = target 50% of original, stage3 = full exit.
-    Builds 1/3/4/7: reservation lock, self-healing target curve, risk gate, attribution."""
+    Builds 1/3/4/7: reservation lock, self-healing target curve, risk gate, attribution.
+    Doc1-4: `liq` (current pool liquidity) is passed through so sub-$1K exits score as
+    unsellable total loss instead of a phantom fill."""
     out = out if out is not None else []
     try:
         from bot.decision_engine.risk_gate import gate
@@ -71,7 +73,7 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
     if not reserve(b, key, want, intent_key=f"{key}:{how}{stage}"):
         out.append(f"GATE {sym}: reservation failed (in-flight)")
         return False
-    res = execute_stage(b, key, stage, mult, reason=reason, how=how)
+    res = execute_stage(b, key, stage, mult, reason=reason, how=how, liq=liq)
     if not res:
         release(b, key, want)
         out.append(f"GATE {sym}: stage engine no-op")
@@ -111,7 +113,12 @@ def tier_exits(mc):
     return (0.50, tp1, tp2, -stop)
 
 def auto_buy():
-    """Buy NEW calls (<5m since channel post) with available cash."""
+    """Buy NEW calls (<5m since channel post) with available cash.
+
+    Doc1-6 (Blix-parity, verified by both systems' own measurements): NO model grade /
+    AI score ever gates an entry. Entries come only from curated calls + the liquidity
+    + entry-hygiene guards. AEGIS/scanner scores are post-entry analysis, never filters.
+    """
     b = load_book()
     if not b.get("autobuy", True):
         return []
@@ -169,6 +176,24 @@ def auto_buy():
         px = mkt.get("priceUsd")
         if not px:
             continue
+        # Doc1-3 (Blix parity, entry hygiene): never auto-buy a mint that is actively
+        # dumping or under a seller flood — same spirit as blixtrade entryBlock (chase/
+        # fall/seller-flood guards). The call is still recorded; we just don't enter it.
+        chg = mkt.get("priceChange") or {}
+        txns5 = (mkt.get("txns") or {}).get("m5") or {}
+        b5, s5 = txns5.get("buys") or 0, txns5.get("sells") or 0
+        if float(chg.get("m5") or 0) <= -5.0:
+            b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                "why": f"dumping_5m_{chg.get('m5'):+.1f}%"})
+            continue
+        if s5 >= 6 and s5 > 2 * b5:
+            b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                "why": f"seller_flood_{b5}B/{s5}S_5m"})
+            continue
+        # Doc2-8 (fill realism): paper entries fill at a small latency slip above the
+        # observed price, modeling front-running by same-second bots. 1% slip.
+        FILL_LATENCY_SLIP_PCT = 1.0
+        px = float(px) * (1 + FILL_LATENCY_SLIP_PCT / 100)
         # Resolve real symbol from market data when the call record lacks one
         if sym == "?" or sym == "None":
             sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
@@ -303,7 +328,8 @@ def main():
                 # exact-fraction sale (P0.3): sells cfrac of remaining basis
                 try:
                     from bot.position_manager.scaleout import execute_fraction
-                    res = execute_fraction(b, mint, frac, mult, reason=decision_action, how="decision_frac")
+                    res = execute_fraction(b, mint, frac, mult, reason=decision_action,
+                                           how="decision_frac", liq=((mkt.get("liquidity") or {}).get("usd") or 0))
                 except Exception:
                     res = None
                 if res:
@@ -315,7 +341,7 @@ def main():
                 stage = None  # fall through to tier engine if fraction path failed
             if stage:
                 res = sell_via_stage(b, pos, sym, mint, stage, mult, px,
-                                     reason=decision_action, how="decision", out=out, market_ts=mkt_ts)
+                                     reason=decision_action, how="decision", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0))
                 if res:
                     # P1.1: sync remaining size into the monitor ledger after any partial/full
                     save_book(b); pm.save_positions(pos)
@@ -349,22 +375,22 @@ def main():
         # FIX #5: stale-hold rule — quick flips only. Any position open >3h closes at market.
         age_h = (time.time() - p.get("opened", time.time())) / 3600
         if age_h > 3:
-            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="STALE", how="stale", out=out, market_ts=mkt_ts):
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="STALE", how="stale", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
         if state == "full" and mult <= 0.50:
             # FIX (user #1): price-based hard stop in the fallback engine too —
             # liquidity-independent floor at 0.50x, catches tokens that dump
             # before the deep decision engine gets a clean read.
-            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="HARD_STOP", how="stop", out=out, market_ts=mkt_ts):
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="HARD_STOP", how="stop", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
         if state == "full" and mult >= tp1:
-            if sell_via_stage(b, pos, sym, mint, 1, mult, px, reason="CLIP1", how="clip1", out=out, market_ts=mkt_ts):
+            if sell_via_stage(b, pos, sym, mint, 1, mult, px, reason="CLIP1", how="clip1", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
         elif state == "half" and (mult >= tp2 or mult <= 0.50):
-            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="TP", how="tp", out=out, market_ts=mkt_ts):
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="TP", how="tp", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
         plan_s = f"sell half at +{(tp1-1)*100:.0f}%, sell all at +{(tp2-1)*100:.0f}%, cut losses at {stop*100:.0f}%"
