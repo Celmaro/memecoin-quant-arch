@@ -60,7 +60,7 @@ def build_forensics_card(mint, call=None):
     L.append("")
     # flag explanations (curated map; fallback = plain flag)
     FLAG_EXPLAIN = {
-        "insider_graph_detected": "deployer/insider wallets cluster in the funding graph — 'clean contract, dirty wallet' pattern",
+        "insider_graph_detected": "deployer/insider wallets cluster in the funding graph. This is the \"clean contract, dirty wallet\" pattern from AEGIS's second brain.",
         "transfer_fee_present": "transfer fee on the contract — tax risk on every sell",
         "lp_partially_locked": "LP only partially locked = ruggable tail risk",
         "mint_authority_present": "mint authority still live = supply can be printed",
@@ -72,6 +72,8 @@ def build_forensics_card(mint, call=None):
         "deployer_wi_sniper": "deployer historically snipes/scalps",
         "whale_holds_top10": "a tracked whale holds this token",
     }
+    # deployer address for the insider line (like "Deployer 6x4XN…TXbBE")
+    deployer = rep.get("deployer")
     shown = 0
     for f in flags:
         if f.startswith(("clean_snapshot", "deployer_wi_score", "bs_", "goplus_", "ave_")):
@@ -80,10 +82,14 @@ def build_forensics_card(mint, call=None):
             L.append(f"- ⚠ {f} … (+{(len(flags)-shown)} more)")
             break
         expl = next((v for k, v in FLAG_EXPLAIN.items() if f.startswith(k)), "")
+        line = f"- ⚠ {f}"
         if expl:
-            L.append(f"- ⚠ {f} — {expl}")
-        else:
-            L.append(f"- ⚠ {f}")
+            line += f" — {expl}"
+        if f.startswith("insider_graph") and deployer:
+            line += f" Deployer {deployer[:6]}…{deployer[-4:]}."
+        elif f.startswith("lp_partially_locked"):
+            line = line.replace("LP only partially locked = ruggable tail risk", "LP only partially locked = ruggable tail risk")
+        L.append(line)
         shown += 1
 
     L.append("")
@@ -91,9 +97,12 @@ def build_forensics_card(mint, call=None):
     call_note = ""
     if call_mc:
         mv = (mc / call_mc - 1) * 100 if call_mc else 0
-        call_note = f" (vs ${call_mc:,.0f} call MC — {'lag up' if mv > 0 else 'lag down'} {mv:+.1f}%)"
+        if abs(mv) >= 3:
+            call_note = f" (vs ${call_mc:,.0f} call MC — desk is showing {'call-price lag up' if mv > 0 else 'call-price lag down'} {mv:+.1f}%)"
+        else:
+            call_note = f" (call MC ${call_mc:,.0f})"
     L.append(f"- MC {fmt_money(mc)} and {'moving' if abs(chg_h1) > 5 else 'flat'} ({chg_h1:+.1f}% 1h){call_note}")
-    L.append(f"- Liq {fmt_money(liq)}, vol {fmt_money(vol_h1)} last hour, m5 buys {b5} vs sells {s5} — {'active inflow' if b5 > s5 else 'sell pressure'}")
+    L.append(f"- Liq {fmt_money(liq)}, vol {fmt_money(vol_h1)} last hour, m5 buys {b5} vs sells {s5} — {'active organic-ish inflow' if b5 > s5 else 'sell pressure'}")
     # holder distribution from rugcheck topHolders
     try:
         from desk_common import rugcheck
@@ -133,9 +142,28 @@ def build_forensics_card(mint, call=None):
         pass
 
     L.append("")
-    L.append(f"Verdict: {'live momentum, structurally imperfect' if score < 40 else 'moderate'}. "
-             f"The contradiction: contract checks say {score}/100, but tape/holders may look organic. "
-             f"Trust the tape while it works, never trust it overnight.")
+    # Verdict + action plan — mirrors the user's requested format (Oct 19)
+    if score < 40:
+        verdict_line = (f"Verdict: live momentum, structurally imperfect. The contradiction: "
+                        f"contract checks scream insider risk ({score:.0f}/100), but holder distribution "
+                        f"and tape look organic. This fits the research rule \"clean snapshot bonus vs "
+                        f"deployer offset\" — trust the tape while it works, never trust it overnight.")
+    else:
+        verdict_line = (f"Verdict: moderate ({score:.0f}/100). The contradiction: contract checks and "
+                        f"market side disagree. Trust the tape while it works, never trust it overnight.")
+    L.append(verdict_line)
+    L.append("")
+    # quick-flip action plan (always, but lean harder on schedule when flags are bad)
+    risky = any(f.startswith(("insider_graph", "lp_", "transfer_fee", "bundle", "rug_", "dirty")) for f in flags)
+    if risky:
+        L.append("If you take it: default-to-quick flip sizing, stop −22%, first clip +30% fast, and treat "
+                 "the insider_graph + partial LP as the reason to take every clip on schedule instead of stretching. "
+                 "If volume dries or the biggest wallet sells, emergency exit.")
+    else:
+        L.append("If you take it: quick-flip default, clip 50% at +30%, rest at +60%, stop −22%. "
+                 "If volume dries, emergency exit.")
+    # whale-watch offer (we have the sol.wales whale intersection layer)
+    L.append("I can put the whale on watch if you enter.")
     L.append("")
     L.append(f"Source: {chan} · call MC ${call_mc:,.0f}" if call_mc else f"Source: {chan}")
     L.append("💠 CA: " + mint)
