@@ -38,37 +38,28 @@ def save_state(s):
 
 
 def deep_aegis_card(mint, chan, sym, mc):
-    """Run DEEP AEGIS forensics on the mint and build the DM card.
+    """Build the RICH forensics DM card (user's requested format — Oct 19).
 
-    Returns (card_text, score, verdict) or (None, None, None) if scan fails.
-    The card carries: source channel, full CA, symbol, AEGIS score/verdict,
-    sub-scores (interpretable layers), and the flags that drove the score.
-    """
+    Returns (card_text, score, verdict) or (None, None, None) on failure.
+    Delegates to rich_card.build_forensics_card with the call payload so the
+    full narrative (flags w/ explanations, market side, holders, authorities,
+    socials, migration, verdict, action plan) reaches the DM."""
     try:
-        import aegis
-        rep = aegis.score_coin(mint, deep=True)
-        score = rep.get("score")
-        verdict = rep.get("verdict")
-        flags = rep.get("flags") or []
-        sub = rep.get("sub_scores") or {}
-        card = []
-        card.append(f"🧠 AEGIS deep scan — ${sym or rep.get('symbol') or mint[:10]}")
-        card.append(f"📡 source: {chan}")
-        card.append(f"💠 CA: {mint}")
-        if mc:
-            card.append(f"📊 call MC: ${mc:,.0f}")
-        card.append(f"🛡 AEGIS: {score}/100 — {verdict}")
-        if sub.get("bad") or sub.get("good"):
-            bad = sub.get("bad") or {}
-            good = sub.get("good") or {}
-            card.append("  layers: " + " | ".join(
-                f"{k}: {bad.get(k,0)}⚠/{good.get(k,0)}✓" for k in ("security","tape","distribution","ecosystem")))
-        if flags:
-            shown = [f for f in flags if f and not f.startswith(("clean_snapshot", "deployer_wi_score"))]
-            if shown:
-                card.append("  flags: " + ", ".join(shown[:8]))
-        return "\n".join(card), score, verdict
-    except Exception as e:
+        sys.path.insert(0, DESK)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from rich_card import build_forensics_card
+        card = build_forensics_card(mint, {"symbol": sym, "channel": chan, "mc": mc})
+        if not card:
+            return None, None, None
+        import aegis as _a
+        score, verdict = None, None
+        try:
+            rep = _a.score_coin(mint, deep=True)
+            score, verdict = rep.get("score"), rep.get("verdict")
+        except Exception:
+            pass
+        return card, score, verdict
+    except Exception:
         return None, None, None
 
 
