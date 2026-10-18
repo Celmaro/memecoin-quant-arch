@@ -612,18 +612,35 @@ def score_coin(mint, deep=False):
     except Exception:
         pass
 
-    # --- 22nd check: USD buy/sell imbalance (Bitquery) ---
+    # --- 22nd check: GMGN RANK DISCOVERY CONTEXT (free, live — replaces 402-locked Bitquery) ---
     try:
-        imb = bitquery_imbalance(mint, limit=25)
-        if imb and (imb.get("buy_usd") or 0) + (imb.get("sell_usd") or 0) > 500:
-            ratio = imb.get("ratio")
-            if ratio is not None:
-                if ratio < 0.35:
-                    score -= 7; flags.append(f"bitquery_sell_imbalance_{ratio:.2f}")
-                elif ratio > 0.65:
-                    score += 5; flags.append(f"bitquery_buy_imbalance_{ratio:.2f}")
+        from desk_common import gmgn_rank
+        rows = gmgn_rank("1h", "volume", 50) or []
+        for row in rows:
+            if isinstance(row, dict) and (row.get("address") == mint or row.get("mint") == mint):
+                sym = row.get("symbol") or ""
+                # GMGN rank fields: sniper_count, bundler_rate, top_10_holder_rate,
+                # rug_ratio, is_wash_trading, buy_tax, sell_tax, creator_close
+                snipers = int(row.get("sniper_count") or 0)
+                bundler = float(row.get("bundler_rate") or 0)
+                wash = bool(row.get("is_wash_trading"))
+                rug = float(row.get("rug_ratio") or 0)
+                t10 = float(row.get("top_10_holder_rate") or 0)
+                if snipers > 15:
+                    score -= 5; flags.append(f"gmgn_snipers_{snipers}")
+                if bundler > 0.3:
+                    score -= 5; flags.append(f"gmgn_bundler_{bundler*100:.0f}%")
+                if wash:
+                    score -= 6; flags.append("gmgn_wash_flag")
+                if rug > 0.3:
+                    score -= 4; flags.append(f"gmgn_rug_ratio_{rug*100:.0f}%")
+                if t10 > 70:
+                    score -= 4; flags.append(f"gmgn_t10_{t10*100:.0f}%")
+                # presence in top-50 by 1h volume = live demand context (+small)
+                score += 3; flags.append("gmgn_top50_1h_vol")
+                break
     except Exception:
-        pass
+        pass  # gmgn down/blocked — never block
 
     # Second brain: deployer + first buyers
     deployer = None
@@ -669,6 +686,29 @@ def score_coin(mint, deep=False):
                         score -= min(12, 3 * int(gpa["malicious_contracts"])); flags.append(f"deployer_malicious_x{gpa['malicious_contracts']}")
             except Exception:
                 pass  # goplus down — never block
+            # --- WalletIntel deployer quality (Oct 18 — free, 10/day budgeted) ---
+            # Historical win-rate / strategy / score of the deployer wallet → feeds deployer
+            # memory (a "serial pumpfun flipper" deployer is a different risk than a "diamond
+            # hands" veteran). Budgeted via credit_budget (walletintel 10/day).
+            try:
+                from desk_common import walletintel_summary
+                wi = walletintel_summary(deployer)
+                if wi and isinstance(wi, dict) and wi.get("score") is not None:
+                    wi_score = float(wi.get("score") or 0)
+                    wi_strategy = (wi.get("strategy") or "").lower()
+                    wi_wr = float(wi.get("win_rate") or 0)
+                    flags.append(f"deployer_wi_score_{wi_score:.0f}_wr_{wi_wr:.0f}")
+                    if wi_score >= 70:
+                        score += 5; flags.append("deployer_wi_strong")
+                    elif wi_score < 25:
+                        score -= 6; flags.append("deployer_wi_weak")
+                    if wi_strategy in ("sniper", "scalper", "degen", "mixed"):
+                        # serial quick-flipper: tight flips, faster exits
+                        score -= 3; flags.append(f"deployer_wi_{wi_strategy}")
+                    elif "diamond" in wi_strategy:
+                        score += 4; flags.append("deployer_wi_diamond_hands")
+            except Exception:
+                pass  # walletintel / budget exhausted — never block
             # Remember deployer's OTHER coins (creatorTokens) — pattern across launches
             other = r.get("creator_tokens") or []
             if other:
@@ -695,12 +735,28 @@ def score_coin(mint, deep=False):
                     if act["class"] in ("rug_deployer",):
                         score -= 10; flags.append("known_rugger_in_first_buyers")
 
-    # ============ RECALIBRATION (Oct 18) ============
+    # --- 18th check: ENTITY-LABEL enrichment (self-sourced: funder graph + bot behavior) ---
+    # annotate_wallet_risk(): -10 exchange first-buyer, -15 known-rug entity, -5 MEV/bot.
+    # Self tier only needs Helius + our own deployers/first_buyers memory (no external keys).
+    try:
+        from aegis_entity_labels import annotate_wallet_risk
+        fbs2 = db().execute("SELECT wallet FROM first_buyers WHERE coin_mint=? LIMIT 6", (mint,)).fetchall()
+        wl = [fb["wallet"] for fb in fbs2]
+        if wl:
+            stats = {w: {"role": "first_buyer"} for w in wl}
+            adj, notes, _ = annotate_wallet_risk(stats)
+            if adj:
+                score += adj  # adj is negative or 0
+                flags.append(f"entity_labels({adj:+d})")
+                for nt in notes:
+                    flags.append(nt)  # e.g. "Wallet… is Binance (exchange) — supply distribution risk"
+    except Exception:
+        pass  # enrichment down — never block
     # AEGIS is now interpretable: 4 category sub-scores + 2 new live checks + dedupe.
     CAT = {
         "security":  ("mint_", "freeze_", "rugged", "bundle", "insider", "transfer_fee", "lp_",
                       "top10", "AVE_", "goplus", "deployer_", "known_rugger", "copycat", "slippage",
-                      "ave_smart_exits", "ave_top1"),
+                      "ave_smart_exits", "ave_top1", "entity_labels"),
         "tape":      ("ws_", "vol_liq", "thin_pool", "low_liq", "blix_top10", "blix_dev",
                       "blix_snipers", "micro_", "fill_", "fragility", "wash", "slow-", "bitquery_",
                       "blix_sol"),

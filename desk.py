@@ -114,9 +114,9 @@ def main():
         return 0
 
     if cmd == "card":
-        """Playbook card for a curated call (Tier 2.1 metrics)."""
+        """Playbook card for a curated call (Tier 2.1 metrics) + recalibrated sub-scores."""
         mint = args[1]
-        import sqlite3
+        import sqlite3, json
         con = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "aegis.db"), timeout=15)
         try:
             con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA busy_timeout=15000")
@@ -124,13 +124,27 @@ def main():
             pass
         con.row_factory = sqlite3.Row
         row = con.execute("SELECT * FROM call_metrics WHERE mint=?", (mint,)).fetchone()
-        con.close()
         if not row:
+            con.close()
             print(f"No playbook card for {mint[:16]}... (run a crawl first)")
             return 1
         print(f"PLAYBOOK CARD: ${row['symbol']} via {row['channel']}")
         for k in ("mc","liq","fill_class","fill_min","aegis_score","verdict","ave_risk_score","top10_pct","smart_money_count","buys5","sells5","mc_delta_pct"):
             print(f"  {k:18s}: {row[k]}")
+        # Recalib Oct 18: append the latest scan sub-scores (interpretable AEGIS layers)
+        try:
+            last = con.execute("SELECT score, verdict, checks_json FROM scan_log WHERE mint=? ORDER BY ts DESC LIMIT 1", (mint,)).fetchone()
+            if last:
+                print(f"  latest AEGIS: {last['score']:.1f} {last['verdict']}")
+                try:
+                    cj = json.loads(last["checks_json"] or "{}")
+                    keys = [k for k in ("authorities","risks","market","ave","goplus") if cj.get(k)]
+                    print(f"  checks: {', '.join(keys)}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        con.close()
         return 0
 
     if cmd == "backfill":
@@ -408,6 +422,53 @@ def main():
         print(f"[13] CabalSpy bundle: {'ok' if cb else 'n/a (network-blocked here)'}")
         bq = madeonsol_buyer_quality([mint])
         print(f"[14] MadeOnSol buyer-quality: {'ok' if bq else 'n/a (network-blocked here)'}")
+        return 0
+
+    if cmd == "score-trend":
+        """AEGIS score evolution over scans from SQLite scan_log (no live positions needed).
+        Usage: desk.py score-trend <mint> [n]"""
+        mint = args[1] if len(args) > 1 else None
+        n = int(args[2]) if len(args) > 2 else 12
+        if not mint:
+            print("usage: desk.py score-trend <mint> [n]"); return 1
+        import sqlite3, os
+        con = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "aegis.db"),
+                              timeout=15)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT ts, score, verdict, strategy, checks_json FROM scan_log WHERE mint=? ORDER BY ts DESC LIMIT ?",
+            (mint, n)).fetchall()
+        con.close()
+        if not rows:
+            print(f"no scans for {mint[:16]}..."); return 0
+        print(f"📈 AEGIS score trend for {mint[:16]}... ({len(rows)} scans, oldest→newest)")
+        print(f"{'#':>2} {'time':>14} {'score':>6} {'verdict':>8}  flags")
+        prev = None
+        for i, r in enumerate(reversed(rows)):
+            # flags count from checks_json (authorities+risks+ave+goplus when present)
+            flags_n = ""
+            try:
+                cj = json.loads(r["checks_json"] or "{}")
+                nf = 0
+                for k in ("authorities", "risks", "ave", "goplus"):
+                    v = cj.get(k)
+                    if isinstance(v, dict) and v:
+                        nf += 1
+                if nf:
+                    flags_n = f"{nf} src"
+            except Exception:
+                pass
+            t = time.strftime("%m-%d %H:%M", time.localtime(r["ts"]))
+            score = r["score"]
+            delta = f" ({score-prev:+.0f})" if prev is not None else ""
+            print(f"{i+1:>2} {t:>14} {score:>6.1f}{delta:>7} {r['verdict']:>8}  {flags_n}")
+            prev = score
+        # spark bars
+        vals = [float(r["score"]) for r in reversed(rows)]
+        mini, maxi = min(vals), max(vals)
+        span = (maxi - mini) or 1
+        bars = "".join("█" if (v-mini)/span > 0.66 else "▆" if (v-mini)/span > 0.33 else "▂" for v in vals)
+        print(f"\n  {bars}  {mini:.0f}–{maxi:.0f}")
         return 0
 
     print(f"unknown command: {cmd}"); print(__doc__); return 1

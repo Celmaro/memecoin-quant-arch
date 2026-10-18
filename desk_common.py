@@ -398,15 +398,28 @@ def coinstats_balance(wallet, connection="solana"):
             pass
         return []
 
+# module-level circuit breaker for Bitquery (402 credit-locked; recalib Oct 18)
+_BQ_DEAD_UNTIL = [0.0]
+
 def bitquery_imbalance(mint, limit=30):
     """USD-weighted buy/sell imbalance via Bitquery V2 — DOCUMENTED query shape (verified).
-    Sums Trade.Side.AmountInUSD by Trade.Side.Type (buy/sell)."""
+    Sums Trade.Side.AmountInUSD by Trade.Side.Type (buy/sell).
+    Recalib Oct 18: Bitquery realtime is 402 credit-locked — circuit-break for 30 min
+    after a failure so per-tick analysis never burns a doomed call (mirrors CoinStats)."""
+    if time.time() < _BQ_DEAD_UNTIL[0]:
+        return None
     q = ('{ Solana { DEXTradeByTokens(limit: {count: %d}, orderBy: {descending: Block_Time}, '
          'where: {Trade: {Currency: {MintAddress: {is: "%s"}}, Price: {gt: 0}}, '
          'Transaction: {Result: {Success: true}}}) '
          '{ Block { allTime: Time } Trade { Side { Type AmountInUSD Amount } Price } } } }') % (limit, mint)
     d = bitquery_graphql(q)
     if not d or not d.get("data"):
+        # 402/None: credit-locked — circuit-break 30 min (recalib Oct 18)
+        _BQ_DEAD_UNTIL[0] = time.time() + 1800
+        try:
+            log_event({"event": "BITQUERY_BREAKER", "detail": "realtime 402/empty"})
+        except Exception:
+            pass
         return None
     rows = (d["data"].get("Solana") or {}).get("DEXTradeByTokens") or []
     if not rows: return None

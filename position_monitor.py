@@ -314,6 +314,13 @@ def analyze(mint, pos):
                 if sym and (sym.lower() in name or any(sym.lower() in (c.get("symbol") or "").lower() for c in (th.get("top") or [])[:6])):
                     signals.append(f"BLIX_NARRATIVE: theme '{th.get('name')}' heat={heat} lift={th.get('launchLift')}")
                     pos["blix_narrative"] = th.get("name")
+                    # Recalib Oct 18: narrative heat now influences action — a HOT narrative
+                    # suppresses premature clips (ride the theme), a COLD narrative + green
+                    # prompts taking profit (theme fading).
+                    if heat >= 70 and action == "CLIP_50" and mult < 1.1:
+                        action = "HOLD"  # don't clip early while theme is hot and gains are small
+                    elif heat < 40 and action == "HOLD" and mult >= 1.0:
+                        action = "CLIP_50"  # cold narrative + green = take some now
                     break
             mkt = blix_market()
             sol_now = ((mkt or {}).get("sol") or {}).get("usd")
