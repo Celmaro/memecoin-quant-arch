@@ -450,6 +450,33 @@ def score_coin(mint, deep=False):
     except Exception:
         pass  # goplus down — never block
 
+    # --- 14th check: BLIX holder-quality cross-check (Oct 18 — local radar, guarded) ---
+    # dev/bundle tags + top-10 concentration from the live holder ledger.
+    try:
+        from desk_common import blix_holders, blix_alive
+        if blix_alive():
+            hd = blix_holders(mint, top=15)
+            if hd:
+                t10 = hd.get("top10") or hd.get("top10Share") or 0
+                # blix top10 is a PERCENTAGE (27.16 = 27.16%), not a fraction
+                t10_pct = t10 if t10 > 1 else t10 * 100
+                if t10_pct > 70:
+                    score -= 10; flags.append(f"blix_top10_{t10_pct:.0f}%")
+                dev_w = hd.get("dev")
+                if isinstance(dev_w, dict):
+                    dev_pct = dev_w.get("pct") or 0
+                    if dev_pct > 5:
+                        score -= 8; flags.append(f"blix_dev_holds_{dev_pct:.1f}%")
+                    elif dev_pct <= 0.5:
+                        score += 4; flags.append("blix_dev_flat")
+                snipers = hd.get("snipers")
+                if isinstance(snipers, (int, float)) and snipers > 3:
+                    score -= 6; flags.append(f"blix_snipers_x{snipers}")
+                elif isinstance(snipers, list) and len(snipers) > 3:
+                    score -= 6; flags.append(f"blix_snipers_x{len(snipers)}")
+    except Exception:
+        pass  # blix down — never block
+
     # Second brain: deployer + first buyers
     deployer = None
     dts = None
@@ -459,6 +486,24 @@ def score_coin(mint, deep=False):
             deployer, dts, _ = resolve_deployer(mint)
         if deployer:
             remember_deployer(deployer, mint, dts)
+            # --- BLIX dev-board enrichment (7.5, Oct 18 — guarded local radar) ---
+            try:
+                from desk_common import blix_devs, blix_pump_board, blix_alive
+                if blix_alive():
+                    devs = blix_devs(limit=100)
+                    for drow in devs:
+                        if (drow.get("wallet") or "") == deployer:
+                            flags.append(f"blix_dev_board_rank{drow.get('rank')}")
+                            if drow.get("launches"):
+                                flags.append(f"blix_dev_launches_{drow.get('launches')}")
+                            break
+                    board = blix_pump_board(range_="24h", limit=50)
+                    for brow in board:
+                        if (brow.get("wallet") or "") == deployer:
+                            flags.append("blix_sniper_board_appears")
+                            break
+            except Exception:
+                pass  # blix down — never block
             # Remember deployer's OTHER coins (creatorTokens) — pattern across launches
             other = r.get("creator_tokens") or []
             if other:

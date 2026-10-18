@@ -716,6 +716,104 @@ def madeonsol_kol_feed(limit=10):
     except Exception:
         return []
 
+# --- BLIX RADAR CLIENT (Oct 18 — localhost:4420, all endpoints verified live) ---
+BLIX = "http://localhost:4420"
+
+def _blix(path, timeout=10):
+    """GET a Blix endpoint; returns dict/list or None on failure."""
+    try:
+        st, d = http_json(f"{BLIX}{path}", timeout=timeout)
+        return d
+    except Exception:
+        return None
+
+def blix_alive():
+    d = _blix("/api/health", timeout=6)
+    return bool(d and d.get("t"))
+
+def blix_overview():
+    d = _blix("/api/overview")
+    return d or {}
+
+def blix_token(mint):
+    d = _blix(f"/api/token/{mint}")
+    return (d or {}).get("token") or None
+
+def blix_holders(mint, top=15):
+    """Live holder ledger: {holders:count, top10:share(0-1), top:[{wallet,pct(2.71=2.71%),sol,trades,tag}], dev, snipers, bundle}."""
+    d = _blix(f"/api/holders/{mint}?top={top}")
+    if not d or "error" in d:
+        return None
+    return d
+
+def blix_candles(mint, tf="5m", limit=None):
+    """MC candles from REAL trades. tf: 5s|15s|1m|5m|15m|1h. rows: [{time,open,high,low,close,value}]."""
+    d = _blix(f"/api/candles/{mint}?tf={tf}")
+    rows = (d or {}).get("rows") or []
+    return rows[-(limit or len(rows)):] if rows else []
+
+def blix_quote(mint, side="buy", amount=1.0, slip=500):
+    """Real Jupiter quote: {inSol,outTokens,feeSol,impactPct,avgSol,spotSol,minOut,route,feeBps,solUsd,mcapAfterSol}."""
+    d = _blix(f"/api/quote?mint={mint}&side={side}&amount={amount}&slip={slip}")
+    return d if isinstance(d, dict) and "error" not in d else None
+
+def blix_signals(limit=20, safety="passed"):
+    d = _blix(f"/api/signals?limit={limit}&safety={safety}")
+    return d if isinstance(d, list) else []
+
+def blix_narratives():
+    d = _blix("/api/narratives")
+    return (d or {}).get("themes") or []
+
+def blix_market():
+    d = _blix("/api/market")
+    return d or {}
+
+def blix_devs(limit=50):
+    d = _blix("/api/devs")
+    return (d or {}).get("top") or []
+
+def blix_pump_board(range_="24h", limit=30):
+    d = _blix(f"/api/pump/board?range={range_}")
+    return (d or {}).get("rows") or []
+
+def blix_coin_trades(mint, limit=500):
+    d = _blix(f"/api/coin/{mint}/trades?limit={limit}")
+    return (d or {}).get("trades") or []
+
+def blix_perf():
+    d = _blix("/api/perf")
+    return d or {}
+
+def blix_signal_track(kind=None):
+    """Empirical 1h track record per signal kind (7.6): {events, up20, down50, median1h, pending1h, unsellable1h}.
+    kind None -> overall 'all'. Returns None if blix unreachable/empty."""
+    d = _blix("/api/perf")
+    if not d:
+        return None
+    try:
+        if kind:
+            for row in d.get("byKind") or []:
+                if row.get("kind") == kind:
+                    ev = row.get("events") or {}
+                    return {"events": ev.get("events"), "up20": ev.get("up20"),
+                            "down50": ev.get("down50"), "median1h": ev.get("median1h"),
+                            "pending1h": ev.get("pending1h")}
+            return None
+        ev = (d.get("all") or {}).get("events") or {}
+        return {"events": ev.get("events"), "up20": ev.get("up20"), "down50": ev.get("down50"),
+                "median1h": ev.get("median1h"), "pending1h": ev.get("pending1h")}
+    except Exception:
+        return None
+
+def blix_research(mint):
+    d = _blix(f"/api/research/{mint}")
+    return d or {}
+
+def blix_wallet(address):
+    d = _blix(f"/api/wallet/{address}")
+    return d or {}
+
 def log_event(entry, fname=None):
     os.makedirs(JOURNAL_DIR, exist_ok=True)
     entry["ts"] = time.time()

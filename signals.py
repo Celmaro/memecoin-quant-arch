@@ -81,6 +81,27 @@ def wash_lpi_check(mint, pair=None):
     if (b5 + s5) > 0 and chg.get("m5") and abs(chg["m5"]) > 25 and (b5 + s5) < 25:
         flags.append("lpi_suspect(price_move>>trade_count)")
     # Interval uniformity would need raw tx timestamps; we approximate via buy/sell shape
+
+    # --- BLIX real-trade tape wash/LPI (7.3, Oct 18 — guarded local radar) ---
+    try:
+        from desk_common import blix_coin_trades, blix_alive
+        if blix_alive():
+            trades = blix_coin_trades(mint, limit=400)
+            if trades and len(trades) >= 10:
+                uniq_buyers = len({t.get("from") or t.get("buyer") or t.get("wallet") for t in trades if t.get("side") == "buy"})
+                uniq_sellers = len({t.get("from") or t.get("seller") or t.get("wallet") for t in trades if t.get("side") == "sell"})
+                tot_usd = sum(float(t.get("usd") or 0) for t in trades)
+                n = len(trades)
+                # Wash: high USD volume spread across very few UNIQUE wallets
+                if tot_usd > 1000 and (uniq_buyers + uniq_sellers) < max(4, n // 10):
+                    flags.append(f"blix_wash_few_wallets({uniq_buyers}B/{uniq_sellers}S for ${tot_usd:.0f})")
+                # LPI: price moved with a tiny # of trades (buy-size anomaly)
+                if len(flags) == 0:
+                    buys = [t for t in trades if t.get("side") == "buy"]
+                    if buys and len(buys) <= 5 and tot_usd > 200:
+                        flags.append(f"blix_lpi_suspect({len(buys)} buys ${tot_usd:.0f})")
+    except Exception:
+        pass
     return {"ok": True, "flags": flags, "vol_m5": v_m5, "vol_h1": v_h1, "vol_h24": v_h24,
             "b5": b5, "s5": s5, "chg5": chg.get("m5")}
 
@@ -170,9 +191,21 @@ def fragility_score(mint, pair=None):
     if isinstance(top10, (int, float)):
         if top10 > 70: f += 30; reasons.append(f"top10={top10:.0f}%")
         elif top10 > 50: f += 15; reasons.append(f"top10={top10:.0f}%")
-    # volatility persistence: OHLCV realized vol if we can get it
-    ohlcv = fetch_ohlcv_dexpa(mint)
-    rv = ohlcv_risk(ohlcv)
+    # volatility persistence: OHLCV realized vol — BLIX real-trade candles preferred (7.2)
+    ohlcv = None
+    rv = None
+    try:
+        from desk_common import blix_candles, blix_alive
+        if blix_alive():
+            bc = blix_candles(mint, tf="1m", limit=120)  # 2h of 1m real-trade closes
+            if bc:
+                ohlcv = [{"close": c.get("close")} for c in bc]
+    except Exception:
+        pass
+    if not ohlcv:
+        ohlcv = fetch_ohlcv_dexpa(mint)
+    if ohlcv:
+        rv = ohlcv_risk(ohlcv)
     if rv:
         if rv["realized_vol_h"] > 8: f += 20; reasons.append(f"rv_h={rv['realized_vol_h']:.1f}%")
         elif rv["realized_vol_h"] > 4: f += 10; reasons.append(f"rv_h={rv['realized_vol_h']:.1f}%")

@@ -227,6 +227,66 @@ def analyze(mint, pos):
     except Exception:
         pass
 
+    # --- BLIX holder/dev/sniper movement (7.1, Oct 18 — guarded local radar) ---
+    try:
+        from desk_common import blix_holders, blix_alive, blix_coin_trades
+        if blix_alive():
+            hd = blix_holders(mint, top=10)
+            if hd:
+                dev_w = hd.get("dev")
+                if isinstance(dev_w, dict):
+                    dev_pct_now = dev_w.get("pct") or 0
+                    prev_dev = pos.get("blix_dev_pct")
+                    if prev_dev is not None and dev_pct_now < prev_dev * 0.5:
+                        signals.append(f"BLIX_DEV_DUMPING: dev {dev_pct_now:.2f}% < 50% of {prev_dev:.2f}%")
+                        if action == "HOLD": action = "CLIP_50"
+                        if mult <= 1.0: action = "EXIT_ALL"
+                    pos["blix_dev_pct"] = dev_pct_now
+                t10 = hd.get("top10") or 0
+                # blix top10 is a PERCENTAGE (27.16 = 27.16%)
+                t10_pct = t10 if t10 > 1 else t10 * 100
+                if t10_pct > 75:
+                    signals.append(f"BLIX_TOP10_CONCENTRATED: {t10_pct:.0f}% in top 10")
+                    if mult <= 1.0: action = "CLIP_50"
+    except Exception:
+        pass
+
+    # --- BLIX narrative + market-regime context (7.4/7.6, Oct 18 — guarded) ---
+    try:
+        from desk_common import blix_narratives, blix_market, blix_alive
+        if blix_alive():
+            sym = (pair.get("baseToken") or {}).get("symbol") or ""
+            themes = blix_narratives()
+            for th in themes[:6]:
+                name = (th.get("name") or "").lower()
+                heat = th.get("heat") or 0
+                if sym and (sym.lower() in name or any(sym.lower() in (c.get("symbol") or "").lower() for c in (th.get("top") or [])[:6])):
+                    signals.append(f"BLIX_NARRATIVE: theme '{th.get('name')}' heat={heat} lift={th.get('launchLift')}")
+                    pos["blix_narrative"] = th.get("name")
+                    break
+            mkt = blix_market()
+            sol_now = ((mkt or {}).get("sol") or {}).get("usd")
+            prev_sol = pos.get("blix_sol_usd")
+            if sol_now and prev_sol and abs(sol_now - prev_sol) / prev_sol > 0.02:
+                d = (sol_now - prev_sol) / prev_sol * 100
+                signals.append(f"BLIX_SOL_REGIME: SOL {d:+.1f}% (${sol_now:.0f})")
+            if sol_now:
+                pos["blix_sol_usd"] = sol_now
+    except Exception:
+        pass
+
+    # --- BLIX empirical track record (7.6, Oct 18) — measured 1h hit rates for context ---
+    try:
+        from desk_common import blix_signal_track, blix_alive
+        if blix_alive() and signals:
+            tr = blix_signal_track()  # overall
+            if tr and tr.get("events", 0) >= 5:
+                up20 = tr.get("up20") or 0
+                med = tr.get("median1h")
+                signals.append(f"BLIX_TRACK: {up20}/{tr.get('events')} up20+ · median1h={med} (empirical)")
+    except Exception:
+        pass
+
     # --- Bitquery USD-weighted buy/sell imbalance (when available) ---
     try:
         imb = bitquery_imbalance(mint, limit=25)
