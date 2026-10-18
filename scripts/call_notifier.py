@@ -63,6 +63,37 @@ def deep_aegis_card(mint, chan, sym, mc):
         return None, None, None
 
 
+def send_dm(text):
+    """Send DIRECTLY to the user's private DM via bot API (chat 1223241788).
+    Chunked <=3800 chars (Telegram limit 4096). DM-only, never a group.
+    Returns True on success. stdout fallback happens in main()."""
+    import re as _re, urllib.request
+    tok = None
+    for p in (os.path.join(DESK, ".env"), os.path.join(DESK, "CONFIG.md")):
+        try:
+            m = _re.search(r"(\d{6,}:[A-Za-z0-9_-]{30,})", open(p).read())
+            if m:
+                tok = m.group(1)
+                break
+        except Exception:
+            pass
+    if not tok:
+        return False
+    ok = True
+    for i in range(0, len(text), 3800):
+        chunk = text[i:i + 3800]
+        try:
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{tok}/sendMessage",
+                data=json.dumps({"chat_id": "1223241788", "text": chunk}).encode(),
+                headers={"Content-Type": "application/json"})
+            r = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            ok = ok and bool(r.get("ok"))
+        except Exception:
+            ok = False
+    return ok
+
+
 def main():
     st = load_state()
     last = st.get("last_ts", 0)
@@ -126,7 +157,11 @@ def main():
 
     save_state({"last_ts": next_ts})
     if out:
-        print("\n\n".join(out))
+        blob = "\n\n".join(out)
+        # DM-only delivery: direct bot send first (reliable), cron-stdout as backup
+        sent = send_dm(blob)
+        print(blob)
+        print(f"\n[delivery: dm_direct={'ok' if sent else 'FAILED — check bot token / DM chat'}]")
     return 0
 
 
