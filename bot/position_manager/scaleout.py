@@ -108,7 +108,9 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage"):
     # Previously state stayed "full" forever -> stage-2 conditions unreachable.
     if stage == 1 and not p.get("state") == "half":
         p["state"] = "half"
-    closed = float(p["entry_usd"]) < 0.01 or stage == 3
+    closed = float(p["entry_usd"]) < 0.01  # audit P0.4 (Oct 18): NEVER close on stage==3 alone — a
+    # full-exit intent may have sold only its own reservation (e.g. $80 of $100) while another
+    # intent reserved the rest; popping on stage==3 would DISCARD the residual basis + its cash.
     if closed:
         b["positions"].pop(sym, None)
     b.setdefault("trades", []).append({"ts": time.time(), "symbol": sym, "mint": p.get("mint"),
@@ -117,3 +119,38 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage"):
     save_book(b)
     return {"sold_usd": round(delta, 2), "pnl": round(pnl, 2), "closed": closed,
             "stage": stage, "remaining": 0.0 if closed else p["entry_usd"]}
+
+def execute_fraction(book, sym, frac, mult, reason="", how="frac"):
+    """audit P0.3 (Oct 18): honor an EXACT requested sell_fraction of the REMAINING basis
+    (e.g. a thesis-deterioration SCALE_OUT of 0.25 sells 25% of what's left — the staged
+    executor cannot express that, it only sells to stage-curve targets). Returns trade
+    record or None. Marks state half when a partial remains, closed when basis depleted."""
+    p = book["positions"].get(sym)
+    if not p or frac <= 0:
+        return None
+    current = float(p.get("entry_usd") or 0)
+    reserved = float(p.get("reserved_exit_usd") or 0)
+    sellable = max(0.0, current - reserved)
+    delta = min(sellable, current * frac)
+    if delta <= 0.001:
+        return None
+    proceeds = delta * mult
+    pnl = proceeds - delta
+    b = book
+    b["cash"] = round(b.get("cash", 0) + proceeds, 2)
+    b["realized"] = round(b.get("realized", 0) + pnl, 2)
+    p["entry_usd"] = round(current - delta, 4)
+    p["size_usd"] = p["entry_usd"]
+    p["reserved_exit_usd"] = 0.0
+    p.setdefault("stages_done", []).append(3 if p["entry_usd"] < 0.01 else 1)
+    if p["entry_usd"] >= 0.01:
+        p["state"] = "half"
+    closed = p["entry_usd"] < 0.01
+    if closed:
+        b["positions"].pop(sym, None)
+    b.setdefault("trades", []).append({"ts": time.time(), "symbol": sym, "mint": p.get("mint"),
+        "mult": round(mult, 4), "sold_usd": round(delta, 2), "pnl": round(pnl, 2),
+        "how": how, "reason": reason, "closed": closed})
+    save_book(b)
+    return {"sold_usd": round(delta, 2), "pnl": round(pnl, 2), "closed": closed,
+            "stage": 3 if closed else 1, "remaining": 0.0 if closed else p["entry_usd"]}

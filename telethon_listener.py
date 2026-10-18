@@ -47,7 +47,9 @@ def load_allowlist():
             if u not in chans and not u.isdigit():
                 chans.append(u)
         # bare names (e.g. "- sol_trend, solwhaletrending" as documented in CONFIG.example.md)
-        # STRICT: only bullet lines whose ENTIRE content is comma-separated usernames
+        # STRICT: only bullet lines whose ENTIRE content is comma-separated usernames,
+        # BUT tolerate a trailing "(...)" annotation on the last item (P1.3 Oct 18) so
+        # e.g. "signalsolanaby4am (private)" still resolves the username.
         for line in sec.splitlines():
             line = line.strip()
             if not line.startswith("-"):
@@ -56,6 +58,9 @@ def load_allowlist():
             items = [t for t in items if t]
             if not items:
                 continue
+            # strip parenthetical annotations from the final token
+            if items and "(" in items[-1]:
+                items[-1] = items[-1].split("(", 1)[0].strip()
             if all(re.fullmatch(r"[A-Za-z0-9_]{4,}", t or "") for t in items):
                 for u in items:
                     if u not in chans and not u.isdigit():

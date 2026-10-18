@@ -19,8 +19,10 @@ only; real keys never enter the repo.
   higher MC tiers scale out slower, stops wider (see position_monitor.py).
 
 ## Telegram Call Channels (curated — WE BUY ALL CALLS)
-- sol_trend, solwhaletrending, solearlytrending, PIRBViewTrending, soltrenchtrending,
-  SeekrTrending, signalsolanaby4am (private) — real-time via MTProto listener.
+- sol_trend, solwhaletrending, solearlytrending, PIRBViewTrending, soltrenchtrending
+- SeekrTrending, signalsolanaby4am
+  <!-- note: keep each channel line as bare comma-separated usernames; the allowlist
+       parser accepts only pure-username bullet lines (P1.3 audit Oct 18) -->
 - Parse via MTProto user session (telethon_listener.py) — t.me/s preview is fallback only.
 
 ## Scan/verification group (OUTPUT — not a signal source)

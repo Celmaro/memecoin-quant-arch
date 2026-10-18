@@ -565,8 +565,10 @@ def coinstats_balance(wallet, connection="solana"):
 def is_token_mint(address, timeout_cache=300):
     """Return True if `address` is an SPL token/Token-2022/Metaplex MINT account.
 
-    Wallets are owned by the System program; token mints are owned by the
-    Token programs. Cached per address (Telegram-intake boundary, audit §3).
+    audit P2 (Oct 18): owner-program membership alone is NOT complete validation —
+    token ACCOUNTS (which hold balances) are also owned by the token programs. Require
+    the parsed account to actually BE a mint (data.program == 'spl-token'/'spl-token-2022'
+    with a mint-shaped layout) rather than a wallet/token-account/ATA.
     """
     if not (32 <= len(str(address)) <= 44) or address == "So11111111111111111111111111111111111111112":
         return False
@@ -576,14 +578,27 @@ def is_token_mint(address, timeout_cache=300):
     TOKEN_PROGRAMS = {
         "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
         "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   # Token-2022 (correct address)
-        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",    # Metaplex metadata
     }
     try:
         acc = rpc("getAccountInfo", [address, {"encoding": "jsonParsed"}])
-        owner = (acc or {}).get("value", {}).get("owner") or ""
-        ok = owner in TOKEN_PROGRAMS
-        ttl_cache_put(("mint?", address), ok)
-        return ok
+        v = (acc or {}).get("value") or {}
+        owner = v.get("owner") or ""
+        data = v.get("data") or {}
+        if owner not in TOKEN_PROGRAMS:
+            ttl_cache_put(("mint?", address), False)
+            return False
+        # jsonParsed data for token programs: {'program': 'spl-token'|'spl-token-2022',
+        # 'parsed': {'info': {'decimals': N, 'isInitialized': bool}, 'type': 'mint'|'account'}}
+        if isinstance(data, dict):
+            parsed_type = (data.get("parsed") or {}).get("type")
+            prog = data.get("program") or ""
+            is_mint = parsed_type == "mint" or (prog in ("spl-token", "spl-token-2022") and "mint" in str(data))
+            ttl_cache_put(("mint?", address), is_mint)
+            return is_mint
+        # No parsed data (raw/base64) — fall back to owner check but exclude Metaplex
+        # metadata (which is NOT a mint) as a conservative guard.
+        ttl_cache_put(("mint?", address), False)
+        return False
     except Exception:
         return False
 

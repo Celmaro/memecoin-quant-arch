@@ -106,6 +106,34 @@ def quote_impact(mint, usd=20):
     return (r.get("price_impact_pct") or 0) / 100.0
 
 
+def quote_sell(mint, token_amount, slippage_bps=500):
+    """audit P1.6 (Oct 18): quote a SELL route (token -> SOL) with the actual token
+    quantity held. Jupiter inputMint/outputMint are the reverse of the buy quote —
+    exit analysis must use the real exit direction, not a buy quote."""
+    try:
+        from desk_common import http_json, load_config, SOL_MINT
+        cfg = load_config()
+        key = cfg.get("JUPITER_KEY")
+        amount = int(round(token_amount))  # raw units (decimals applied by caller)
+        params = urllib.parse.urlencode({
+            "inputMint": mint, "outputMint": SOL_MINT, "amount": amount, "slippageBps": slippage_bps,
+        })
+        hdrs = {"User-Agent": "Mozilla/5.0"}
+        if key: hdrs["x-api-key"] = key
+        d = http_json(f"{QUOTE}?{params}", headers=hdrs)[1]
+        if not isinstance(d, dict) or not d.get("outAmount"):
+            return None
+        return {
+            "via": "jupiter",
+            "in_tokens": amount,
+            "out_sol": int(d.get("outAmount") or 0),
+            "impact_fraction": float(d.get("priceImpactPct") or 0),  # decimal fraction (0.05=5%)
+            "slippage_bps": slippage_bps,
+        }
+    except Exception:
+        return None
+
+
 def report(mint, usd=20):
     r = quote(mint, usd)
     if "error" in r:

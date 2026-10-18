@@ -13,15 +13,20 @@ from desk_common import dex_pair
 
 FEE_BPS = 1.7  # desk execution estimate (%.3f = ~1.7%)
 
-def _jupiter_impact(mint, usd):
-    """Best-effort price impact at a given USD size; None if unavailable."""
+def _jupiter_impact(mint, usd, run_decimals):
+    """Best-effort SELL-side price impact at a given USD position size; None if unavailable.
+
+    audit P1.6 (Oct 18): use a real token->SOL SELL quote (the actual exit direction),
+    converting the USD position size into raw token units via `run_decimals`, instead of
+    using a buy-route quote and treating it as sell-side impact."""
     try:
-        from jupiter_estimator import quote
-        q = quote(mint, usd=usd, slippage_bps=500)
-        # audit P2 (Oct 18): NEVER treat the dexscreener fallback (hardcoded
-        # 1.0 = 100% impact) as a real quote — that skews executable-exit math.
-        if q and q.get("via") == "jupiter" and q.get("price_impact_pct") is not None:
-            return q["price_impact_pct"]
+        from jupiter_estimator import quote_sell
+        raw = usd / max(0.00000001, (run_decimals or 1))  # token amount in raw units
+        q = quote_sell(mint, int(round(raw)) if raw > 1 else 1, slippage_bps=500)
+        if q and q.get("via") == "jupiter":
+            # impact_fraction is a decimal fraction (0.05 = 5%); return as PERCENT for
+            # downstream display consistency (exit_intel multiplies by /100 below).
+            return q["impact_fraction"] * 100.0
     except Exception:
         pass
     return None
@@ -53,8 +58,15 @@ def exit_intel(mint, pos, liq=None, entry_liq=None, entry_usd=None, size_usd=Non
     displayed = qty * px               # mark-to-market gross value
     notional_usd = displayed
 
-    # price impact of selling the actual position
-    impact = _jupiter_impact(mint, notional_usd)
+    # price impact of selling the actual position (P1.6: SELL route, real token qty)
+    qty_raw = None
+    try:
+        from jupiter_estimator import token_decimals
+        dec = token_decimals(mint)
+        qty_raw = int(round(qty * (10 ** dec)))
+    except Exception:
+        qty_raw = None
+    impact = _jupiter_impact(mint, notional_usd, qty_raw) if qty_raw else None
     if impact is None:
         # fallback heuristic: impact grows with position share of liquidity
         impact = min(50.0, 5.0 * notional_usd / liq) if liq > 0 else 50.0

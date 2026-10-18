@@ -343,29 +343,30 @@ def score_coin(mint, deep=False):
         if isinstance(ave.get("risk_score"), (int, float)) and ave["risk_score"] >= 80:
             score -= 10; flags.append(f"ave_risk_score_{ave['risk_score']}")
 
-    # --- 8th check: LIVE MOMENTUM from PumpDev WS tape (bounded +/-10) ---
+    # --- 8th check: LIVE MOMENTUM from BLIX trade tape (bounded +/-10; replaces pruned ws_momentum) ---
     try:
-        from ws_momentum import sample_trades
-        trades, _err = sample_trades(mint, seconds=12, max_trades=120)
-        if trades and len(trades) >= 3:
-            buys = sum(t["usd"] for t in trades if t["side"] == "buy")
-            sells = sum(t["usd"] for t in trades if t["side"] == "sell")
-            tot = buys + sells
-            ratio = buys / tot if tot else 0.5
-            if tot >= 500:
-                if ratio >= 0.7:
-                    score += 8; flags.append("ws_hot_buys")
-                elif ratio >= 0.55:
-                    score += 4; flags.append("ws_buy_pressure")
-                elif ratio >= 0.45:
-                    pass  # neutral
-                elif ratio >= 0.3:
-                    score -= 6; flags.append("ws_sell_pressure")
-                else:
-                    score -= 10; flags.append("ws_dumping")
-        # too few trades = dead tape at scan time
-        if len(trades) < 3:
-            flags.append("ws_quiet_tape")
+        from desk_common import blix_coin_trades, blix_alive
+        if blix_alive():
+            trades = blix_coin_trades(mint, limit=120)
+            if trades and len(trades) >= 3:
+                buys = sum(float(t.get("usd") or 0) for t in trades if t.get("side") == "buy")
+                sells = sum(float(t.get("usd") or 0) for t in trades if t.get("side") == "sell")
+                tot = buys + sells
+                ratio = buys / tot if tot else 0.5
+                if tot >= 500:
+                    if ratio >= 0.7:
+                        score += 8; flags.append("ws_hot_buys")
+                    elif ratio >= 0.55:
+                        score += 4; flags.append("ws_buy_pressure")
+                    elif ratio >= 0.45:
+                        pass  # neutral
+                    elif ratio >= 0.3:
+                        score -= 6; flags.append("ws_sell_pressure")
+                    else:
+                        score -= 10; flags.append("ws_dumping")
+            # too few trades = dead tape at scan time
+            if not trades or len(trades) < 3:
+                flags.append("ws_quiet_tape")
     except Exception:
         pass  # WS unavailable — never block the scan on it
 

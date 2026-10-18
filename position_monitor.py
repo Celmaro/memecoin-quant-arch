@@ -69,6 +69,8 @@ def round_stall(mc):
 
 def analyze(mint, pos):
     """Exit-signal engine v2. Returns dict with signals + recommended action."""
+    mkt_ts = time.time()  # audit P1.2 (Oct 18): market observation timestamp — captured at the
+                          # moment the snapshot is fetched, before any slow intelligence calls.
     pair = dex_pair(mint)
     if not pair:
         return {"ok": False, "signal": "DATA_UNAVAILABLE", "action": "MANUAL_CHECK"}
@@ -523,7 +525,10 @@ def analyze(mint, pos):
             if sym_key:
                 # audit P1 (Oct 18): pass a real market observation timestamp so the
                 # gate's staleness rule is ACTIVE, not silently disabled by None.
-                allowed, gnotes = gate(contract, pb, sym_key, market_ts=now_ev, quote_ts=None)
+                # audit P1.2 (Oct 18): use the TRUE snapshot fetch time (mkt_ts) rather than
+                # the end-of-analysis now_ev — slow forensic calls must not make stale data
+                # appear fresh to the gate.
+                allowed, gnotes = gate(contract, pb, sym_key, market_ts=mkt_ts, quote_ts=None)
                 if allowed != contract.get("action"):
                     contract = dict(contract)
                     contract["action"] = allowed
@@ -537,10 +542,14 @@ def analyze(mint, pos):
         if contract["action"] not in ("HOLD", action):
             # HARD_STOP / EMERGENCY (liq proxy) are non-overridable: the risk
             # engine may UPGRADE but never DOWNGRADE a floor/collapse exit.
-            if pos.get("hard_stop_triggered") or pos.get("emergency_triggered"):
+            # audit P0.3 (Oct 18): ANY full-exit intent set by intelligence branches
+            # (wallet-distribution, BLIX dev-dump, sell-block) must also stay sticky —
+            # the decision engine can otherwise downgrade it to SCALE_OUT via thesis.
+            if (pos.get("hard_stop_triggered") or pos.get("emergency_triggered")
+                    or action in ("EXIT_ALL", "EMERGENCY_EXIT", "FULL_EXIT", "DEAD")):
                 if contract["action"] in ("EMERGENCY_EXIT", "DEAD", "FULL_EXIT", "EXIT_ALL"):
                     action = contract["action"]
-                # else keep the stronger action — floor/collapse wins
+                # else keep the stronger action — floor/collapse/full-exit wins
             else:
                 action = contract["action"]  # risk engine veto/upgrade
     except Exception:

@@ -93,10 +93,13 @@ def main():
     if not fresh:
         return 0  # silent
 
-    # audit P2 (Oct 18): watermark must advance ONLY past calls actually POSTED,
-    # not to the max across all fresh — a >4-call burst silently dropped later calls.
+    # audit P2 (Oct 18): calls.jsonl is NOT chronological — sort by timestamp ASCENDING
+    # and always consume the OLDEST MAX_POST first. That makes the watermark advance to
+    # exactly the newest of the consumed batch, so a higher-ts record that appeared later
+    # in the file stays fresh (never permanently skipped by an out-of-order max).
+    fresh.sort(key=lambda c: float(c.get("ts") or 0))
     posted = fresh[:MAX_POST]
-    next_ts = max((float(c.get("ts") or 0) for c in posted), default=last)
+    next_ts = st.get("last_ts", 0)  # only advance past calls whose queue actually succeeded
 
     out = []
     for c in posted:
@@ -116,7 +119,12 @@ def main():
         out.append(dm)
         hmq_text = f"📡 Channel call: ${sym or '?'} from {chan}{mc_s}\nCA: {mint}"
         # queue with channel + mint so the curator card can attribute the source
-        queue_hmq_post(hmq_text, mint=mint, channel=chan)  # curator sends as human -> scan bots -> curated card
+        try:
+            if queue_hmq_post(hmq_text, mint=mint, channel=chan):
+                next_ts = max(next_ts, float(c.get("ts") or 0))
+            # audit P2: on queue failure, do NOT advance the watermark — retry next tick
+        except Exception:
+            pass
 
     save_state({"last_ts": next_ts})
     if out:
