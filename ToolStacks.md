@@ -2,7 +2,13 @@
 
 **Living reference.** Every tool/API/WS/RPC the user provides gets appended here with endpoints + summary.
 Before building anything: scan this file for the right tool. Credentials live in `CONFIG.md` (same dir).
-Last verified: **2026-10-15** (live probes). Docs consulted: official docs/llms.txt per tool.
+Last verified: **2026-10-18** (full live battery across all providers, AE mint AeLonpr… as test target).
+
+**Oct 18 live-battery results (probe script /tmp/toolstack_probe*.py):**
+- ✅ **WORKS today:** Helius RPC (getAccountInfo 281ms), GeckoTerminal (305ms), Birdeye overview (218ms), Ave search + contracts-risk (217/209ms, risk 55), GMGN rank 1h (274ms), DexPaprika token + pools/search (1.0s/0.9s), Jupiter quote (29ms, impact 1.49%), Rugcheck summary (520ms), GoPlus (97ms), WalletIntel leaderboard (590ms), Sol.wales moves (540ms), Solscan chaininfo (366ms), Blix health (9ms), FomoAPI /v1 (553ms — NOT dead, just leaderboard credit-locked), PumpDev health (992ms), Shyft getTokenSupply (230ms), SolanaTracker /credits (245ms, 200)
+- ⚠️ **DEGRADED/locked:** Bitquery realtime GraphQL → **HTTP 402** (realtime now paywalled), Dune → 401 (key/scope), Nansen → 401 (credits), CoinStats → 406 (credits exhausted, unchanged), PumpAPI replay archive → 403 (UA/plan)
+- ⚠️ **Intermittent:** DexScreener 429'd once during battery (retry/backoff handles it)
+- 🔌 **Network-blocked from this box (probe from user network):** CabalSpy api+api-id+stream, MadeOnSol api/v1, GMGN openapi (CF-403)
 
 Status legend:
 - ✅ **WORKS** — live-tested working
