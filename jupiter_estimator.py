@@ -50,7 +50,18 @@ def quote(mint, usd=20, slippage_bps=500):
     try:
         hdrs = {"User-Agent": "Mozilla/5.0"}
         if key: hdrs["x-api-key"] = key
-        data = http_json(f"{QUOTE}?{params}", headers=hdrs)[1]
+        # Swap V2 quote is the recommended path (Oct-18 research); fall back to V1.
+        data = None
+        for base in (f"{QUOTE.replace('/swap/v1/quote','/swap/v2/quote')}", QUOTE):
+            try:
+                d2 = http_json(f"{base}?{params}", headers=hdrs)[1]
+                if isinstance(d2, dict) and d2.get("outAmount"):
+                    data = d2
+                    break
+            except Exception:
+                continue
+        if not data:
+            raise Exception("both v1+v2 quote failed")
         out_amt = int(data.get("outAmount") or 0)
         # Jupiter docs: priceImpactPct is a DECIMAL FRACTION (0.05 = 5%), not a percentage.
         price_impact = float(data.get("priceImpactPct") or 0)

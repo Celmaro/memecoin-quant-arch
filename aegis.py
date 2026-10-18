@@ -477,6 +477,42 @@ def score_coin(mint, deep=False):
     except Exception:
         pass  # blix down — never block
 
+    # --- 15th check: AVE top-100 holder quality (Oct 18 — keyed, per-holder PnL/funding) ---
+    try:
+        from desk_common import ave_top100_holders
+        th = ave_top100_holders(mint)
+        if th and isinstance(th, list) and len(th) >= 5:
+            n = len(th)
+            # top-1 concentration
+            top1 = th[0].get("balance_ratio") or 0
+            if top1 > 0.5:
+                score -= 12; flags.append(f"ave_top1_{top1*100:.0f}%")
+            # count holders with realized profit taken on this mint (smart exits visible)
+            sold_profit = sum(1 for h in th if (h.get("realized_profit") or 0) > 0)
+            if sold_profit >= max(3, n // 3):
+                score -= 6; flags.append(f"ave_smart_exits_x{sold_profit}")
+            # avg holder age / wallet age signal
+            young = sum(1 for h in th if h.get("age") and (h.get("age") or "")[:7] >= "2026-10-01")
+            if young > n // 2:
+                flags.append("ave_wallets_young")
+    except Exception:
+        pass  # ave down — never block
+
+    # --- 16th check: Rugcheck insider networks (free; net_id persists across tokens) ---
+    try:
+        from desk_common import rugcheck_insiders, rugcheck_lockers
+        ins = rugcheck_insiders(mint)
+        if ins and isinstance(ins, list):
+            nets = len(ins)
+            if nets > 0:
+                score -= 5 * min(nets, 3); flags.append(f"rug_insider_nets_x{nets}")
+                # transfer-type networks = involved wallets; trade-type = bought-in insiders
+                trade_nets = sum(1 for n in ins if n.get("network_type") == "trade")
+                if trade_nets > 0:
+                    score -= 5; flags.append(f"rug_trade_insiders_x{trade_nets}")
+    except Exception:
+        pass  # rugcheck down — never block
+
     # Second brain: deployer + first buyers
     deployer = None
     dts = None
@@ -504,6 +540,23 @@ def score_coin(mint, deep=False):
                             break
             except Exception:
                 pass  # blix down — never block
+            # --- GoPlus address_security on the deployer (Oct 18 — free, wire vetting) ---
+            try:
+                from desk_common import goplus_address_security
+                gpa = goplus_address_security(deployer)
+                if gpa:
+                    if gpa.get("risk") == "RISK":
+                        score -= 12; flags.append("deployer_goplus_risk")
+                    if gpa.get("honeypot_related"):
+                        score -= 12; flags.append("deployer_honeypot_related")
+                    if gpa.get("phishing"):
+                        score -= 10; flags.append("deployer_phishing")
+                    if gpa.get("sanctioned"):
+                        score -= 15; flags.append("deployer_sanctioned")
+                    if gpa.get("malicious_contracts"):
+                        score -= min(12, 3 * int(gpa["malicious_contracts"])); flags.append(f"deployer_malicious_x{gpa['malicious_contracts']}")
+            except Exception:
+                pass  # goplus down — never block
             # Remember deployer's OTHER coins (creatorTokens) — pattern across launches
             other = r.get("creator_tokens") or []
             if other:

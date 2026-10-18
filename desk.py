@@ -354,6 +354,62 @@ def main():
             print(__doc__); return 1
         return 0
 
+    if cmd == "deep":
+        """Full deep-enrichment stack on one mint (Oct-18 wiring 1-15 except GMGN-callout).
+        Usage: desk.py deep <mint>"""
+        mint = args[1] if len(args) > 1 else None
+        if not mint:
+            print("usage: desk.py deep <mint>"); return 1
+        from desk_common import (ave_top100_holders, rugcheck_insiders, rugcheck_lockers,
+                                 shyft_failed_txs, dexscreener_metas_trending,
+                                 rugcheck_stats_new, jupiter_quote_v2, budget_remaining,
+                                 goplus_address_security, cabalspy_bundle, cabalspy_signals,
+                                 madeonsol_buyer_quality, madeonsol_signal_perf)
+        print(f"🔬 DEEP ENRICHMENT {mint[:12]}...")
+        print(f"   credit budget: ave_top100={budget_remaining('ave_top100')} fomo={budget_remaining('fomoapi')} "
+              f"st={budget_remaining('solanatracker')}")
+        # 7 Ave top100
+        th = ave_top100_holders(mint)
+        print(f"[7] Ave top100: {len(th) if th else 'n/a'} holders")
+        if th:
+            print(f"    top1={th[0].get('balance_ratio', 0)*100:.0f}% "
+                  f"smart_exits={sum(1 for h in th if (h.get('realized_profit') or 0) > 0)}")
+        # 9 Rugcheck insiders + lockers
+        rgi = rugcheck_insiders(mint)
+        print(f"[9] Rugcheck insiders: {len(rgi) if isinstance(rgi, list) else 'n/a'} net(s)")
+        rgl = rugcheck_lockers(mint)
+        print(f"    lockers: {'PAID(401)' if rgl is None else 'ok'}")
+        # 4 Shyft failed
+        fails = shyft_failed_txs(mint)
+        print(f"[4] Shyft failed txs: {len(fails) if fails else 0}")
+        # 11 DexScreener metas
+        metas = dexscreener_metas_trending()
+        print(f"[11] DexScreener metas trending: {len(metas)} themes")
+        if metas:
+            for m in metas[:3]:
+                print(f"    {m.get('name')}: mc={m.get('marketCap',0):,.0f} tok={m.get('tokenCount')} "
+                      f"h24={((m.get('marketCapChange') or {}).get('h24')):.1%}" if isinstance(m, dict) and m.get("marketCapChange") else f"    {m}")
+        # 15 Jupiter v2 quote
+        q2 = jupiter_quote_v2(mint, usd=20)
+        print(f"[15] Jupiter v2: {'ok impact=' + str(round(float(q2.get('priceImpactPct'))*100,2)) + '%' if q2 else 'n/a'}")
+        # 1 GoPlus address security (if deployer known from db)
+        try:
+            import sqlite3, os
+            con = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "aegis.db"))
+            row = con.execute("SELECT deployer FROM coins WHERE mint=?", (mint,)).fetchone()
+            con.close()
+            if row and row[0]:
+                gpa = goplus_address_security(row[0])
+                print(f"[1] GoPlus addr_security: {'RISK ' + str(gpa) if gpa and gpa.get('risk')=='RISK' else ('OK' if gpa else 'n/a')}")
+        except Exception:
+            pass
+        # 13 CabalSpy + 14 MadeOnSol (blocked here — show graceful)
+        cb = cabalspy_bundle(mint)
+        print(f"[13] CabalSpy bundle: {'ok' if cb else 'n/a (network-blocked here)'}")
+        bq = madeonsol_buyer_quality([mint])
+        print(f"[14] MadeOnSol buyer-quality: {'ok' if bq else 'n/a (network-blocked here)'}")
+        return 0
+
     print(f"unknown command: {cmd}"); print(__doc__); return 1
 
 if __name__ == "__main__":

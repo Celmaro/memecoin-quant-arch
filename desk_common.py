@@ -814,6 +814,334 @@ def blix_wallet(address):
     d = _blix(f"/api/wallet/{address}")
     return d or {}
 
+# ================= CREDIT/TIER BUDGET MANAGER (Oct 18) =================
+# Providers bill in credits or daily limits. Guard every paid call through budget()
+# so a burst never blows a monthly bucket. Budgets reset each UTC day and are
+# persisted to ~/memecoin-quant/credit_budget.json (thread-safe-ish via file write).
+CREDIT_BUDGETS = {
+    "helius_wallet":    {"daily": 500,   "cost": 100},   # Wallet API 100cr/call
+    "fomoapi":          {"daily": 2500,  "cost": 250},   # devs/stats 250cr
+    "solanatracker":    {"daily": 500,   "cost": 1},     # 10k/mo free -> keep light
+    "walletintel":      {"daily": 10,    "cost": 1},
+    "ave_top100":       {"daily": 200,   "cost": 1},     # keyed, free-ish w/ limits
+    "madeonsol":        {"daily": 180,   "cost": 1},     # 200/day free, leave headroom
+    "cabalspy":         {"daily": 500,   "cost": 10},    # 10k/mo
+}
+_BUDGET_FILE = os.path.join(DESK, "credit_budget.json")
+
+def _load_budget():
+    try:
+        return json.load(open(_BUDGET_FILE))
+    except Exception:
+        return {}
+
+def _save_budget(b):
+    try:
+        tmp = _BUDGET_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(b, f)
+        os.replace(tmp, _BUDGET_FILE)
+    except Exception:
+        pass
+
+def _day():
+    return time.strftime("%Y-%m-%d")
+
+def budget(provider, cost=None, now=None):
+    """True if this call is within the daily budget; records the spend. Use BEFORE the call.
+    Now optional for testing. Thread-light: file-based counter, best-effort."""
+    bp = CREDIT_BUDGETS.get(provider)
+    if not bp:
+        return True  # unbudgeted provider: allow
+    cost = cost if cost is not None else bp["cost"]
+    d = _day()
+    b = _load_budget()
+    day = b.setdefault("_day", d)
+    if day != d:
+        b = {"_day": d}          # new day, reset
+    used = float(b.get(provider, 0.0))
+    if used + cost > bp["daily"]:
+        return False             # over budget: caller should degrade gracefully
+    b[provider] = used + cost
+    _save_budget(b)
+    return True
+
+def budget_remaining(provider):
+    bp = CREDIT_BUDGETS.get(provider)
+    if not bp:
+        return None
+    b = _load_budget()
+    if b.get("_day") != _day():
+        return bp["daily"]
+    return max(0.0, bp["daily"] - float(b.get(provider, 0.0)))
+
+# ================= DEEP-RESEARCH WIRING (Oct 18 — Top-15 capabilities) =================
+# 1+2. GoPlus address_security + pre_execution (free, rate-limited)
+def goplus_address_security(wallet):
+    """Vet a wallet: honeypot_related_address, number_of_malicious_contracts_created,
+    phishing, mixer, money_laundering, sanctioned, fake_token, blackmail. Free."""
+    try:
+        st, d = http_json(f"https://api.gopluslabs.io/api/v1/address_security/{wallet}?chain_id=solana",
+                          headers={"User-Agent": UA})
+        res = (d or {}).get("result")
+        if isinstance(res, dict):
+            return {
+                "honeypot_related": (res.get("honeypot_related_address") or {}).get("is_honeypot"),
+                "malicious_contracts": res.get("number_of_malicious_contracts_created"),
+                "phishing": res.get("phishing_activities"),
+                "mixer": res.get("money_laundering") or res.get("mixer_related_address"),
+                "sanctioned": res.get("sanctioned_related_address"),
+                "draining_contract": (res.get("draining_contract_related_address") or {}).get("is_draining_contract"),
+                "risk": "RISK" if (res.get("phishing_activities") or res.get("sanctioned_related_address")
+                                    or res.get("number_of_malicious_contracts_created")) else "OK",
+            }
+    except Exception:
+        pass
+    return None
+
+def goplus_pre_execution(tx_encoded):
+    """Simulate an encoded transaction: returns asset_changes w/ risky_address flags.
+    Use to PROVE an exit swap executes before sending (sell-capability gate). Free."""
+    try:
+        st, d = http_json("https://api.gopluslabs.io/api/v1/solana/pre_execution", method="POST",
+                          headers={"Content-Type": "application/json", "User-Agent": UA},
+                          body={"encoded_transaction": tx_encoded}, timeout=30)
+        res = (d or {}).get("result")
+        if res:
+            return {"asset_changes": res.get("asset_changes"), "risky": res.get("risky_address"),
+                    "wait_sec": res.get("wait_sec")}
+    except Exception:
+        pass
+    return None
+
+# 3. Helius Wallet API: funded_by + identity (100cr/call — budgeted)
+def helius_wallet(wallet):
+    """Who funded a wallet + identity labels. BUDGETED (helius_wallet, 100cr)."""
+    if not budget("helius_wallet"):
+        return None
+    try:
+        st, d = http_json(f"https://api.helius.xyz/v1/wallet/{wallet}/identity",
+                          timeout=20)
+        if not isinstance(d, dict) or d.get("error"):
+            return None
+        funded = None
+        try:
+            st2, d2 = http_json(f"https://api.helius.xyz/v1/wallet/{wallet}/funded_by",
+                                timeout=20)
+            funded = (d2 or {}).get("result") if isinstance(d2, dict) else None
+        except Exception:
+            pass
+        return {"identity": d, "funded_by": funded}
+    except Exception:
+        return None
+
+# 4. Shyft failed-tx tape (free REST — sell-block detector)
+def shyft_failed_txs(mint, limit=20):
+    """Recent FAILED transactions touching a mint — dynamic-honeypot / sell-block proof.
+    Free REST (getTransactionsForAddress with filters status=failed)."""
+    try:
+        st, d = http_json(
+            f"https://rpc.shyft.to?api_key={load_config().get('SHYFT_KEY')}", method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": UA},
+            body={"jsonrpc": "2.0", "id": 1, "method": "getTransactionsForAddress",
+                  "params": [mint, {"limit": limit,
+                                    "filters": [{"status": "failed"}]}]}, timeout=25)
+        res = (d or {}).get("result") or []
+        if isinstance(res, list):
+            return [t for t in res if isinstance(t, dict)]
+        return []
+    except Exception:
+        return []
+
+# 5. FomoAPI token devs + stats (250cr — budgeted; credits may be exhausted -> graceful)
+def fomo_devs_stats(mint):
+    if not budget("fomoapi", cost=250):
+        return None
+    try:
+        key = load_config().get("FOMO_KEY")
+        if not key: return None
+        st, d = http_json(f"https://api.fomoapi.io/v2/token/{mint}/devs?networkId=1399811149",
+                          headers={"Authorization": f"Bearer {key}"}, timeout=20)
+        devs = (d or {}).get("devs") or []
+        st2, d2 = http_json(f"https://api.fomoapi.io/v2/token/{mint}/stats?networkId=1399811149",
+                            headers={"Authorization": f"Bearer {key}"}, timeout=20)
+        stats = (d2 or {}).get("data") or {}
+        out = {"devs": devs[:5], "stats": {
+            "holders": stats.get("holders"), "top10_pct": stats.get("top10HoldersPercent"),
+            "windows": stats.get("windows")}}
+        return out
+    except Exception:
+        return None
+
+# 6. SolanaTracker whale/KOL trades (credits — budgeted)
+def st_whales(min_volume=1000, limit=20):
+    if not budget("solanatracker"):
+        return []
+    try:
+        key = load_config().get("SOLANATRACKER_KEY")
+        req = urllib.request.Request(
+            f"https://data.solanatracker.io/trades/whales?minVolume={min_volume}&limit={limit}",
+            headers={"x-api-key": key, "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode())
+        return (d or {}).get("trades") or []
+    except Exception:
+        return []
+
+def st_kol_trades(limit=20):
+    if not budget("solanatracker"):
+        return []
+    try:
+        key = load_config().get("SOLANATRACKER_KEY")
+        req = urllib.request.Request(f"https://data.solanatracker.io/trades/kol?limit={limit}",
+                                     headers={"x-api-key": key, "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode())
+        return (d or {}).get("trades") or []
+    except Exception:
+        return []
+
+# 7. Ave top-100 holders (per-holder PnL + funding attribution) — keyed
+def ave_top100_holders(mint):
+    if not budget("ave_top100"):
+        return []
+    try:
+        key = load_config().get("AVE_KEY")
+        st, d = http_json(f"https://prod.ave-api.com/v2/tokens/top100/{mint}-solana",
+                          headers={"X-API-KEY": key, "User-Agent": UA}, timeout=25)
+        data = (d or {}).get("data") or []
+        if isinstance(data, list):
+            return data[:100]
+        return []
+    except Exception:
+        return []
+
+# 9. Rugcheck insiders graph + lockers (insiders free w/ flux key; lockers PAID -> graceful)
+def rugcheck_insiders(mint):
+    try:
+        st, d = http_json(f"https://api.rugcheck.xyz/v1/tokens/{mint}/insiders/graph?api_key={load_config().get('FLUX_KEY')}", timeout=20)
+        return d or None   # returns a LIST of {net_id, network_type, nodes[], links[]}
+    except Exception:
+        return None
+
+def rugcheck_lockers(mint):
+    try:
+        st, d = http_json(f"https://api.rugcheck.xyz/v1/tokens/{mint}/lockers?api_key={load_config().get('FLUX_KEY')}", timeout=20)
+        return (d or {}).get("data") or d
+    except Exception:
+        return None
+
+def rugcheck_stats_new(limit=20):
+    try:
+        st, d = http_json(f"https://api.rugcheck.xyz/v1/stats/new_tokens?api_key={load_config().get('FLUX_KEY')}", timeout=20)
+        data = (d or {}).get("data") if isinstance(d, dict) else None
+        return (data or [])[:limit]
+    except Exception:
+        return []
+
+# 11. DexScreener metas trending (free)
+def dexscreener_metas_trending():
+    try:
+        st, d = http_json("https://api.dexscreener.com/metas/trending/v1", timeout=20)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+# 12. DexPaprika reserve stream (SSE — one-shot read helper + poll usage)
+def dexpaprika_reserves(pool_id):
+    """Read a single reserve snapshot (SSE is push; this is the REST pool detail fallback).
+    For continuous liq-pull monitoring, poll or run the SSE reader (see scripts)."""
+    try:
+        st, d = http_json(f"https://api.dexpaprika.com/networks/solana/pools/{pool_id}",
+                          headers={"Authorization": load_config().get("DEXPAPRIKA_KEY") or ""}, timeout=20)
+        return (d or {}).get("data") or d
+    except Exception:
+        return None
+
+# 13. CabalSpy bundle/signals/connections (10k cr/mo, network-blocked here -> graceful)
+def cabalspy_bundle(mint):
+    if not budget("cabalspy"):
+        return None
+    try:
+        key = load_config().get("CABALSPY_KEY")
+        if not key: return None
+        st, d = http_json(f"https://api.cabalspy.xyz/v1/bundle?blockchain=solana&mint={mint}&api_key={key}", timeout=15)
+        return (d or {}).get("data") or d
+    except Exception:
+        return None
+
+def cabalspy_signals(min_win_rate=0.5):
+    if not budget("cabalspy"):
+        return []
+    try:
+        key = load_config().get("CABALSPY_KEY")
+        if not key: return []
+        st, d = http_json(f"https://api.cabalspy.xyz/v1/signals?blockchain=solana&min_win_rate={min_win_rate}&api_key={key}", timeout=15)
+        return (d or {}).get("data", {}).get("signals") or []
+    except Exception:
+        return []
+
+def cabalspy_connections(wallet):
+    if not budget("cabalspy"):
+        return []
+    try:
+        key = load_config().get("CABALSPY_KEY")
+        if not key: return []
+        st, d = http_json(f"https://api.cabalspy.xyz/v1/wallets/connections?blockchain=solana&address={wallet}&api_key={key}", timeout=15)
+        return (d or {}).get("data", {}).get("connections") or []
+    except Exception:
+        return []
+
+# 14. MadeOnSol buyer-quality / signals-performance / depth (CF-blocked here -> graceful)
+def madeonsol_buyer_quality(mints):
+    """Batch buyer-quality for a list of mints (≤50). BUDGETED; 200/day free."""
+    if not budget("madeonsol"):
+        return []
+    try:
+        key = load_config().get("MADEONSOL_KEY")
+        if not key: return []
+        st, d = http_json("https://madeonsol.com/api/v1/tokens/batch/buyer-quality", method="POST",
+                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": UA},
+                          body={"mints": mints[:50]}, timeout=30)
+        return (d or {}).get("tokens") or []
+    except Exception:
+        return []
+
+def madeonsol_signal_perf(signal_name, history=False):
+    try:
+        key = load_config().get("MADEONSOL_KEY")
+        if not key: return None
+        st, d = http_json(f"https://madeonsol.com/api/v1/signals/{signal_name}/performance?history={'true' if history else 'false'}",
+                          headers={"Authorization": f"Bearer {key}", "User-Agent": UA}, timeout=25)
+        return d or None
+    except Exception:
+        return None
+
+# 15. Jupiter Swap v2 quote (recommended path; drop-in for v1)
+def jupiter_quote_v2(mint, usd=20, slippage_bps=500):
+    """Swap v2 quote (SOL->mint). Returns dict w/ priceImpactPct fraction, outAmount, or None."""
+    try:
+        cfg = load_config()
+        key = cfg.get("JUPITER_KEY")
+        # SOL/USD via DexScreener (price.jup.ag doesn't resolve here)
+        s = 150.0
+        try:
+            p = dex_pair(SOL_MINT)
+            s = float((p or {}).get("priceUsd") or 150.0)
+        except Exception:
+            pass
+        amount = int(round(usd / s * 1e9))
+        url = (f"https://api.jup.ag/swap/v2/quote?inputMint={SOL_MINT}&outputMint={mint}"
+               f"&amount={amount}&slippageBps={slippage_bps}")
+        hdrs = {"User-Agent": UA}
+        if key: hdrs["x-api-key"] = key
+        st, d = http_json(url, headers=hdrs, timeout=20)
+        if isinstance(d, dict) and "outAmount" in d:
+            return d
+        return None
+    except Exception:
+        return None
+
 def log_event(entry, fname=None):
     os.makedirs(JOURNAL_DIR, exist_ok=True)
     entry["ts"] = time.time()

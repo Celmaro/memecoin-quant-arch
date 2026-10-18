@@ -131,16 +131,29 @@ def analyze(mint, pos):
         signals.append(f"CLIP1: {mult:.2f}x >= {c1:.2f}x (sell 50%)")
         action = "CLIP_50"
 
-    # --- Hard stop ---
-    if mult <= (1 - stop):
-        signals.append(f"STOP: {mult:.2f}x <= {1-stop:.2f}x (stop {stop*100:.0f}%)")
+    # --- Hard stop (FIX: price-based circuit breaker, independent of liquidity) ---
+    # User fix #1: exit at a hard price floor (default -50%) even if liquidity data
+    # is missing. The old stop was inverted (mult <= 1 - stop where stop is a
+    # positive fraction made it fire at 1.28x/1.15x ABOVE entry) and was skipped
+    # entirely when liq was None. New logic: hard floor always applies.
+    hard_floor = float(pos.get("hard_stop_mult") or 0.50)
+    if mult <= hard_floor:
+        signals.append(f"HARD_STOP: {mult:.2f}x <= {hard_floor:.2f}x price floor (liquidity-independent)")
         action = "EXIT_ALL"
+        pos["hard_stop_triggered"] = True  # non-overridable: contract may not downgrade
 
-    # --- Liquidity collapse ---
-    entry_liq = float(pos.get("entry_liq") or liq or 0)
-    if entry_liq > 0 and liq < entry_liq * 0.5:
-        signals.append(f"LIQ_COLLAPSE: ${liq:,.0f} < 50% of entry ${entry_liq:,.0f}")
+    # --- Liquidity collapse (FIX #3: missing-liq fallback) ---
+    stored_entry_liq = pos.get("entry_liq")
+    entry_liq = float(stored_entry_liq or liq or 0)
+    if stored_entry_liq and float(stored_entry_liq) > 0 and liq < float(stored_entry_liq) * 0.5:
+        signals.append(f"LIQ_COLLAPSE: ${liq:,.0f} < 50% of entry ${float(stored_entry_liq):,.0f}")
         action = "EMERGENCY_EXIT"
+    elif not stored_entry_liq and liq > 0 and mult <= 0.75:
+        # FIX #3: NO entry liquidity snapshot was stored at buy time — a >25%
+        # price drawdown with any reported liquidity is collapse risk (price proxy)
+        signals.append(f"LIQ_MISSING_DRAWDOWN: no entry liq, mult {mult:.2f} <= 0.75 with ${liq:,.0f} liq")
+        action = "EMERGENCY_EXIT"
+        pos["emergency_triggered"] = True  # non-overridable: contract may not downgrade
 
     # --- LIQ=0 -> DEAD (ghost/dumped position: no one can exit at $0) ---
     if liq <= 0:
@@ -224,6 +237,42 @@ def analyze(mint, pos):
                 signals.append(f"GOOD_WALLET_SELLING: {owner} balance {qty:,.0f} < 50% of snapshot {snap:,.0f}")
                 if action == "HOLD": action = "CLIP_50"
                 if mult <= 1.0: action = "EXIT_ALL"
+    except Exception:
+        pass
+
+    # --- DEEP-ENRICHMENT GATES (Oct 18 — throttled to once per position per 15 min) ---
+    try:
+        last_deep = pos.get("deep_enrich_ts") or 0
+        if time.time() - last_deep > 900:  # 15-min throttle
+            # 4. Shyft failed-tx = sell-block detector (free) -> escalate by count
+            try:
+                from desk_common import shyft_failed_txs
+                fails = shyft_failed_txs(mint, limit=10)
+                if fails:
+                    if len(fails) >= 3:
+                        signals.append(f"SELL_BLOCK_DETECTED: {len(fails)} failed txs touching mint")
+                        action = "EMERGENCY_EXIT"
+                    elif len(fails) >= 1:
+                        signals.append(f"FAILED_TXS: {len(fails)} recent failed txs (dynamic-honeypot watch)")
+                        if action == "HOLD": action = "CLIP_50"
+            except Exception:
+                pass
+            # 5. FomoAPI devs: dev realized PnL closing = exit bias (budgeted)
+            try:
+                from desk_common import fomo_devs_stats
+                fd = fomo_devs_stats(mint)
+                if fd and fd.get("devs"):
+                    for drow in fd["devs"][:3]:
+                        if isinstance(drow, dict) and (drow.get("realizedPnlUsd") or 0) < 0:
+                            signals.append(f"DEV_EXIT_BIAS: dev realized {drow.get('realizedPnlUsd')}")
+                            if action == "HOLD": action = "CLIP_50"
+                if fd and fd.get("stats", {}).get("top10_pct"):
+                    t10 = fd["stats"]["top10_pct"]
+                    if t10 and t10 > 70:
+                        signals.append(f"FOMO_TOP10_{t10}%")
+            except Exception:
+                pass
+            pos["deep_enrich_ts"] = time.time()
     except Exception:
         pass
 
@@ -486,7 +535,14 @@ def analyze(mint, pos):
         pos["last_decision"] = {k: contract[k] for k in ("action", "sell_fraction", "confidence", "thesis_state")}
         pos["last_decision_px"] = px
         if contract["action"] not in ("HOLD", action):
-            action = contract["action"]  # risk engine veto/upgrade
+            # HARD_STOP / EMERGENCY (liq proxy) are non-overridable: the risk
+            # engine may UPGRADE but never DOWNGRADE a floor/collapse exit.
+            if pos.get("hard_stop_triggered") or pos.get("emergency_triggered"):
+                if contract["action"] in ("EMERGENCY_EXIT", "DEAD", "FULL_EXIT", "EXIT_ALL"):
+                    action = contract["action"]
+                # else keep the stronger action — floor/collapse wins
+            else:
+                action = contract["action"]  # risk engine veto/upgrade
     except Exception:
         pass
 
