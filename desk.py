@@ -13,7 +13,6 @@ Commands:
   vet <wallet>          Smart-wallet vettor
   journal [days]        Trade + filter-precision report
   followups             Run due PRFS follow-up checks
-  daily                 crawl + followups + journal (for cron)
 """
 import sys, time, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,17 +22,6 @@ def main():
     if not args:
         print(__doc__); return 1
     cmd = args[0]
-
-    if cmd == "crawl":
-        import telegram_crawler
-        new = telegram_crawler.crawl_all(scan=True)
-        for c in new: telegram_crawler.desk_alert(c)
-        import journal
-        if new:
-            for c in new:
-                journal.schedule_followup(c["mint"], "call_outcome", 24, f"call {c.get('symbol')}")
-            print(f"\n{len(new)} new call(s); follow-ups scheduled (+24h).")
-        return 0
 
     if cmd == "scan":
         mint = args[1]
@@ -125,17 +113,6 @@ def main():
         print(f"{n} follow-up(s) processed.")
         return 0
 
-    if cmd == "daily":
-        print(f"--- DESK DAILY {time.strftime('%Y-%m-%d %H:%M')} ---")
-        import telegram_crawler
-        new = telegram_crawler.crawl_all(scan=True, verbose=False)
-        for c in new: telegram_crawler.desk_alert(c)
-        import journal
-        journal.run_followups(verbose=True)
-        print()
-        journal.report(14)
-        return 0
-
     if cmd == "card":
         """Playbook card for a curated call (Tier 2.1 metrics)."""
         mint = args[1]
@@ -209,14 +186,6 @@ def main():
         import asyncio
         from scan_curator_daemon import run_daemon
         asyncio.run(run_daemon())
-        return 0
-
-    if cmd == "stream":
-        """Post-buy WS monitor (monitoring ONLY, never signal source)."""
-        from stream_listener import main as slm
-        sys.argv = ["stream_listener.py"] + args[1:]
-        import asyncio
-        asyncio.run(slm())
         return 0
 
     if cmd == "bracket":
