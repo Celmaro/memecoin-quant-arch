@@ -22,6 +22,97 @@ STAGES = {  # stage -> (target_remaining_ratio, default_trigger_mult)
 PAPER_FEE_PCT = 3.0
 PAPER_COST = (1 - PAPER_FEE_PCT / 100) / (1 + PAPER_FEE_PCT / 100)  # ≈ 0.943
 MIN_EXIT_LIQ_USD = 1000.0
+# Oct 19 phantom-loss fix: liq == 0 is an API miss (DexScreener 429 / fallback
+# empty), NOT proof the token is dead. Before booking a total loss we:
+#   - retry dex_pair up to 2x (Fix 1)
+#   - require 2 CONSECUTIVE confirmed-low reads (or a rugcheck flag) before
+#     UNSELLABLE is booked (Fix 2) — a single 0 never writes off a position.
+LIQ_RETRIES = 2
+LIQ_CONFIRM_MIN = 2
+
+
+def _resolve_exit_liq(mint, liq, p=None):
+    """Resolve exit liquidity with retries. Returns (resolved_liq, low_read_count).
+
+    - Treats liq in (None, <=0) as UNKNOWN and re-reads via dex_pair up to
+      LIQ_RETRIES more times (each read 1.1s+ throttle; bounded).
+    - returns the MAX observed (a single provider miss shouldn't count), plus
+      how many of the reads were confirmed < MIN_EXIT_LIQ_USD.
+    """
+    # liq=None: the CALLER didn't provide data (normal TP/CLIP exits) —
+    # do not block them; no retry, no low-count. Only an explicit liq<=0
+    # (a real lookup returned zero/missing) enters the retry path.
+    if liq is None:
+        return None, 0
+    reads = []
+    if liq > 0:
+        reads.append(float(liq))
+    else:
+        try:
+            from desk_common import dex_pair
+            for _ in range(LIQ_RETRIES):
+                mkt = dex_pair(mint, allow_fallback=True, timeout=10, retries=1) or {}
+                v = float(((mkt.get("liquidity") or {}).get("usd")) or 0)
+                reads.append(v)
+                if v > 0:
+                    break
+        except Exception:
+            pass
+    if not reads:
+        return 0.0, 0
+    resolved = max(reads)
+    low = sum(1 for v in reads if 0 < v < MIN_EXIT_LIQ_USD)
+    return resolved, low
+
+
+def _rugcheck_confirms_dead(mint):
+    """True only when rugcheck itself returns a rugged/danger verdict — the
+    fast-path that may still book UNSELLABLE on the first low read."""
+    try:
+        from desk_common import rugcheck
+        rep = rugcheck(mint) or {}
+        if not rep:
+            return False
+        if rep.get("danger") is True or rep.get("risk") in ("danger", "critical"):
+            return True
+        risks = " ".join(str(r.get("name") or "") for r in (rep.get("risks") or []))
+        if any(k in risks.lower() for k in ("rugpull", "mint authority", "freeze authority", "liquidity removed")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Fix 4 (Oct 19): never book an emergency exit worse than -28% when the
+# on-chain tape price is >= the paper's own mult. Uses the PumpAPI replay
+# archive when the exit hour is within reach; falls back to a DexScreener
+# re-read otherwise. Returns the max confirmed on-chain multiple or None.
+MAX_BOOKED_DUMP_MULT = 0.72  # 1 - 0.28 (the loosest stop tier)
+
+
+def _onchain_mult(mint, mult, entry_px=None):
+    """Best-effort on-chain price sanity check for an emergency exit.
+
+    If the tape shows the token trading >= MAX_BOOKED_DUMP_MULT of the paper's
+    entry at exit time, the emergency exit's fill is capped at that level
+    instead of a deeper phantom dump. Returns (capped_mult, source) where
+    capped_mult is None when no evidence (then caller keeps the raw mult).
+    """
+    try:
+        import urllib.request, json as _j
+        from desk_common import dex_pair
+        # quick DexScreener cross-read (cheap, no tape download)
+        mkt = dex_pair(mint, allow_fallback=True, timeout=8, retries=1) or {}
+        px = mkt.get("priceUsd")
+        if px and entry_px:
+            px = float(px)
+            if px > 0 and entry_px > 0:
+                live_mult = px / float(entry_px)
+                if live_mult >= MAX_BOOKED_DUMP_MULT and live_mult < mult:
+                    return live_mult, "dexscreener"
+    except Exception:
+        pass
+    return None, None
 # Doc2-7: don't sell dust tranches — a planned partial smaller than this collapses
 # into the next tranche (fees eat small sells on Solana under congestion).
 MIN_TRANCHE_USD = 2.5
@@ -116,17 +207,32 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage", liq=None, fee_
     if delta < min_tranche and current - delta >= 0.01:
         save_book(book)  # leave stage undone; next tick can combine
         return None
-    unsellable = (liq is not None and liq < MIN_EXIT_LIQ_USD)
-    if unsellable:
-        # Doc1-4: total loss — you can't exit into < $1K liquidity
-        proceeds = 0.0
-        pnl = -delta
-        reason = reason + "+UNSELLABLE"
-        illiq = True
-    else:
+    # Oct 19 phantom-loss fix: resolve liq with retries, require confirmation.
+    # liq=None and liq==0.0 (unknown after retries) are NEVER write-off
+    # triggers. Only confirmed low (0 < liq < $1000) twice, or rugcheck-dead,
+    # may book UNSELLABLE.
+    mint_for_liq = p.get("mint")
+    resolved_liq, low_reads = _resolve_exit_liq(mint_for_liq, liq, p)
+    confirmed_low = resolved_liq is not None and 0 < resolved_liq < MIN_EXIT_LIQ_USD
+    if resolved_liq is None or resolved_liq >= MIN_EXIT_LIQ_USD:
+        p["_low_liq_streak"] = 0
         proceeds = delta * mult * (1 - fee_pct / 100)
         pnl = proceeds - delta
         illiq = False
+    else:
+        streak = int(p.get("_low_liq_streak") or 0) + (1 if confirmed_low else 0)
+        p["_low_liq_streak"] = streak
+        rug_dead = _rugcheck_confirms_dead(mint_for_liq) if (confirmed_low or resolved_liq <= 0) else False
+        if rug_dead or (confirmed_low and streak >= LIQ_CONFIRM_MIN):
+            proceeds = 0.0
+            pnl = -delta
+            reason = reason + "+UNSELLABLE"
+            illiq = True
+            p["_low_liq_streak"] = 0
+        else:
+            # First confirmed-low read or unknown(0): hold, never write off.
+            save_book(book)
+            return None
     b = book
     b["cash"] = round(b.get("cash", 0) + proceeds, 2)
     b["realized"] = round(b.get("realized", 0) + pnl, 2)
@@ -173,16 +279,30 @@ def execute_fraction(book, sym, frac, mult, reason="", how="frac", liq=None, fee
     # Doc2-7: skip dust partials unless this sale closes the position
     if delta < min_tranche and current - delta >= 0.01:
         return None
-    unsellable = (liq is not None and liq < MIN_EXIT_LIQ_USD)
-    if unsellable:
-        proceeds = 0.0
-        pnl = -delta
-        reason = reason + "+UNSELLABLE"
-        illiq = True
-    else:
+    # Oct 19 phantom-loss fix (same as execute_stage): resolve liq w/ retries.
+    # liq=None / unknown(0.0) never writes off; only confirmed low twice
+    # (or rugcheck-dead) books UNSELLABLE.
+    mint_for_liq = p.get("mint")
+    resolved_liq, low_reads = _resolve_exit_liq(mint_for_liq, liq, p)
+    confirmed_low = resolved_liq is not None and 0 < resolved_liq < MIN_EXIT_LIQ_USD
+    if resolved_liq is None or resolved_liq >= MIN_EXIT_LIQ_USD:
+        p["_low_liq_streak"] = 0
         proceeds = delta * mult * (1 - fee_pct / 100)
         pnl = proceeds - delta
         illiq = False
+    else:
+        streak = int(p.get("_low_liq_streak") or 0) + (1 if confirmed_low else 0)
+        p["_low_liq_streak"] = streak
+        rug_dead = _rugcheck_confirms_dead(mint_for_liq) if (confirmed_low or resolved_liq <= 0) else False
+        if rug_dead or (confirmed_low and streak >= LIQ_CONFIRM_MIN):
+            proceeds = 0.0
+            pnl = -delta
+            reason = reason + "+UNSELLABLE"
+            illiq = True
+            p["_low_liq_streak"] = 0
+        else:
+            save_book(book)
+            return None
     b = book
     b["cash"] = round(b.get("cash", 0) + proceeds, 2)
     b["realized"] = round(b.get("realized", 0) + pnl, 2)

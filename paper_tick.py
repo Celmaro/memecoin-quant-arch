@@ -73,7 +73,20 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
     if not reserve(b, key, want, intent_key=f"{key}:{how}{stage}"):
         out.append(f"GATE {sym}: reservation failed (in-flight)")
         return False
-    res = execute_stage(b, key, stage, mult, reason=reason, how=how, liq=liq)
+    # Fix 4 (Oct 19): for emergency exits, never book a deeper dump than the
+    # tape confirms. Cap mult at the on-chain multiple when evidence says the
+    # coin didn't crash as hard as the paper's stale quote claims.
+    mult_used = mult
+    if "EMERGENCY" in reason.upper() or "DEAD" in reason.upper() or "HARD_STOP" in reason.upper():
+        try:
+            from bot.position_manager.scaleout import _onchain_mult
+            capped, src = _onchain_mult(mint, float(mult), float(p.get("entry_px") or 0))
+            if capped is not None:
+                mult_used = capped
+                out.append(f"TAPE-CHECK {sym}: capped mult {mult:.2f}x -> {capped:.2f}x ({src})")
+        except Exception:
+            pass
+    res = execute_stage(b, key, stage, mult_used, reason=reason, how=how, liq=liq)
     if not res:
         release(b, key, want)
         out.append(f"GATE {sym}: stage engine no-op")
@@ -238,7 +251,7 @@ def auto_buy():
                                      "msg_id": d.get("msg_id"), "ts": time.time()}) + "\n")
         except Exception:
             pass
-        bought.append(f"BUY ${sym} @ ${px} (${size:.0f}, call {age:.0f}m old, {conf}ch{' ⚡confluence' if conf >= 2 else ''}) {mint[:10]}")
+        bought.append(f"BUY ${sym} @ ${px} (${size:.0f}, call {age/60:.0f}m old, {conf}ch{' ⚡confluence' if conf >= 2 else ''}) {mint[:10]}")
         import position_monitor as _pm
         pos = _pm.load_positions()
         # audit P1.1 (Oct 18): copy entry baselines into the monitor ledger so the monitor
@@ -270,6 +283,15 @@ def entry_call(d, b=None):
         return None, "no_mint"
     if d.get("retracted"):
         return None, "retracted"
+    # FRESHNESS GATE (audit Oct 19 — the killer): entry_call (instant_trigger path)
+    # had NO age check while auto_buy did (line 162). Stale calls (observed 125-241m
+    # old) were being bought hours after the channel posted — after the pump died,
+    # straight into UNSELLABLE full losses. Only calls <5 min old may enter.
+    ts = d.get("ts")
+    if isinstance(ts, (int, float)) and ts > 1000000000:
+        age = time.time() - ts
+        if age > 300:
+            return None, f"stale_call_{age/60:.0f}m"
     # dedupe: open positions + consumed ledger
     if any(p.get("mint") == mint for p in b["positions"].values()) or mint in _consumed_mints():
         return None, "already_held_or_consumed"
@@ -347,16 +369,24 @@ def entry_call(d, b=None):
 
 
 def main():
+    # F4 (Oct 19): global tick budget. Each provider call can burn 20s x 3 retries;
+    # under position load the old code blew the supervisor's 120s subprocess timeout
+    # and exits never executed. Now: hard deadline for the whole tick — positions past
+    # the budget are deferred (they run next tick) instead of blocking the book.
+    TICK_DEADLINE = time.time() + 100   # < supervisor timeout (120s) — keeps the subprocess alive
     for line in auto_buy():
         print(line)
     b = load_book()
     pos = pm.load_positions()  # SINGLE authoritative monitor snapshot (audit P1 Oct 18)
     out = []
     for mint, p in list(b["positions"].items()):
+        if time.time() > TICK_DEADLINE:
+            out.append(f"⏱ tick budget hit — deferring {len(b['positions']) - list(b['positions']).index(mint)} position(s) to next tick")
+            break
         sym = p.get("symbol") or mint[:8]  # display symbol (book key is MINT — P0.1)
         mkt_ts = time.time()               # audit P1.2 (Oct 18): market observation ts — captured
                                             # the moment the snapshot is fetched, not at decision end
-        mkt = dex_pair(mint) or {}
+        mkt = dex_pair(mint, allow_fallback=False, timeout=10, retries=1) or {}
         px = mkt.get("priceUsd")
         if not px:
             out.append(f"? {sym}: no market"); continue
@@ -503,7 +533,7 @@ def main():
     # FIX #6: recompute equity from book (staged executor already updated cash/realized)
     openval = 0.0
     for sym, p in b["positions"].items():
-        mkt = dex_pair(p["mint"]) or {}
+        mkt = dex_pair(p["mint"], allow_fallback=False, timeout=10, retries=1) or {}
         px = mkt.get("priceUsd")
         if px: openval += p["size_usd"] * float(px) / p["entry_px"]
     cash = b.get("cash", 0.0)
@@ -524,16 +554,19 @@ def main():
     held_note = f" Held: {', '.join(held)}." if held else ""
     out.append(f"💼 Paper account: ${eq:.2f} (started ${b['start']:.0f}, {'+' if gain>=0 else ''}{gpct:.0f}% — {mood}). Waiting cash: ${cash:.2f}. Coins held: {len(b['positions'])}.{held_note} Still need ${need:.2f} to reach the $500 goal.")
     blob = "\n".join(out)
-    # 10-min heartbeat: DM the book summary even with no action (user-approved Oct 19)
+    # 3-min heartbeat: DM the book summary even with no action (user-approved Oct 19;
+    # user requested 1m → 3m cadence). Action lines (BUY/EXIT/skip) still send immediately.
     HB = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tick_heartbeat")
     now = time.time()
     due = True
     try:
-        due = (now - float(open(HB).read().strip() or 0)) >= 600
+        due = (now - float(open(HB).read().strip() or 0)) >= 180
     except Exception:
         due = True
-    acted = any(("BOUGHT" in l or "SOLD" in l or "EXIT" in l or "skipped" in l or "HOLD" in l or "clip" in l.lower()) for l in out)
-    if due or acted or len(b["positions"]) > 0:
+    acted = any(("BOUGHT" in l or "BUY" in l or "SOLD" in l or "EXIT" in l or "skipped" in l or "HOLD" in l or "clip" in l.lower()) for l in out)
+    # 3-min heartbeat only — open positions alone must NOT force a per-tick DM
+    # (that flooded the chat every 60s; action lines still send instantly via acted).
+    if due or acted:
         if due:
             open(HB, "w").write(str(now))
         try:
