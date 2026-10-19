@@ -22,8 +22,13 @@ import aegis
 
 DESK_DIR = os.path.expanduser("~/memecoin-quant")
 POS_FILE = os.path.join(DESK_DIR, "positions.json")
-FEE_BPS = 3.0  # Oct 20 audit: was 1.7 (Jupiter display fee) — actual booked fee is
-# PAPER_FEE_PCT 3.0 in scaleout.py. Monitor's displayed pnl was optimistic by 1.3 pts.
+# Oct 20 audit (P4): ONE book fee constant. The desk books 3.0%/side
+# (scaleout.PAPER_FEE_PCT); the monitor's DISPLAY must use the same number.
+try:
+    from bot.position_manager.scaleout import PAPER_FEE_PCT as _PAPER_FEE
+    FEE_BPS = _PAPER_FEE
+except Exception:
+    FEE_BPS = 3.0
 
 # MC-adaptive exit plan: (mc_floor, clip1_mult, clip2_mult, stop_loss%)
 EXIT_TIERS = [

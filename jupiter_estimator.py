@@ -9,7 +9,10 @@ import sys, urllib.request, urllib.parse, json, re
 from desk_common import SOL_MINT, dex_pair, load_config, http_json
 
 QUOTE = "https://api.jup.ag/swap/v1/quote"
-FEE_BPS = 1.7  # desk estimate: terminal ~0.9% + pool ~0.3% + priority ~0.5%
+FEE_BPS = 1.7  # P4 (Oct 20): REAL-QUOTE estimate only (terminal ~0.9% + pool ~0.3%
+# + priority ~0.5% per Jupiter v1/v2 quote). The PAPER book books 3.0%/side
+# (scaleout.PAPER_FEE_PCT) — this estimator documents the real-money drag; it is
+# NOT the paper fee and must never be used for book PnL.
 
 
 def sol_price():

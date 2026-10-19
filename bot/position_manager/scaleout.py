@@ -184,7 +184,20 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage", liq=None, fee_
         return None
     done = set(p.get("stages_done") or [])
     if stage in done:
-        return None
+        # P2 (Oct 20): a "done" stage must still re-enter when there is sellable
+        # basis — either unreserved overshoot (cur−resv−tgt > 0) OR this intent's
+        # own reserved-but-unsold inventory (a stage-3 full exit sold only its
+        # $80 of $100 while another intent held the residual). The old hard
+        # `return None` stranded the residual forever.
+        cur = float(p.get("entry_usd") or 0)
+        resv = float(p.get("reserved_exit_usd") or 0)
+        tgt = target_remaining(book, sym, stage) or 0
+        intent_key = f"{sym}:{how}{stage}"
+        mine = [r for r in (p.get("reservations") or []) if r.get("key") == intent_key]
+        if (cur - resv - tgt <= 0.01) and not mine:
+            return None
+        # else fall through: sell_delta below recomputes the real delta
+        # (matching reservation consumed via the delta<=0 branch)
     delta = sell_delta(book, sym, stage)
     if delta <= 0 and float(p.get("reserved_exit_usd") or 0) > 0:
         # audit P1 (Oct 18): only consume THIS intent's reservation, never the
@@ -197,8 +210,14 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage", liq=None, fee_
         else:
             delta = 0.0
     if delta <= 0:
-        p.setdefault("stages_done", []).append(stage)
-        save_book(book)
+        # P2 (Oct 20): only mark the stage done when there is NOTHING to sell even
+        # ignoring reservations. A different intent's in-flight reservation makes
+        # sell_delta negative (current - reserved - target) — marking done here
+        # strands the residual (stage permanently done, $20 never closes).
+        unreserved = float(p.get("entry_usd") or p.get("size_usd") or 0) - target_remaining(book, sym, stage)
+        if unreserved <= 0.01:
+            p.setdefault("stages_done", []).append(stage)
+            save_book(book)
         return None
     fee_pct = fee_pct if fee_pct is not None else PAPER_FEE_PCT
     min_tranche = min_tranche if min_tranche is not None else MIN_TRANCHE_USD
@@ -220,15 +239,49 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage", liq=None, fee_
         pnl = proceeds - delta
         illiq = False
     else:
-        streak = int(p.get("_low_liq_streak") or 0) + (1 if confirmed_low else 0)
+        # P3 (Oct 20): streak must count INDEPENDENT reads. Two executor calls in
+        # one tick (decision then tier fallback) share the SAME snapshot — bumping
+        # on both books UNSELLABLE from a single observation. Gate the bump: only
+        # a read >=60s after the last counted read increments the streak.
+        _now = time.time()
+        last_bump = float(p.get("_low_liq_bump_ts") or 0)
+        independent = (_now - last_bump) >= 60
+        streak = int(p.get("_low_liq_streak") or 0)
+        if confirmed_low and independent:
+            streak += 1
+            p["_low_liq_bump_ts"] = _now
         p["_low_liq_streak"] = streak
         rug_dead = _rugcheck_confirms_dead(mint_for_liq) if (confirmed_low or resolved_liq <= 0) else False
         if rug_dead or (confirmed_low and streak >= LIQ_CONFIRM_MIN):
-            proceeds = 0.0
-            pnl = -delta
-            reason = reason + "+UNSELLABLE"
-            illiq = True
-            p["_low_liq_streak"] = 0
+            # Fix 2 (Oct 19, user-approved): LIVE reclassification — never book a
+            # total loss against a positive tape. If the on-chain price is >= 1.0x
+            # entry (coin UP), the low-liq read is stale/broken (wrong pool pair /
+            # provider snapshot), so fill at the real mult instead of zero. This
+            # replaces the manual reclassify_unsellable.py one-off.
+            reclass_mult = None
+            try:
+                from desk_common import dex_pair as _dex_pair
+                _m = _dex_pair(mint_for_liq, allow_fallback=True, timeout=8, retries=1) or {}
+                _px = _m.get("priceUsd")
+                _ep = float(p.get("entry_px") or 0)
+                if _px and _ep > 0 and float(_px) > 0:
+                    lm = float(_px) / _ep
+                    if lm >= 1.0:
+                        reclass_mult = lm
+            except Exception:
+                pass
+            if reclass_mult is not None:
+                proceeds = delta * reclass_mult * (1 - fee_pct / 100)
+                pnl = proceeds - delta
+                reason = reason + "+RECLASSIFIED_UP"
+                illiq = False
+                p["_low_liq_streak"] = 0
+            else:
+                proceeds = 0.0
+                pnl = -delta
+                reason = reason + "+UNSELLABLE"
+                illiq = True
+                p["_low_liq_streak"] = 0
         else:
             # First confirmed-low read or unknown(0): hold, never write off.
             save_book(book)
@@ -238,7 +291,13 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage", liq=None, fee_
     b["realized"] = round(b.get("realized", 0) + pnl, 2)
     p["entry_usd"] = round(current - delta, 4)
     p["size_usd"] = p["entry_usd"]
-    p["reserved_exit_usd"] = 0.0
+    # P2 (Oct 20): reconcile ONLY this intent's reservation(s) — zeroing the whole
+    # reserved_exit_usd pool let a different intent's locked inventory vanish
+    # without selling (stranded basis, stage marked done, residual can't close).
+    intent_key = f"{sym}:{how}{stage}"
+    kept = [r for r in (p.get("reservations") or []) if r.get("key") != intent_key]
+    p["reservations"] = kept
+    p["reserved_exit_usd"] = round(sum(float(r.get("usd") or 0) for r in kept), 4)
     p.setdefault("stages_done", []).append(stage)
     # audit P0-2 (Oct 18): after stage-1 partial, the book position MUST become
     # "half" so the `state == "half"` bracket branch (TP2/exit) can ever run.
@@ -291,15 +350,49 @@ def execute_fraction(book, sym, frac, mult, reason="", how="frac", liq=None, fee
         pnl = proceeds - delta
         illiq = False
     else:
-        streak = int(p.get("_low_liq_streak") or 0) + (1 if confirmed_low else 0)
+        # P3 (Oct 20): streak must count INDEPENDENT reads. Two executor calls in
+        # one tick (decision then tier fallback) share the SAME snapshot — bumping
+        # on both books UNSELLABLE from a single observation. Gate the bump: only
+        # a read >=60s after the last counted read increments the streak.
+        _now = time.time()
+        last_bump = float(p.get("_low_liq_bump_ts") or 0)
+        independent = (_now - last_bump) >= 60
+        streak = int(p.get("_low_liq_streak") or 0)
+        if confirmed_low and independent:
+            streak += 1
+            p["_low_liq_bump_ts"] = _now
         p["_low_liq_streak"] = streak
         rug_dead = _rugcheck_confirms_dead(mint_for_liq) if (confirmed_low or resolved_liq <= 0) else False
         if rug_dead or (confirmed_low and streak >= LIQ_CONFIRM_MIN):
-            proceeds = 0.0
-            pnl = -delta
-            reason = reason + "+UNSELLABLE"
-            illiq = True
-            p["_low_liq_streak"] = 0
+            # Fix 2 (Oct 19, user-approved): LIVE reclassification — never book a
+            # total loss against a positive tape. If the on-chain price is >= 1.0x
+            # entry (coin UP), the low-liq read is stale/broken (wrong pool pair /
+            # provider snapshot), so fill at the real mult instead of zero. This
+            # replaces the manual reclassify_unsellable.py one-off.
+            reclass_mult = None
+            try:
+                from desk_common import dex_pair as _dex_pair
+                _m = _dex_pair(mint_for_liq, allow_fallback=True, timeout=8, retries=1) or {}
+                _px = _m.get("priceUsd")
+                _ep = float(p.get("entry_px") or 0)
+                if _px and _ep > 0 and float(_px) > 0:
+                    lm = float(_px) / _ep
+                    if lm >= 1.0:
+                        reclass_mult = lm
+            except Exception:
+                pass
+            if reclass_mult is not None:
+                proceeds = delta * reclass_mult * (1 - fee_pct / 100)
+                pnl = proceeds - delta
+                reason = reason + "+RECLASSIFIED_UP"
+                illiq = False
+                p["_low_liq_streak"] = 0
+            else:
+                proceeds = 0.0
+                pnl = -delta
+                reason = reason + "+UNSELLABLE"
+                illiq = True
+                p["_low_liq_streak"] = 0
         else:
             save_book(book)
             return None
@@ -308,7 +401,12 @@ def execute_fraction(book, sym, frac, mult, reason="", how="frac", liq=None, fee
     b["realized"] = round(b.get("realized", 0) + pnl, 2)
     p["entry_usd"] = round(current - delta, 4)
     p["size_usd"] = p["entry_usd"]
-    p["reserved_exit_usd"] = 0.0
+    # P2 (Oct 20): same per-intent reconciliation as execute_stage — never zero the
+    # whole reserved pool (other intents' locked inventory would vanish unsold).
+    fkey = f"{sym}:{how}"
+    kept = [r for r in (p.get("reservations") or []) if r.get("key") != fkey]
+    p["reservations"] = kept
+    p["reserved_exit_usd"] = round(sum(float(r.get("usd") or 0) for r in kept), 4)
     p.setdefault("stages_done", []).append(3 if p["entry_usd"] < 0.01 else 1)
     if p["entry_usd"] >= 0.01:
         p["state"] = "half"

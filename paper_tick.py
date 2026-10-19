@@ -199,6 +199,18 @@ def auto_buy():
     # FIX #7: calls.jsonl is NOT chronological (54 order violations in last 100).
     # Sort ALL candidate lines by post time descending, then walk newest-first with a
     # proper age cutoff — never `break` on a stray old line in the middle.
+    # P8 (Oct 20): retraction markers carry ts but NO dt — the old `if d.get("dt")`
+    # filter silently dropped the marker and kept the ORIGINAL row buyable in the
+    # cron path. Pre-scan ALL lines for retraction markers FIRST and build a
+    # retracted-mint set; any call for those mints is skipped regardless of row.
+    retracted_mints = set()
+    for line in lines:
+        try:
+            _r = _j.loads(line)
+        except Exception:
+            continue
+        if (_r.get("retracted") or _r.get("dead")) and _r.get("mint"):
+            retracted_mints.add(_r["mint"])
     def _ts(d):
         # Prefer the epoch `ts` field (telethon writes msg.date.timestamp() — unambiguous).
         # Fall back to parsing `dt` (crawler records may only have dt).
@@ -213,7 +225,10 @@ def auto_buy():
     for line in lines:
         try:
             d = _j.loads(line)
-            if d.get("dt"):
+            # P8: accept rows by ts OR dt; strip retracted/dead rows out entirely
+            if d.get("retracted") or d.get("dead"):
+                continue
+            if d.get("dt") or d.get("ts"):
                 parsed.append((_ts(d), d))
         except Exception:
             continue
@@ -226,7 +241,7 @@ def auto_buy():
             continue
         sym = d.get("symbol") or "?"
         mint = d["mint"]
-        if d.get("retracted"):
+        if d.get("retracted") or mint in retracted_mints:  # P8: deferred retraction kills the call
             continue
         if any(p["mint"] == mint for p in b["positions"].values()) or mint in seen_mints or mint in consumed:
             continue
@@ -234,6 +249,19 @@ def auto_buy():
         from desk_common import dex_pair
         mkt = dex_pair(mint) or {}
         liq = ((mkt.get("liquidity") or {}).get("usd")) or 0
+        # P12 (Oct 20): first-seen MC extension gate (mirror entry_call) — never
+        # enter a coin already pumped >=1.8x past its call-time MC.
+        try:
+            mc_now = float((mkt.get("marketCap") or 0) or 0)
+            mc_call = float((d.get("mc") or 0) or 0)
+            if mc_now > 0 and mc_call > 0:
+                ratio = mc_now / mc_call
+                if ratio >= 1.8:
+                    b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                        "why": f"mc_extended_{ratio:.1f}x"})
+                    continue
+        except Exception:
+            pass
         # FIX 3a (Oct 20): pre-graduation curve coins report liq=0 by design
         # (bonding curve has no pool until $69K fill) — the $10K gate rejected
         # 22/33 of the best GRAD-DURING cohort. Only enforce the gate for coins
@@ -368,6 +396,21 @@ def entry_call(d, b=None, aegis_score=None):
         aegis_boost = 1.25  # mild position-size boost on strong contract/live signals
     mkt = dex_pair(mint) or {}
     liq = ((mkt.get("liquidity") or {}).get("usd")) or 0
+    # P12 (Oct 20): first-seen MC extension gate — never chase a coin that has
+    # already pumped >=1.8x past the MC printed at the channel call (M_now/M_0).
+    # The tape says these are exhausted entries (the pump already happened).
+    try:
+        mc_now = float((mkt.get("marketCap") or 0) or 0)
+        mc_call = float((d.get("mc") or 0) or 0)
+        if mc_now > 0 and mc_call > 0:
+            ratio = mc_now / mc_call
+            if ratio >= 1.8:
+                b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                    "why": f"mc_extended_{ratio:.1f}x"})
+                save_book(b)
+                return None, f"mc_extended_{ratio:.1f}x"
+    except Exception:
+        pass
     # FIX 3a (Oct 20): same pre-graduation exemption as auto_buy — sub-$69K curve
     # coins legitimately report liq=0; the gate must not kill the best cohort.
     if liq < 10000 and not _is_curve_pre_grad(mkt):
@@ -415,6 +458,20 @@ def entry_call(d, b=None, aegis_score=None):
                                             "why": f"insufficient_cash_${b['cash']:.2f}"})
         save_book(b)
         return None, f"insufficient_cash_${b['cash']:.2f}"
+    # P11 (Oct 20): close the risk-gate bypass — the instant_trigger path called
+    # entry_call directly and never consulted the exposure cap that risk_gate
+    # enforces on the cron path. Same $200 face exposure limit here.
+    try:
+        from bot.decision_engine.risk_gate import MAX_OPEN_EXPOSURE_USD
+        open_exposure = sum(float(p.get("entry_usd") or p.get("size_usd") or 0)
+                            for p in b["positions"].values())
+        if open_exposure + size > MAX_OPEN_EXPOSURE_USD:
+            b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                "why": f"exposure_cap_${open_exposure + size:.0f}"})
+            save_book(b)
+            return None, f"exposure_cap_${open_exposure + size:.0f}"
+    except Exception:
+        pass
     age = (time.time() - float(d.get("ts") or time.time())) / 60
     b["positions"][mint] = {"mint": mint, "symbol": sym, "entry_px": float(px), "size_usd": size,
                            "entry_usd": size, "initial_usd": size, "opened": time.time(),
@@ -558,19 +615,28 @@ def main():
                 stage, frac = None, 0.0
             if stage == "frac":
                 # exact-fraction sale (P0.3): sells cfrac of remaining basis
+                frac_failed = False
                 try:
                     from bot.position_manager.scaleout import execute_fraction
                     res = execute_fraction(b, mint, frac, mult, reason=decision_action,
                                            how="decision_frac", liq=((mkt.get("liquidity") or {}).get("usd") or 0))
                 except Exception:
                     res = None
+                    frac_failed = True
                 if res:
                     # P1.1: sync remaining size into the monitor ledger
                     if not res.get("closed"):
                         pos[mint]["size"] = res.get("remaining", 0.0)
                     save_book(b); pm.save_positions(pos)
                     continue
-                stage = None  # fall through to tier engine if fraction path failed
+                # P0 (Oct 20): a None from execute_fraction is a legit no-op (dust
+                # tranche / gate hold / reservation in-flight) — NEVER fall through to
+                # the legacy inline branch which BOOKS the sale as if it succeeded.
+                if not frac_failed:
+                    save_book(b); pm.save_positions(pos)
+                    out.append(f"GATE {sym}: fraction sell no-op (dust/hold/in-flight) — nothing booked")
+                    continue
+                stage = None  # only engine-unavailable reaches the legacy fallback
             if stage:
                 res = sell_via_stage(b, pos, sym, mint, stage, mult, px,
                                      reason=decision_action, how="decision", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0))
@@ -578,8 +644,15 @@ def main():
                     # P1.1: sync remaining size into the monitor ledger after any partial/full
                     save_book(b); pm.save_positions(pos)
                     continue
-            # fallback to legacy inline path if stage engine unavailable
-            if stage is None or "unavailable" in (out[-1] if out else ""):
+                # P0 (Oct 20): sell_via_stage returning False is a GATE HOLD / no-op
+                # (reservation failed, nothing to sell, engine verdict) — the legacy
+                # inline branch below must run ONLY when the stage engine is genuinely
+                # unavailable (import error), never to force a booked sale.
+                out.append(f"GATE {sym}: stage engine no-op — nothing booked")
+                save_book(b); pm.save_positions(pos)
+                continue
+            # fallback to legacy inline path ONLY if the stage engine is unavailable
+            if stage is None and "unavailable" in (out[-1] if out else ""):
                 frac = frac or (0.5 if decision_action == "CLIP_50" else 1.0)
                 sold = entry_usd * frac * mult
                 pnl = sold - entry_usd * frac
@@ -590,6 +663,8 @@ def main():
                     "pnl": round(pnl, 2), "how": f"decision_{decision_action.lower()}",
                     "closed": frac >= 0.99})
                 if frac >= 1.0:
+                    # P0 (Oct 20): book is MINT-keyed — pop(sym) never removed it.
+                    b["positions"].pop(mint, None)
                     b["positions"].pop(sym, None)
                     pos.pop(mint, None)
                 else:
