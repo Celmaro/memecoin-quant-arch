@@ -57,6 +57,19 @@ def build_forensics_card(mint, call=None):
     L.append(f"Forensics on {sym_ca} — mixed card")
     L.append("")
     L.append(f"🛡 AEGIS score: {score}/100 — {verdict} (deep scan). Read the flags before acting:")
+    # Oct 19: REAL cross-channel confluence (ledger-based) — the old card never
+    # showed it because calls.jsonl dedupes by mint (2nd+ channel invisible).
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
+        from confluence import confluence
+        chans, span, _, _ = confluence(mint, window_s=1800)
+        if chans and len(chans) >= 2:
+            L.append("")
+            L.append(f"🔀 CONFLUENCE: {len(chans)} channels signaled this CA in the last 30m "
+                     f"({', '.join(chans)} — span {span/60:.0f}m) — ⬆ confidence, boost sizing")
+    except Exception:
+        pass
     L.append("")
     # flag explanations (curated map; fallback = plain flag)
     FLAG_EXPLAIN = {

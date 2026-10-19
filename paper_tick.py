@@ -200,7 +200,14 @@ def auto_buy():
         if sym == "?" or sym == "None":
             sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
         # FIX 2: confluence size booster — 2+ channels => max size regardless of channel
-        conf = d.get("confluence") or len(d.get("channels") or [1])
+        # Oct 19: real confluence from ledger (see entry_call for rationale)
+        conf = 1
+        try:
+            sys.path.insert(0, DESK)
+            from confluence import confluence_count
+            conf = max(1, confluence_count(mint, window_s=1800))
+        except Exception:
+            conf = 1
         if conf >= 2:
             size = 25.0
         else:
@@ -231,7 +238,7 @@ def auto_buy():
                                      "msg_id": d.get("msg_id"), "ts": time.time()}) + "\n")
         except Exception:
             pass
-        bought.append(f"BUY ${sym} @ ${px} (${size:.0f}, call {age:.0f}m old) {mint[:10]}")
+        bought.append(f"BUY ${sym} @ ${px} (${size:.0f}, call {age:.0f}m old, {conf}ch{' ⚡confluence' if conf >= 2 else ''}) {mint[:10]}")
         import position_monitor as _pm
         pos = _pm.load_positions()
         # audit P1.1 (Oct 18): copy entry baselines into the monitor ledger so the monitor
@@ -294,7 +301,17 @@ def entry_call(d, b=None):
     px = float(px) * (1 + FILL_LATENCY_SLIP_PCT / 100)
     if sym == "?" or sym == "None":
         sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
-    conf = d.get("confluence") or len(d.get("channels") or [1])
+    # Oct 19 fix: REAL cross-channel confluence (ledger-based). The listener
+    # dedupes calls.jsonl by mint, so `d["channels"]`/`d["confluence"]` were
+    # always empty/1 — the 2nd channel posting the same mint was invisible.
+    # confluence.confluence_count() reads the full ledger: N channels in 30m.
+    conf = 1
+    try:
+        sys.path.insert(0, DESK)
+        from confluence import confluence_count
+        conf = max(1, confluence_count(mint, window_s=1800))
+    except Exception:
+        conf = 1
     size = 25.0 if conf >= 2 else 20.0
     size = min(size, b["cash"])
     if size < 10:
@@ -325,7 +342,7 @@ def entry_call(d, b=None):
                  "entry_mc": float(mkt.get("marketCap") or 0)}
     _pm.save_positions(pos)
     save_book(b)
-    line = f"🛒 PAPER BUY ${sym} @ ${px} (${size:.0f}, call {max(0,age):.0f}m old) {mint[:10]}"
+    line = f"🛒 PAPER BUY ${sym} @ ${px} (${size:.0f}, call {max(0,age):.0f}m old, {conf}ch{' ⚡confluence' if conf >= 2 else ''}) {mint[:10]}"
     return line, None
 
 
@@ -499,7 +516,13 @@ def main():
     gpct = gain / b["start"] * 100
     need = 500 - eq
     mood = "🎯 ahead!" if gain > 0 else ("⚠️ behind" if gain > -15 else "🚨 deep red")
-    out.append(f"💼 Paper account: ${eq:.2f} (started ${b['start']:.0f}, {'+' if gain>=0 else ''}{gpct:.0f}% — {mood}). Waiting cash: ${cash:.2f}. Coins held: {len(b['positions'])}. Still need ${need:.2f} to reach the $500 goal.")
+    held = []
+    for mint, p in b.get("positions", {}).items():
+        psym = p.get("symbol") or mint[:8]
+        psize = float(p.get("size_usd") or 0)
+        held.append(f"${psym} (${psize:.2f})")
+    held_note = f" Held: {', '.join(held)}." if held else ""
+    out.append(f"💼 Paper account: ${eq:.2f} (started ${b['start']:.0f}, {'+' if gain>=0 else ''}{gpct:.0f}% — {mood}). Waiting cash: ${cash:.2f}. Coins held: {len(b['positions'])}.{held_note} Still need ${need:.2f} to reach the $500 goal.")
     blob = "\n".join(out)
     # 10-min heartbeat: DM the book summary even with no action (user-approved Oct 19)
     HB = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tick_heartbeat")
