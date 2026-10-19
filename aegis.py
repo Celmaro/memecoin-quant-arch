@@ -137,23 +137,26 @@ def record_first_buyers(mint, deployer, n=5):
 
     getSignaturesForAddress returns NEWEST first; walk to the oldest page to
     avoid labeling recent traders as early buyers (audit F: chronological order).
+    Speed (Oct 19): page limit 100 -> 1000 (RPC max) so a 40-page walk becomes
+    ~4 calls; only a few mints exceed 4k sigs in the first minutes anyway.
     """
     try:
         sigs = []
         before = None
-        for _ in range(40):  # max 40 pages back
-            params = [mint, {"limit": 100}]
+        for _ in range(10):  # max 10 pages back (1000/page = 10k sigs)
+            params = [mint, {"limit": 1000}]
             if before:
                 params[1]["before"] = before
             page = rpc("getSignaturesForAddress", params) or []
             if not page:
                 break
             sigs.extend(page)
-            if len(page) < 100:
+            if len(page) < 1000:
                 break
             before = page[-1]["signature"]
-        # oldest first: we walked newest->oldest, so reverse, take first n
+        # earliest signatures only (we walked newest->oldest; want oldest n)
         sigs.sort(key=lambda s: s.get("blockTime") or 0)
+        sigs = sigs[:max(3, n * 4)]
         for i, s in enumerate(sigs[:n]):
             tx = rpc("getTransaction", [s["signature"], {"encoding": "json", "maxSupportedTransactionVersion": 0}])
             if not tx: continue
@@ -690,9 +693,18 @@ def score_coin(mint, deep=False):
             # Historical win-rate / strategy / score of the deployer wallet → feeds deployer
             # memory (a "serial pumpfun flipper" deployer is a different risk than a "diamond
             # hands" veteran). Budgeted via credit_budget (walletintel 10/day).
+            # Oct 19 audit: budget gate was COMMENTED but never called — every deep scan
+            # burned one of the 10 daily requests AND ~14s (endpoint does heavy compute).
+            # Now: budget() gate + 24h per-deployer cache so repeated scans are free.
             try:
-                from desk_common import walletintel_summary
-                wi = walletintel_summary(deployer)
+                from desk_common import budget, walletintel_summary, ttl_cache_get, ttl_cache_put
+                if budget("walletintel"):
+                    wi_key = f"wi_dep_{deployer}"
+                    wi = ttl_cache_get(wi_key, 86400)
+                    if wi is None:
+                        wi = walletintel_summary(deployer)
+                        if wi:
+                            ttl_cache_put(wi_key, wi)
                 if wi and isinstance(wi, dict) and wi.get("score") is not None:
                     wi_score = float(wi.get("score") or 0)
                     wi_strategy = (wi.get("strategy") or "").lower()

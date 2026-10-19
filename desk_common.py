@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Memecoin Quant Desk — shared utilities & config (stdlib only)."""
-import json, os, re, time, sqlite3, urllib.request, urllib.error
+import json, os, re, time, sqlite3, socket, urllib.request, urllib.error
 
 DESK = os.path.expanduser("~/memecoin-quant")
 AEGIS_DB = os.path.join(DESK, "aegis.db")
@@ -515,6 +515,12 @@ def dex_pair(mint, allow_fallback=True):
 def rugcheck(mint, full=False):
     cfg = load_config()
     url = RUGCHECK.format(mint, "/report" if full else "/report/summary") + f"?api_key={cfg['FLUX_KEY']}"
+    # DNS circuit breaker (Oct 19 live): api.rugcheck.xyz stopped resolving —
+    # without this every call burns 12s in retries for a guaranteed None.
+    try:
+        socket.gethostbyname("api.rugcheck.xyz")
+    except Exception:
+        return None
     try:
         return http_json(url)[1]
     except Exception:
@@ -1046,6 +1052,12 @@ def ave_top100_holders(mint):
 
 # 9. Rugcheck insiders graph + lockers (insiders free w/ flux key; lockers PAID -> graceful)
 def rugcheck_insiders(mint):
+    # Same DNS circuit breaker as rugcheck(): api.rugcheck.xyz currently has no
+    # DNS record from this environment; avoid a 12s retry storm per scan.
+    try:
+        socket.gethostbyname("api.rugcheck.xyz")
+    except Exception:
+        return None
     try:
         st, d = http_json(f"https://api.rugcheck.xyz/v1/tokens/{mint}/insiders/graph?api_key={load_config().get('FLUX_KEY')}", timeout=20)
         return d or None   # returns a LIST of {net_id, network_type, nodes[], links[]}

@@ -163,6 +163,8 @@ def auto_buy():
             continue
         sym = d.get("symbol") or "?"
         mint = d["mint"]
+        if d.get("retracted"):
+            continue
         if any(p["mint"] == mint for p in b["positions"].values()) or mint in seen_mints or mint in consumed:
             continue
         # FIX 3: minimum liquidity gate ($10K per user spec Oct 17) — below: skip+log
@@ -259,6 +261,8 @@ def entry_call(d, b=None):
     sym = d.get("symbol") or "?"
     if not mint:
         return None, "no_mint"
+    if d.get("retracted"):
+        return None, "retracted"
     # dedupe: open positions + consumed ledger
     if any(p.get("mint") == mint for p in b["positions"].values()) or mint in _consumed_mints():
         return None, "already_held_or_consumed"

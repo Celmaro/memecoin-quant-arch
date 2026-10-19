@@ -27,6 +27,13 @@ STATE_FILE = os.path.join(DESK, "telethon_state.json")
 MINT_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
+# Oct 19 audit: edit-storm rate limiter (rolling digest cards edited every few
+# minutes -> 1,806 ledger rows from 3 msg_ids). Only non-call edits are throttled.
+_edit_last = {}
+
+# Oct 19 audit: emitted mints keyed by msg_id — lets MessageDeleted retract calls.
+_emitted_by_msgid = {}
+
 def _log_flood(what):
     """Doc2-10: surface a Telegram FloodWaitError (rate-limit) to the desk journal
     instead of silently freezing ingestion. Best-effort, never raises."""
@@ -326,7 +333,9 @@ def process_message(msg, channel):
       - victory laps / rank digests / updates are noise -> skipped
       - FRESHNESS GATE: only calls <5 min old enter calls.jsonl (stale catch-up
         backlog must never reach the pipeline — the 'MC is late'/'old call' bug)
-    Ledger (telegram_messages.jsonl) still records EVERYTHING for forensics."""
+    Ledger (telegram_messages.jsonl) still records EVERYTHING for forensics.
+    Audit Oct 19: capture views/forwards/reactions; rate-limit EDIT STORMS (rolling
+    digest cards get edited every few minutes -> 3 msg_ids produced 1,806 ledger rows)."""
     if msg is None or getattr(msg, "action", None):
         return None
     text = msg.message or ""
@@ -336,9 +345,35 @@ def process_message(msg, channel):
            "dt": msg.date.isoformat() if msg.date else None, "text": text[:2000],
            "mints": None, "dominant_url_mint": None, "kind": kind, "skip": skip or None,
            "edit_ts": msg.edit_date.isoformat() if msg.edit_date else None}
+    # Oct 19: social-heat fields (best effort; public channels expose these)
+    try:
+        rec["views"] = msg.views
+    except Exception:
+        pass
+    try:
+        rec["forwards"] = msg.forwards
+    except Exception:
+        pass
+    try:
+        rec["fwd_from"] = str(getattr(getattr(msg, "fwd_from", None) or {}, "from_id", "")) or None
+    except Exception:
+        pass
+    try:
+        if msg.reactions:
+            rec["reactions"] = [{"e": r.emoticon, "n": r.count} for r in msg.reactions.results]
+    except Exception:
+        pass
     post_ts = msg.date.timestamp() if msg.date else time.time()
     if skip:
         rec["mints"], rec["dominant_url_mint"] = parse_mints(msg)
+        # EDIT-STORM RATE LIMIT (Oct 19): non-call rolling cards (PIRB/Seekr digests)
+        # are edited every few minutes; each edit wrote a ledger row -> 1.8k rows/3 msgs.
+        # Only write non-call edits once per 120s per (channel, msg_id).
+        if msg.edit_date and skip:
+            key = f"{channel}:{msg.id}"
+            if time.time() - _edit_last.get(key, 0) < 120:
+                return None
+            _edit_last[key] = time.time()
         append_jsonl(MSG_LEDGER, rec)
         return None
     # freshness gate: only live calls (<5 min old) become signals
@@ -383,6 +418,13 @@ def process_message(msg, channel):
                 rec2["mc"] = c["mc"]
             append_jsonl(CALLS, rec2)
             lines.append(f"NEW ${c.get('symbol') or c['mint'][:10]} from {channel} ({rec['dt']})")
+            # Oct 19 audit: index emitted mint by msg_id so MessageDeleted can retract
+            try:
+                _emitted_by_msgid.setdefault(str(c["msg_id"]), []).append(c["mint"])
+                if len(_emitted_by_msgid) > 4000:
+                    _emitted_by_msgid.pop(next(iter(_emitted_by_msgid)))
+            except Exception:
+                pass
             # INSTANT-TRIGGER: poke the notifier the moment a call lands (fire-and-forget,
             # non-blocking for the listener loop; file-lock prevents double-runs).
             try:
@@ -430,6 +472,13 @@ async def run():
             ent = await client.get_entity(ch)
             entities[ch] = ent
             print(f"  resolved {ch} -> id {ent.id}", flush=True)
+            # Oct 19 audit: participant counts — channel size/velocity is a signal
+            # edge (public channels expose counts on the entity; private channels n/a).
+            try:
+                n = getattr(ent, "participants_count", None)
+                print(f"    {ch} participants: {n if n is not None else 'n/a'}", flush=True)
+            except Exception:
+                print(f"    {ch} participants: n/a", flush=True)
         except Exception as e:
             print(f"  cannot resolve {ch}: {str(e)[:60]}", flush=True)
     ids_to_name = {e.id: n for n, e in entities.items()}
@@ -484,6 +533,48 @@ async def run():
         line = process_message(ev.message, ch)
         if line:
             print(f"EDIT->{line}", flush=True)
+
+    # Oct 19 audit: MessageDeleted — a channel deleting a call is a RETRACTION
+    # signal (rug pull, CA wrong, or signal retracted). Emitted mints for that
+    # msg_id are marked in calls.jsonl as retracted so the paper desk never buys
+    # a deleted call, and the retraction is logged for forensics.
+    @client.on(events.MessageDeleted(chats=list(ids_to_name.keys())))
+    async def del_handler(ev):
+        for mid in ev.deleted_ids:
+            mints = _emitted_by_msgid.get(str(mid))
+            if not mints:
+                continue
+            ch = chan_name(ev.chat_id)
+            try:
+                with open(os.path.join(DESK, "retractions.jsonl"), "a") as f:
+                    f.write(json.dumps({"ts": time.time(), "channel": ch, "msg_id": mid,
+                                        "mints": mints}) + "\n")
+                # append a retracted marker line so entry_call/auto_buy skip it
+                for mint in mints:
+                    with open(CALLS, "a") as f:
+                        f.write(json.dumps({"mint": mint, "channel": ch, "msg_id": mid,
+                                            "ts": time.time(), "retracted": True,
+                                            "source": "retraction"}) + "\n")
+                print(f"RETRACTED {len(mints)} mint(s) from {ch} msg {mid}", flush=True)
+            except Exception as e:
+                print(f"retract error {mid}: {str(e)[:60]}", flush=True)
+
+    # Oct 19 audit: reconnect catch-up — Telethon's own reconnection misses
+    # updates posted while disconnected; awaiting client.disconnected + catch_up()
+    # backfills the gap so calls posted during a blip are not lost.
+    async def reconnect_watcher():
+        while True:
+            try:
+                await client.disconnected
+                print("disconnected — reconnecting", flush=True)
+                if not client.is_connected():
+                    await client.connect()
+                await client.catch_up()
+                print("reconnected + catch_up done", flush=True)
+            except Exception as e:
+                print(f"reconnect err: {str(e)[:80]}", flush=True)
+            await asyncio.sleep(5)
+    asyncio.ensure_future(reconnect_watcher())
 
     await client.run_until_disconnected()
 
