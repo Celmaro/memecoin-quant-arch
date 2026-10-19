@@ -39,6 +39,20 @@ def fetch_zst(path, mint_set, limit=8_000_000):
         sys.stderr.write("zstandard missing — run with: .venv/bin/python replay_backtest.py ...\n")
         return []
     url = REPLAY.format(path)
+    cache_dir = os.path.join(DESK, "_replay_cache")
+    cache_file = os.path.join(cache_dir, path.replace("/", "_") + f".{len(mint_set)}mints.jsonl")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
+            out = []
+            for line in open(cache_file):
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+            return out
+    except Exception:
+        cache_file = None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     out = []
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -72,7 +86,14 @@ def fetch_zst(path, mint_set, limit=8_000_000):
                     out.append(ev)
                     seen.add(m)
                     if len(out) >= limit:
-                        return out
+                        break
+    try:
+        if cache_file and out:
+            with open(cache_file, "w") as cf:
+                for ev in out:
+                    cf.write(json.dumps(ev) + "\n")
+    except Exception:
+        pass
     return out
 
 
@@ -97,6 +118,14 @@ def replay_mint(call, events, verbose=False):
             price = float(price)
         except Exception:
             price = None
+        if price is not None and price <= 0:
+            continue  # zero/negative price = data glitch, not a fillable trade (Oct 19)
+        # migration artifact guard: a price that collapses below 1% of the running
+        # real price = bonding-curve finalize / curve-empty buy-out, not a trade.
+        if price is not None and grouped and grouped[-1]["price"]:
+            prev_real = grouped[-1]["price"]
+            if price < prev_real * 0.01:
+                continue
         grouped.append({"ts": ts, "price": price, "mc": e.get("marketCapQuote")})
     # entry fill: first event AT/AFTER call_ts + latency
     fill_idx = None
