@@ -496,7 +496,26 @@ def main():
     need = 500 - eq
     mood = "🎯 ahead!" if gain > 0 else ("⚠️ behind" if gain > -15 else "🚨 deep red")
     out.append(f"💼 Paper account: ${eq:.2f} (started ${b['start']:.0f}, {'+' if gain>=0 else ''}{gpct:.0f}% — {mood}). Waiting cash: ${cash:.2f}. Coins held: {len(b['positions'])}. Still need ${need:.2f} to reach the $500 goal.")
-    print("\n".join(out))
+    blob = "\n".join(out)
+    # 10-min heartbeat: DM the book summary even with no action (user-approved Oct 19)
+    HB = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tick_heartbeat")
+    now = time.time()
+    due = True
+    try:
+        due = (now - float(open(HB).read().strip() or 0)) >= 600
+    except Exception:
+        due = True
+    acted = any(("BOUGHT" in l or "SOLD" in l or "EXIT" in l or "skipped" in l or "HOLD" in l or "clip" in l.lower()) for l in out)
+    if due or acted or len(b["positions"]) > 0:
+        if due:
+            open(HB, "w").write(str(now))
+        try:
+            sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
+            from call_notifier import send_dm
+            send_dm(blob)
+        except Exception:
+            pass  # cron deliver (telegram DM) is the fallback channel
+    print(blob)
 
 if __name__ == "__main__":
     main()
