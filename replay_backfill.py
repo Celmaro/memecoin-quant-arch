@@ -37,7 +37,7 @@ def fetch_zst(path, mint=None, limit=MAX_EVENTS):
                 line, buf = buf.split(b"\n", 1)
                 if not line.strip():
                     continue
-                if mint and mint.lower() not in line.lower():
+                if mint and mint.lower().encode() not in line.lower():
                     continue  # cheap pre-filter, no parse
                 try:
                     events.append(json.loads(line))
