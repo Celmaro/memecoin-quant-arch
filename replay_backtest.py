@@ -29,9 +29,16 @@ LATENCY_MS = 1500          # conservative execution latency buffer (PumpAPI guid
 BUNDLE_MS = 3              # same-token events within 3ms = one Jito bundle
 FEE_PCT = 3.0              # Doc1-1 3% paper fee per sell
 MAX_HORIZON_S = 2 * 3600   # quick-flip horizon
+SOLUSD = 150.0             # pump.fun marketCapQuote/quoteAmount are SOL; tiers are USD (Oct 19 fix)
+# Only these event fields are needed for replay — slimming cuts RAM ~10x (Oct 19 OOM fix)
+SLIM_KEYS = ("mint", "timestamp", "price", "marketCapQuote", "action", "quoteAmount")
 
 
-def fetch_zst(path, mint_set, limit=8_000_000):
+def _slim(ev):
+    return {k: ev.get(k) for k in SLIM_KEYS}
+
+
+def fetch_zst(path, mint_set, limit=8_000_000, reuse_any=False):
     """Stream .jsonl.zst, keep events whose mint is in mint_set. Bounded."""
     try:
         import zstandard
@@ -47,10 +54,26 @@ def fetch_zst(path, mint_set, limit=8_000_000):
             out = []
             for line in open(cache_file):
                 try:
-                    out.append(json.loads(line))
+                    out.append(_slim(json.loads(line)))
                 except Exception:
                     continue
             return out
+        # Oct 19 (user "from the tape"): reuse ANY existing cache file for this
+        # hour even if it was keyed by a different mint-count — avoids re-
+        # downloading hours we already have on disk.
+        if reuse_any:
+            prefix = path.replace("/", "_")
+            for cand in sorted(os.listdir(cache_dir)):
+                if cand.startswith(prefix + ".") and cand.endswith("mints.jsonl"):
+                    candp = os.path.join(cache_dir, cand)
+                    if os.path.getsize(candp) > 0:
+                        out = []
+                        for line in open(candp):
+                            try:
+                                out.append(_slim(json.loads(line)))
+                            except Exception:
+                                continue
+                        return out
     except Exception:
         cache_file = None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -83,15 +106,14 @@ def fetch_zst(path, mint_set, limit=8_000_000):
                     continue
                 m = ev.get("mint") or ""
                 if m in mint_set:
-                    out.append(ev)
-                    seen.add(m)
+                    out.append(_slim(ev))
                     if len(out) >= limit:
                         break
     try:
         if cache_file and out:
             with open(cache_file, "w") as cf:
                 for ev in out:
-                    cf.write(json.dumps(ev) + "\n")
+                    cf.write(json.dumps(ev) + "\n")  # slimmed now (smaller caches)
     except Exception:
         pass
     return out
@@ -138,7 +160,7 @@ def replay_mint(call, events, verbose=False):
     if fill_idx is None or fill_px is None:
         return None, "no_fill", ""
     # exit ladder (mirrors position_monitor.EXIT_TIERS + tier_exits)
-    mc_entry = float(grouped[fill_idx].get("mc") or 0)
+    mc_entry = float(grouped[fill_idx].get("mc") or 0) * SOLUSD  # SOL -> USD
     tier = EXIT_TIERS[0]
     for cand in EXIT_TIERS:
         if mc_entry >= cand[0]:
@@ -203,6 +225,7 @@ EXIT_TIERS = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", nargs="+", required=True, help="UTC hour paths e.g. 2026/10/19/05")
+    ap.add_argument("--reuse-any", action="store_true", help="reuse ANY existing per-hour cache file (even different mint-count) instead of downloading")
     ap.add_argument("--mint", default=None)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -238,18 +261,31 @@ def main():
     if not mint_set:
         return 0
 
-    # fetch archives (early-stop per hour; may still be large)
-    events = []
-    for hour in args.hours:
-        print(f"fetching {hour} ...", flush=True)
-        events.extend(fetch_zst(hour, mint_set))
-    print(f"loaded {len(events)} events for {len(mint_set)} mints")
+    # OOM fix (Oct 19): process ONE hour at a time with a 1-hour lookahead so a
+    # 12h run never holds all hours in RAM. Slim events cut per-hour cost ~10x.
+    import gc
+    calls_by_hour = collections.defaultdict(list)
+    for c in calls:
+        h = time.gmtime(c["ts"])
+        calls_by_hour[f"{h.tm_year:04d}/{h.tm_mon:02d}/{h.tm_mday:02d}/{h.tm_hour:02d}"].append(c)
 
     results = []
-    for c in calls:
-        pnl, outcome, detail = replay_mint(c, events, verbose=args.verbose)
-        live, ntrades = load_live_outcome(c["mint"])
-        results.append((c, pnl, outcome, detail, live, ntrades))
+    hours_sorted = sorted(args.hours)
+    for i, hour in enumerate(hours_sorted):
+        print(f"fetching {hour} ...", flush=True)
+        events = fetch_zst(hour, mint_set, reuse_any=args.reuse_any)
+        # lookahead: next hour's tape for exits crossing the hour boundary
+        if i + 1 < len(hours_sorted):
+            nxt = hours_sorted[i + 1]
+            print(f"fetching {nxt} (lookahead) ...", flush=True)
+            events.extend(fetch_zst(nxt, mint_set, reuse_any=args.reuse_any))
+        print(f"  {len(events)} events for {len(calls_by_hour.get(hour, []))} calls in {hour}", flush=True)
+        for c in calls_by_hour.get(hour, []):
+            pnl, outcome, detail = replay_mint(c, events, verbose=args.verbose)
+            live, ntrades = load_live_outcome(c["mint"])
+            results.append((c, pnl, outcome, detail, live, ntrades))
+        del events
+        gc.collect()
 
     print(f"\n=== REPLAY RESULTS ({len(results)} calls) ===")
     print(f"{'SYM':10s} {'outcome':9s} {'pnl%':>8s} {'live':>8s} {'detail':22s} chan")
