@@ -17,12 +17,7 @@ BUNDLE_MS = 3
 MAX_HORIZON_S = 2 * 3600
 SOLUSD = 150.0
 # mirror replay exit tiers (MC-adaptive, USD)
-EXIT_TIERS = [
-    (40_000, 1.30, 1.60, 0.78),      # <$40K: 50%@+30 rest@+60 stop -22%
-    (150_000, 1.35, 1.75, 0.75),     # $40-150K: -25%
-    (1_500_000, 1.50, 2.00, 0.70),   # $150K-1.5M: -30%
-    (10**12, 1.75, 2.50, 0.65),      # >$1.5M: -35%
-]
+EXIT_TIERS = [(0, 1.10, 1.30, 0.15), (40_000, 1.15, 1.35, 0.18), (150_000, 1.20, 1.45, 0.22), (1_500_000, 1.30, 1.60, 0.28)]  # LIVE ladder (position_monitor.EXIT_TIERS)
 
 def load_hour(prefix):
     out = []
@@ -85,7 +80,7 @@ def scan_call(call, events_by_hour):
     fill_px = fill[1]
     # ladder
     mc_entry = fill_px  # proxy tier by entry price magnitude? need MC — skip tier, use base ladder
-    tp1, tp2, stop = 1.30, 1.60, 0.78
+    tp1, tp2, stop = 1.10, 1.30, 0.15  # LIVE ladder base tier (position_monitor.EXIT_TIERS)
     outcome = "OPEN"
     exit_ms = None
     for ts, price in g:
@@ -94,7 +89,7 @@ def scan_call(call, events_by_hour):
         mult = price / fill_px
         if mult >= tp2:
             outcome = "TP2"; exit_ms = ts; break
-        if mult <= stop:
+        if mult <= (1 - stop):
             outcome = "STOP"; exit_ms = ts; break
     # post-exit window: p99 maxX + endX (2h from fill)
     end_t = fill[0] + MAX_HORIZON_S * 1000

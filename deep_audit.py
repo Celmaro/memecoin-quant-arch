@@ -25,12 +25,7 @@ CACHE = os.path.join(DESK, "_replay_cache")
 LATENCY_MS = 1500
 BUNDLE_MS = 3
 SOLUSD = 150.0
-EXIT_TIERS = [
-    (40_000, 1.30, 1.60, 0.78),
-    (150_000, 1.35, 1.75, 0.75),
-    (1_500_000, 1.50, 2.00, 0.70),
-    (10**12, 1.75, 2.50, 0.65),
-]
+EXIT_TIERS = [(0, 1.10, 1.30, 0.15), (40_000, 1.15, 1.35, 0.18), (150_000, 1.20, 1.45, 0.22), (1_500_000, 1.30, 1.60, 0.28)]  # LIVE ladder (position_monitor.EXIT_TIERS), single source of truth
 
 _hour_cache = {}
 
@@ -133,9 +128,8 @@ def audit_call(c):
     row["act60"] = act60
     row["bs5m"] = round(buys / max(sells, 1), 2)
     row["buys5m"], row["sells5m"] = buys, sells
-    # ladder outcome (mirror replay engine)
-    mc_entry = fill * 1.0  # fill price proxy; tiers by mc not available per event in cache (marketCapQuote exists but we slimmered) — use base tier
-    tp1, tp2, stop = 1.30, 1.60, 0.78
+    # ladder outcome (mirror live position_monitor.EXIT_TIERS; base tier for mc<=40K)
+    tp1, tp2, stop = 1.10, 1.30, 0.15
     outcome = "OPEN"
     for ts, price, action in g:
         if ts < call0:
@@ -143,7 +137,7 @@ def audit_call(c):
         mult = price / fill
         if mult >= tp2:
             outcome = "TP2"; break
-        if mult <= stop:
+        if mult <= (1 - stop):
             outcome = "STOP"; break
     row["outcome"] = outcome
     # pnl proxy from outcome

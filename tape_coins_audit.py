@@ -131,8 +131,8 @@ def audit(mint, call_ts, call_mc, sym, chan):
     row["buys"], row["sells"] = buys, sells
     row["bs5m"] = round(buys5 / max(sells5, 1), 2)
     row["act60"] = act60
-    # ladder
-    tp1, tp2, stop = 1.30, 1.60, 0.78
+    # ladder (live position_monitor.EXIT_TIERS; base tier)
+    tp1, tp2, stop = 1.10, 1.30, 0.15
     outcome = "OPEN"
     for ts, px, mcq, action, qa in g:
         if ts < t0:
@@ -140,7 +140,7 @@ def audit(mint, call_ts, call_mc, sym, chan):
         mult = px / fill
         if mult >= tp2:
             outcome = "TP2"; break
-        if mult <= stop:
+        if mult <= (1 - stop):
             outcome = "STOP"; break
     row["outcome"] = outcome
     return row
