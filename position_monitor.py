@@ -16,13 +16,14 @@ Usage:
 """
 import json, sys, os, time, argparse
 from desk_common import (dex_pair, db, log_event, init_schema, rugcheck,
-                         coinstats_balance, bitquery_imbalance)
+                         coinstats_balance)
 from signals import token_intel, holder_growth, holder_churn, fresh_wallet_power
 import aegis
 
 DESK_DIR = os.path.expanduser("~/memecoin-quant")
 POS_FILE = os.path.join(DESK_DIR, "positions.json")
-FEE_BPS = 1.7
+FEE_BPS = 3.0  # Oct 20 audit: was 1.7 (Jupiter display fee) — actual booked fee is
+# PAPER_FEE_PCT 3.0 in scaleout.py. Monitor's displayed pnl was optimistic by 1.3 pts.
 
 # MC-adaptive exit plan: (mc_floor, clip1_mult, clip2_mult, stop_loss%)
 EXIT_TIERS = [
@@ -133,11 +134,22 @@ def analyze(mint, pos):
         signals.append(f"CLIP1: {mult:.2f}x >= {c1:.2f}x (sell 50%)")
         action = "CLIP_50"
 
+    # --- Tier stop (P0-1 RESTORED Oct 19, user-approved): MC-adaptive stop fires
+    # FIRST. `stop` = tier[3] (0.15-0.28, tightened by wash flags) was computed but
+    # NEVER READ (audit P0-1) — every position rode to the 0.50 hard floor, turning
+    # 51% of closes into emergency exits. Stop at mult <= 1 - stop.
+    if mult <= (1 - stop):
+        signals.append(f"TIER_STOP: {mult:.2f}x <= {1-stop:.2f}x (tier stop {stop:.0%}, MC ${mc:,.0f})")
+        action = "EXIT_ALL"
+        pos["tier_stop_triggered"] = True  # non-overridable: contract may not downgrade
+
     # --- Hard stop (FIX: price-based circuit breaker, independent of liquidity) ---
     # User fix #1: exit at a hard price floor (default -50%) even if liquidity data
     # is missing. The old stop was inverted (mult <= 1 - stop where stop is a
     # positive fraction made it fire at 1.28x/1.15x ABOVE entry) and was skipped
     # entirely when liq was None. New logic: hard floor always applies.
+    # The tier stop above fires first; this floor is the FINAL BACKSTOP for
+    # gap-through dumps (a token can blow through -22% to -50% in one tick).
     hard_floor = float(pos.get("hard_stop_mult") or 0.50)
     if mult <= hard_floor:
         signals.append(f"HARD_STOP: {mult:.2f}x <= {hard_floor:.2f}x price floor (liquidity-independent)")
@@ -345,17 +357,22 @@ def analyze(mint, pos):
     except Exception:
         pass
 
-    # --- Bitquery USD-weighted buy/sell imbalance (when available) ---
+    # --- USD buy/sell imbalance from BLIX tape (audit Oct 19 fix #4: Bitquery is
+    # credit-locked 402; the local tape gives the same signal for free). ---
     try:
-        imb = bitquery_imbalance(mint, limit=25)
-        if imb and (imb.get("buy_usd") or 0) + (imb.get("sell_usd") or 0) > 500:
-            pos.setdefault("bitquery_imb", {})["prev"] = imb
-            pos["bitquery_imb"]["last"] = imb
-            if imb.get("ratio", 0.5) < 0.35:
-                signals.append(f"BITQUERY SELL IMBALANCE: buys ${imb['buy_usd']:,.0f} vs sells ${imb['sell_usd']:,.0f}")
-                if action == "HOLD": action = "CLIP_50"
-            elif imb.get("ratio", 0.5) > 0.7:
-                signals.append(f"BITQUERY BUY IMBALANCE: buys ${imb['buy_usd']:,.0f} vs sells ${imb['sell_usd']:,.0f}")
+        from desk_common import blix_coin_trades, blix_alive
+        if blix_alive():
+            trs = blix_coin_trades(mint, limit=60) or []
+            buy_usd = sum(float(t.get("usd") or 0) for t in trs if t.get("side") == "buy")
+            sell_usd = sum(float(t.get("usd") or 0) for t in trs if t.get("side") == "sell")
+            tot = buy_usd + sell_usd
+            if tot > 500:
+                ratio = buy_usd / tot
+                if ratio < 0.35:
+                    signals.append(f"TAPE SELL IMBALANCE: buys ${buy_usd:,.0f} vs sells ${sell_usd:,.0f}")
+                    if action == "HOLD": action = "CLIP_50"
+                elif ratio > 0.7:
+                    signals.append(f"TAPE BUY IMBALANCE: buys ${buy_usd:,.0f} vs sells ${sell_usd:,.0f}")
     except Exception:
         pass
 
@@ -383,9 +400,15 @@ def analyze(mint, pos):
                 hg = fresh
             # --- Holder churn/retention (DAS, same 5-min throttle, cheap: 1 paged read) ---
             # --- and New-wallet purchasing power (GeckoTerminal trades, keyless) ---
+            # P1-4 (Oct 20): churn also had NO throttle — every tick paid a 1k-tx page.
+            # Reuse the same last_holders_ts window so both refreshes share one cadence.
             try:
-                churn = holder_churn(mint)
-                pos["holder_churn"] = churn
+                if now - last >= 300:
+                    churn = holder_churn(mint)
+                    pos["holder_churn"] = churn
+                    pos["last_holders_ts"] = now
+                else:
+                    churn = pos.get("holder_churn") or {}
                 if churn:
                     if churn.get("retention") is not None:
                         ret_pct = churn["retention"] * 100
@@ -686,6 +709,22 @@ def cmd_close(args):
     hold_min = (time.time() - float(p["ts"])) / 60
     log_event({"event": "POSITION_CLOSE", "mint": args.mint, "exit_px": args.exit_px,
                "mult": mult, "realized_usd": pnl, "reason": args.reason, "hold_min": hold_min})
+    # --- deployer memory outcome (audit Oct 19 fix #1): rug/liq-collapse closes
+    # increment deployers.rug_count so deployer_offset + funder→rug checks compound.
+    reason_l = (args.reason or "").lower()
+    is_rug = ("rug" in reason_l or "collapse" in reason_l or "dead" in reason_l
+              or "liq=0" in reason_l or mult <= 0.15)
+    if is_rug:
+        try:
+            con = db()
+            dep = con.execute("SELECT deployer FROM coins WHERE mint=?", (args.mint,)).fetchone()
+            if dep and dep["deployer"]:
+                con.execute("""UPDATE deployers SET rug_count = rug_count + 1,
+                    score_offset = MAX(score_offset - 5, -25) WHERE deployer=?""", (dep["deployer"],))
+                con.commit()
+                print(f"  deployer {dep['deployer'][:8]}... rug_count incremented (memory layer compounding)")
+        except Exception as e:
+            print(f"  deployer-memory update skipped: {e}")
     print(f"CLOSED {args.mint[:12]}... mult={mult:.2f}x realized=${pnl:+.2f} hold={hold_min:.0f}m reason={args.reason}")
     return 0
 

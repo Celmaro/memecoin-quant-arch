@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Signal engine: slow-graduation, wash-trade/LPI detector, fragility score (ME2F-lite), OHLCV risk."""
 import time, statistics, json, os
-from desk_common import dex_pair, rpc, rugcheck, db, load_config, http_json, UA
+from desk_common import dex_pair, rpc, rugcheck, db, load_config, http_json, UA, helius_asc_txs
 
 # ---------- 1. Slow-graduation (bonding-curve fill time) ----------
 

@@ -8,6 +8,37 @@ import position_monitor as pm
 BOOK = "/home/agentuser/memecoin-quant/paper_book.json"
 CONSUMED_FILE = "/home/agentuser/memecoin-quant/consumed_calls.jsonl"
 
+# Grad-curve threshold: pump.fun bonding curve fills at ~$69K MC. Below that a coin
+# is pre-graduation and reports NO pool liquidity (liq=0) — the $10K liq gate must
+# never treat those as dead (audit Oct 20: gate blocked 22/33 of the best cohort).
+CURVE_FILL_MC_USD = 69_000
+CURVE_GRAD_LIQ_MIN = 10_000
+
+def _is_curve_pre_grad(mkt):
+    """True for a pump.fun mint still on the bonding curve (MC < fill) where a
+    liq=0 read is EXPECTED, not evidence of death. Those coins report liq $0 until
+    the curve fills, so the liq gate must not reject them on liq alone."""
+    if not mkt:
+        return False
+    mc = float((mkt.get("marketCap") or mkt.get("marketCapQuote") or 0) or 0)
+    if mc <= 0:
+        return False
+    # if MC is already above fill, it's graduated (has real pool liq) — gate applies
+    return mc < CURVE_FILL_MC_USD
+
+def _note_fill(mint, age_min, ts=None):
+    """Record fill-time (call→entry minutes) in the coins table. Oct 20 audit:
+    coins.fill_time_min was 0% populated (dead field) — the desk's own entry
+    latency audit was blind. Cheap local write, never inside a book txn."""
+    try:
+        import sqlite3
+        con = sqlite3.connect("/home/agentuser/memecoin-quant/aegis.db", timeout=15)
+        con.execute("UPDATE coins SET fill_time_min=?, call_ts=COALESCE(call_ts,?) "
+                    "WHERE mint=?", (round(float(age_min or 0), 3), ts or time.time(), mint))
+        con.commit(); con.close()
+    except Exception:
+        pass
+
 def _consumed_mints(max_age_s=86400):
     """Mints already consumed as entries (P0.2): durable ledger so a quick stop/clip
     within the freshness window can't re-buy the same curated signal."""
@@ -29,6 +60,19 @@ def load_book():
     return json.load(open(BOOK))
 
 def save_book(b):
+    # GUARD (Oct 19, clobber-incident): refuse to write a structurally invalid
+    # book. A synthetic/test book missing required keys (start/cash/positions) was
+    # once written over the live $92.40 book by a verification test's save_book
+    # call. Required keys + sane types; raise instead of silently clobbering.
+    required = ("start", "cash", "positions", "trades")
+    for k in required:
+        if k not in b:
+            raise ValueError(f"save_book refused: book missing required key '{k}' "
+                             f"(got {sorted(b.keys())}) — refusing to clobber live book")
+    if not isinstance(b["positions"], dict) or not isinstance(b["trades"], list):
+        raise ValueError("save_book refused: positions must be dict, trades must be list")
+    if not isinstance(b.get("cash"), (int, float)) or not isinstance(b.get("start"), (int, float)):
+        raise ValueError("save_book refused: cash/start must be numeric")
     import tempfile
     tmp = BOOK + ".tmp"
     with open(tmp, "w") as f:
@@ -63,7 +107,13 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
     # capture for attribution before position pops
     peak = float(p.get("peak_price") or 0); trough = float(p.get("trough_price") or 0)
     initial = float(p.get("initial_usd") or p["entry_usd"])
-    decision_px = float(p.get("last_decision_px") or px)
+    # Oct 20 audit fix: the monitor writes last_decision_px into POSITIONS.json
+    # (mp dict) but NEVER into the book row — so every attribution had
+    # decision_px=exit_px → is_exit 0/212. Read the monitor row as fallback.
+    _dp = p.get("last_decision_px")
+    if not _dp:
+        _dp = (pos.get(mint) or {}).get("last_decision_px")
+    decision_px = float(_dp or px)
     entry_px = float(p["entry_px"])
     # reserve exactly the sellable slice the target curve needs
     want = sell_delta(b, key, stage)
@@ -184,7 +234,11 @@ def auto_buy():
         from desk_common import dex_pair
         mkt = dex_pair(mint) or {}
         liq = ((mkt.get("liquidity") or {}).get("usd")) or 0
-        if liq < 10000:
+        # FIX 3a (Oct 20): pre-graduation curve coins report liq=0 by design
+        # (bonding curve has no pool until $69K fill) — the $10K gate rejected
+        # 22/33 of the best GRAD-DURING cohort. Only enforce the gate for coins
+        # that should ALREADY have a pool (MC >= fill) or have real liq data.
+        if liq < 10000 and not _is_curve_pre_grad(mkt):
             b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                                 "why": f"thin_liquidity_${liq:,.0f}"})
             continue
@@ -241,6 +295,7 @@ def auto_buy():
                                "entry_liq": ((mkt.get("liquidity") or {}).get("usd")) or 0,
                                "entry_vol_h1": (mkt.get("volume") or {}).get("h1") or 0,
                                "entry_mc": float(mkt.get("marketCap") or 0)}
+        _note_fill(mint, age)  # Oct 20: populate coins.fill_time_min (was 0% filled)
         b["cash"] = round(b["cash"] - size, 2)
         seen_mints.add(mint)
         # audit P0.2 (Oct 18): durable consumed-call ledger — a quick stop/clip within the
@@ -265,7 +320,7 @@ def auto_buy():
     return bought
 
 
-def entry_call(d, b=None):
+def entry_call(d, b=None, aegis_score=None):
     """Oct 19: DIRECT single-call paper entry (used by notifier after AEGIS card).
 
     Applies the same guards as auto_buy's loop (liq >= $10K gate, no 5m dump, no
@@ -273,6 +328,15 @@ def entry_call(d, b=None):
     for ONE call dict — so the DM notifier can trigger the buy immediately after the
     AEGIS deep card, without waiting for paper_tick's next cron.
     Returns (bought_line, skip_reason|None)."""
+
+    # Oct 20 audit policy: AEGIS is a veto/boost ONLY (never a rank filter).
+    # score < 30 = hard veto (the only band with real predictive power);
+    # score >= 70 = mild size boost; the 30-70 zone changes nothing.
+    if aegis_score is not None:
+        try:
+            aegis_score = float(aegis_score)
+        except Exception:
+            aegis_score = None
     import json as _j
     b = b if b is not None else load_book()
     if not b.get("autobuy", True):
@@ -295,9 +359,18 @@ def entry_call(d, b=None):
     # dedupe: open positions + consumed ledger
     if any(p.get("mint") == mint for p in b["positions"].values()) or mint in _consumed_mints():
         return None, "already_held_or_consumed"
+    # AEGIS veto (audit policy Oct 20): <30 = hard veto, 70+ = mild size boost.
+    # Applies AFTER dedupe so consumed/holding mints aren't double-logged.
+    if aegis_score is not None and aegis_score < 30:
+        return None, f"aegis_veto_score_{aegis_score:.0f}"
+    aegis_boost = 1.0
+    if aegis_score is not None and aegis_score >= 70:
+        aegis_boost = 1.25  # mild position-size boost on strong contract/live signals
     mkt = dex_pair(mint) or {}
     liq = ((mkt.get("liquidity") or {}).get("usd")) or 0
-    if liq < 10000:
+    # FIX 3a (Oct 20): same pre-graduation exemption as auto_buy — sub-$69K curve
+    # coins legitimately report liq=0; the gate must not kill the best cohort.
+    if liq < 10000 and not _is_curve_pre_grad(mkt):
         b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                             "why": f"thin_liquidity_${liq:,.0f}"})
         save_book(b)
@@ -335,6 +408,7 @@ def entry_call(d, b=None):
     except Exception:
         conf = 1
     size = 25.0 if conf >= 2 else 20.0
+    size *= aegis_boost  # 70+ AEGIS: +25% position (Oct 20 policy)
     size = min(size, b["cash"])
     if size < 10:
         b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
@@ -349,6 +423,7 @@ def entry_call(d, b=None):
                            "entry_liq": liq,
                            "entry_vol_h1": (mkt.get("volume") or {}).get("h1") or 0,
                            "entry_mc": float(mkt.get("marketCap") or 0)}
+    _note_fill(mint, max(0, age))  # Oct 20: populate coins.fill_time_min (was 0% filled)
     b["cash"] = round(b["cash"] - size, 2)
     try:
         with open(CONSUMED_FILE, "a") as cf:
@@ -386,7 +461,16 @@ def main():
         sym = p.get("symbol") or mint[:8]  # display symbol (book key is MINT — P0.1)
         mkt_ts = time.time()               # audit P1.2 (Oct 18): market observation ts — captured
                                             # the moment the snapshot is fetched, not at decision end
-        mkt = dex_pair(mint, allow_fallback=False, timeout=10, retries=1) or {}
+        mkt = {}
+        try:
+            mkt = dex_pair(mint, allow_fallback=False, timeout=10, retries=1) or {}
+        except Exception as e:
+            # 429-blip resilience (Oct 19): ONE provider failure must not kill the
+            # whole tick (that silently froze the desk for 25 min after a rate-limit
+            # burst — no heartbeat, no exits processed). Defer this position and
+            # let the next tick retry; the book stays live for other positions.
+            out.append(f"? {sym}: market err ({type(e).__name__}) — deferred to next tick")
+            continue
         px = mkt.get("priceUsd")
         if not px:
             out.append(f"? {sym}: no market"); continue
@@ -403,7 +487,7 @@ def main():
         if p.get("trough_price") is None or px < float(p["trough_price"]): p["trough_price"] = px
         # Build 5: tier budgeting — BACKGROUND moonbags skip deep analyze most ticks
         try:
-            from bot.orchestration.monitor_tiers import classify
+            from bot.orchestration.monitor_tiers import classify, CADENCE_S
             # audit P1.5 (Oct 18): classify with the LATEST market result (mult) so a
             # moonbag that is losing money is never demoted to BACKGROUND on None mult.
             tier = classify(p, r={"mult": mult})
@@ -414,10 +498,24 @@ def main():
         # position at a fixed index isn't skipped every single run. Keep it in the position
         # row (survives restarts) instead of a per-invocation tick_no reset.
         tick_no = int(p.get("_tick_no") or 0)
-        skip_deep = (tier == "BACKGROUND" and tick_no % 10 != 0)
         p["_tick_no"] = (tick_no + 1) % 10
+        # Oct 20 audit: wire monitor_tiers.CADENCE_S (was dead constant). A position
+        # gets full deep analyze only as often as its tier allows:
+        #   CRITICAL 15s / HIGH 60s / NORMAL 300s / BACKGROUND 900s.
+        # The old rule skipped BACKGROUND 9/10 ticks regardless of elapsed time;
+        # now every tier honors its cadence via a persisted last_deep_ts, and the
+        # round-robin counter is only a fallback for the first BACKGROUND tick.
+        last_deep = float(p.get("_last_deep_ts") or 0)
+        now_t = time.time()
+        cad_s = CADENCE_S.get(tier, 300)
+        skip_deep = (now_t - last_deep) < cad_s
+        if tier == "BACKGROUND" and tick_no % 10 != 0 and skip_deep:
+            skip_deep = True  # keep the coarse backward-skip for moonbags
+        elif not skip_deep and last_deep == 0:
+            p["_last_deep_ts"] = now_t
         decision_action = None
         if not skip_deep:
+            p["_last_deep_ts"] = now_t  # deep analyze ran — stamp for cadence gating
             try:
                 mp = pos.get(mint) or {"entry_px": p["entry_px"], "size": entry_usd,
                                            "ts": p.get("opened", time.time()), "paper": True,
@@ -510,6 +608,14 @@ def main():
         age_h = (time.time() - p.get("opened", time.time())) / 3600
         if age_h > 3:
             if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="STALE", how="stale", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
+                save_book(b); pm.save_positions(pos)
+                continue
+        if state == "full" and mult <= 1 + stop:
+            # P0-1 RESTORED (Oct 19, user-approved): MC-adaptive tier stop fires
+            # FIRST in the fallback engine too. stop is NEGATIVE here (tier_exits
+            # returns -0.15..-0.28), so 1+stop = 0.85..0.72 — a real early stop.
+            # Previously only the 0.50 floor existed -> every loser rode to -50%.
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="TIER_STOP", how="stop", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
         if state == "full" and mult <= 0.50:

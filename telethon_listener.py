@@ -22,6 +22,7 @@ CRED_FILE = os.path.join(DESK, ".tg_credentials.json")
 SESSION_FILE = os.path.join(DESK, "tg_session")
 MSG_LEDGER = os.path.join(DESK, "telegram_messages.jsonl")
 CALLS = os.path.join(DESK, "calls.jsonl")
+CALLS_TRIGGER = os.path.join(DESK, "calls.trigger")
 STATE_FILE = os.path.join(DESK, "telethon_state.json")
 
 MINT_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
@@ -327,6 +328,9 @@ def block_fields(block, fallback_sym=None, fallback_mc=None):
 def process_message(msg, channel):
     """Record + forward to pipeline. Returns summary line or None.
 
+    Oct 20 audit: normalize channel name ONCE at ingest so the same channel never
+    splits stats by case (PIRBViewTrending vs pirbviewtrending). Calls.jsonl,
+    ledger rows, retractions all inherit the canonical name.
     Live-corrected Oct 17:
       - channel cards carry their OWN symbol + MC in the text
       - CAs hide in button/entity URLs (dominant mint, NOT solscan /account/ wallet links)
@@ -338,6 +342,13 @@ def process_message(msg, channel):
     digest cards get edited every few minutes -> 3 msg_ids produced 1,806 ledger rows)."""
     if msg is None or getattr(msg, "action", None):
         return None
+    # Oct 20 audit: canonical channel (lowercase, no 'trending' suffix) so stats
+    # never split one channel into case variants.
+    try:
+        from desk_common import normalize_channel
+        channel = normalize_channel(channel)
+    except Exception:
+        pass
     text = msg.message or ""
     sym, mc, kind, skip = parse_signal_fields(text)
     # ledger first: record everything (kind + skip tell the audit story)
@@ -417,6 +428,11 @@ def process_message(msg, channel):
             if c.get("mc"):
                 rec2["mc"] = c["mc"]
             append_jsonl(CALLS, rec2)
+            try:  # event trigger: supervisor scans immediately instead of next 60s tick
+                open(CALLS_TRIGGER, "a").close()
+                os.utime(CALLS_TRIGGER)
+            except Exception:
+                pass
             lines.append(f"NEW ${c.get('symbol') or c['mint'][:10]} from {channel} ({rec['dt']})")
             # Oct 19 audit: index emitted mint by msg_id so MessageDeleted can retract
             try:
@@ -545,6 +561,11 @@ async def run():
             if not mints:
                 continue
             ch = chan_name(ev.chat_id)
+            try:
+                from desk_common import normalize_channel
+                ch = normalize_channel(ch)
+            except Exception:
+                pass
             try:
                 with open(os.path.join(DESK, "retractions.jsonl"), "a") as f:
                     f.write(json.dumps({"ts": time.time(), "channel": ch, "msg_id": mid,

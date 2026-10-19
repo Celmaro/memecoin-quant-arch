@@ -374,29 +374,8 @@ def fomo_board(mint, chain="solana"):
             continue
     return None
 
-def coinstats_balance(wallet, connection="solana"):
-    """CoinStats wallet balance (X-API-KEY). Returns LIST directly.
-
-    ⚠️ Oct 16 2026: free-tier credits exhausted -> every endpoint 406. Returns []
-    but logs a degraded marker once so the desk knows this path is dead, not silent.
-    """
-    cfg = load_config()
-    ck = cfg.get("COINSTATS_KEY")
-    if not ck: return []
-    try:
-        url = f"https://openapiv1.coinstats.app/v1/wallet/balance?address={wallet}&connectionId={connection}"
-        st, data = http_json(url, headers={"X-API-KEY": ck, "Accept": "application/json"})
-        if isinstance(data, list):
-            return data
-        res = data.get("result") or []
-        return res if isinstance(res, list) else []
-    except Exception:
-        # 406 = credits exhausted; mark degraded once so monitoring knows
-        try:
-            log_event({"event": "COINSTATS_DEGRADED", "detail": "406 credits limit"})
-        except Exception:
-            pass
-        return []
+# (coinstats_balance defined once below at line ~557 WITH the 406 circuit breaker;
+#  an older dup without the breaker was removed Oct 20 P2-8.)
 
 # module-level circuit breaker for Bitquery (402 credit-locked; recalib Oct 18)
 _BQ_DEAD_UNTIL = [0.0]
@@ -496,11 +475,15 @@ def resolve_token_meta(mint):
             out["price"] = gp["priceUsd"]
     return out if out else None
 
-def dex_pair(mint, allow_fallback=True):
-    """Best pair for a mint from DexScreener (throttled) with GeckoTerminal fallback on 429."""
+def dex_pair(mint, allow_fallback=True, timeout=20, retries=3):
+    """Best pair for a mint from DexScreener (throttled) with GeckoTerminal fallback on 429.
+
+    timeout/retries: per-call budget (F2/F4 Oct 19) — batch paths (followups,
+    paper tick) should pass tight values like (8, 1) so one hung provider never
+    blows the whole batch's subprocess timeout."""
     _dex_throttle()
     try:
-        st, data = http_json(DEXSCREENER.format(mint))
+        st, data = http_json(DEXSCREENER.format(mint), timeout=timeout, retries=retries)
     except Exception as e:
         if allow_fallback and ("429" in str(e) or "Too Many" in str(e)):
             return _gecko_pair(mint)
@@ -623,12 +606,16 @@ def is_token_mint(address, timeout_cache=300):
 
 def ave_risk(mint):
     """Ave.ai Contract Risk Detection Report — verified working (X-API-KEY header).
+    P2-7 (Oct 20): BUDGETED — the report is keyed and per-call metered; without a
+    gate, every AEGIS scan burns one even when the daily quota is gone.
     https://prod.ave-api.com/v2/contracts/{CA}-{chain}"""
     cfg = load_config()
     import re as _re
     ave_key = cfg.get("AVE_KEY")
     if not ave_key:
         return None
+    if not budget("ave_risk"):
+        return None  # daily quota exhausted — degrade silently (caller treats None as "no data")
     try:
         url = f"https://prod.ave-api.com/v2/contracts/{mint}-solana"
         st, data = http_json(url, headers={"X-API-KEY": ave_key})
@@ -727,6 +714,10 @@ def solscan_chaininfo():
 
 def cabalspy_wallets(chain="solana", wtype="kol", limit=20):
     """CabalSpy labeled KOL/smart/whale roster (10k credits free/mo)."""
+    # P2-8 (Oct 20): DNS fail-fast — api.cabalspy.xyz does not resolve from this
+    # box; without this every call burns retries for a guaranteed empty list.
+    if not _host_ok("api.cabalspy.xyz"):
+        return []
     try:
         cfg = load_config()
         key = cfg.get("CABALSPY_KEY")
@@ -739,7 +730,11 @@ def cabalspy_wallets(chain="solana", wtype="kol", limit=20):
 
 def madeonsol_kol_feed(limit=10):
     """MadeOnSol KOL trade feed — CF-blocked from this box; returns [] here.
+    P2-8 (Oct 20): DNS fail-fast — madeonsol.com does not resolve from this box,
+    so don't burn per-call timeouts on a guaranteed-empty feed.
     Works from user-network/x402. Base: madeonsol.com/api/v1 (NOT api.madeonsol.com)."""
+    if not _host_ok("madeonsol.com"):
+        return []
     try:
         cfg = load_config()
         key = cfg.get("MADEONSOL_KEY")
@@ -753,12 +748,20 @@ def madeonsol_kol_feed(limit=10):
 # --- BLIX RADAR CLIENT (Oct 18 — localhost:4420, all endpoints verified live) ---
 BLIX = "http://localhost:4420"
 
+# P2-8 (Oct 20): Blix localhost service is PARTIALLY down (webapp/trades/pumpswap/
+# rugcheck/helius-config/telegram endpoints dead). Add a per-endpoint circuit
+# breaker so dead ones don't burn a timeout every call; alive ones stay fast.
+_BLIX_DEAD = {}  # endpoint -> dead_until ts
 def _blix(path, timeout=10):
-    """GET a Blix endpoint; returns dict/list or None on failure."""
+    """GET a Blix endpoint; returns dict/list or None on failure (breaker for dead paths)."""
+    now = time.time()
+    if now < _BLIX_DEAD.get(path, 0):
+        return None
     try:
         st, d = http_json(f"{BLIX}{path}", timeout=timeout)
         return d
     except Exception:
+        _BLIX_DEAD[path] = now + 600  # 10-min breaker per dead endpoint
         return None
 
 def blix_alive():
@@ -858,9 +861,38 @@ CREDIT_BUDGETS = {
     "solanatracker":    {"daily": 500,   "cost": 1},     # 10k/mo free -> keep light
     "walletintel":      {"daily": 10,    "cost": 1},
     "ave_top100":       {"daily": 200,   "cost": 1},     # keyed, free-ish w/ limits
+    "ave_risk":         {"daily": 200,   "cost": 1},     # P2-7: Ave contract-risk report is keyed — budget it
     "madeonsol":        {"daily": 180,   "cost": 1},     # 200/day free, leave headroom
     "cabalspy":         {"daily": 500,   "cost": 10},    # 10k/mo
 }
+
+# P2-8 (Oct 20): shared DNS fail-fast for network-dead providers. A host that
+# won't resolve (rugcheck/cabalspy/madeonsol on this box) must not burn 12s of
+# retries per call. Mirrors the rugcheck DNS breaker pattern.
+_DNS_DEAD = {}  # host -> dead_until ts
+def _host_ok(host, ttl=1800):
+    """False + circuit-break if host has no DNS (fail-fast, don't burn timeouts)."""
+    now = time.time()
+    until = _DNS_DEAD.get(host, 0)
+    if now < until:
+        return False
+    try:
+        socket.gethostbyname(host)
+        return True
+    except Exception:
+        _DNS_DEAD[host] = now + ttl
+        return False
+
+def normalize_channel(name):
+    """Canonical channel name (Oct 20 audit): the same Telegram channel was being
+    recorded under case variants (PIRBViewTrending vs pirbviewtrending, SeekrTrending
+    vs seekrtrending), splitting attribution/backtest stats. Canonical = lowercase,
+    'trending' suffix stripped (matches desk_supervisor card display)."""
+    if not name:
+        return "?"
+    n = str(name).strip().lower()
+    n = n.replace("trending", "")
+    return n
 _BUDGET_FILE = os.path.join(DESK, "credit_budget.json")
 
 def _load_budget():
@@ -1090,7 +1122,10 @@ def dexscreener_metas_trending():
 # 12. DexPaprika reserve stream (SSE — one-shot read helper + poll usage)
 def dexpaprika_reserves(pool_id):
     """Read a single reserve snapshot (SSE is push; this is the REST pool detail fallback).
+    P2-8 (Oct 20): DNS fail-fast — api.dexpaprika.com does not resolve from this box.
     For continuous liq-pull monitoring, poll or run the SSE reader (see scripts)."""
+    if not _host_ok("api.dexpaprika.com"):
+        return None
     try:
         st, d = http_json(f"https://api.dexpaprika.com/networks/solana/pools/{pool_id}",
                           headers={"Authorization": load_config().get("DEXPAPRIKA_KEY") or ""}, timeout=20)
@@ -1101,6 +1136,8 @@ def dexpaprika_reserves(pool_id):
 # 13. CabalSpy bundle/signals/connections (10k cr/mo, network-blocked here -> graceful)
 def cabalspy_bundle(mint):
     if not budget("cabalspy"):
+        return None
+    if not _host_ok("api.cabalspy.xyz"):
         return None
     try:
         key = load_config().get("CABALSPY_KEY")
@@ -1113,6 +1150,8 @@ def cabalspy_bundle(mint):
 def cabalspy_signals(min_win_rate=0.5):
     if not budget("cabalspy"):
         return []
+    if not _host_ok("api.cabalspy.xyz"):
+        return []
     try:
         key = load_config().get("CABALSPY_KEY")
         if not key: return []
@@ -1123,6 +1162,8 @@ def cabalspy_signals(min_win_rate=0.5):
 
 def cabalspy_connections(wallet):
     if not budget("cabalspy"):
+        return []
+    if not _host_ok("api.cabalspy.xyz"):
         return []
     try:
         key = load_config().get("CABALSPY_KEY")
@@ -1137,6 +1178,8 @@ def madeonsol_buyer_quality(mints):
     """Batch buyer-quality for a list of mints (≤50). BUDGETED; 200/day free."""
     if not budget("madeonsol"):
         return []
+    if not _host_ok("madeonsol.com"):
+        return []
     try:
         key = load_config().get("MADEONSOL_KEY")
         if not key: return []
@@ -1148,6 +1191,8 @@ def madeonsol_buyer_quality(mints):
         return []
 
 def madeonsol_signal_perf(signal_name, history=False):
+    if not _host_ok("madeonsol.com"):
+        return []
     try:
         key = load_config().get("MADEONSOL_KEY")
         if not key: return None
@@ -1251,7 +1296,15 @@ def init_schema():
     CREATE TABLE IF NOT EXISTS positions(
         mint TEXT PRIMARY KEY, entry_px REAL, size REAL, entry_mc REAL, entry_liq REAL,
         opened_ts REAL, strategy TEXT, conviction INTEGER DEFAULT 0, notes TEXT);
+    CREATE TABLE IF NOT EXISTS deep_cache(
+        mint TEXT PRIMARY KEY, report_json TEXT, ts REAL);
     """)
+    # Audit F1: first_buyers must be unique per (mint, wallet, rank).
+    # Without this, INSERT OR REPLACE is just INSERT on every rescan.
+    try:
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fb_uniq ON first_buyers(coin_mint, wallet, rank)")
+    except Exception:
+        pass  # existing duplicate rows are repaired by maintenance before index creation
     # audit P1 (Oct 18): older DBs lack the `outcome` column -> filter_precision's
     # `SELECT outcome FROM followups` was failing silently. Migrate if missing.
     cols = [r[1] for r in con.execute("PRAGMA table_info(followups)")]
@@ -1267,3 +1320,52 @@ def mark_status(mint, status):
     con = db()
     con.execute("UPDATE coins SET status=?, updated_ts=? WHERE mint=?", (status, time.time(), mint))
     con.commit(); con.close()
+
+def remember_call_meta(mint, channel, call_ts, symbol=None, mc=None, liq=None):
+    """F3 (Oct 19): persist WHERE/WEN a call was first seen on the coins row.
+
+    Previously coins.call_ts/source were NULL for every row (1025/1025) — the
+    schema advertised call timing that nothing wrote, and score_coin's
+    INSERT OR REPLACE wiped them on every rescan. This upserts the immutable
+    call metadata (first sighting wins) so timing/channel rules have data."""
+    if not mint:
+        return
+    try:
+        con = db()
+        con.execute("""INSERT INTO coins(mint, symbol, source, call_ts, mc_at_call, liq_at_call)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(mint) DO UPDATE SET
+                         symbol=COALESCE(coins.symbol, excluded.symbol),
+                         source=COALESCE(coins.source, excluded.source),
+                         call_ts=COALESCE(coins.call_ts, excluded.call_ts),
+                         mc_at_call=COALESCE(coins.mc_at_call, excluded.mc_at_call),
+                         liq_at_call=COALESCE(coins.liq_at_call, excluded.liq_at_call)""",
+                    (mint, symbol, channel, call_ts, mc, liq))
+        con.commit(); con.close()
+    except Exception:
+        pass
+
+# --- deep-cache (latency audit Oct 19, fix #4): AEGIS deep=True walks the deployer's
+# chain history (~46s). Cache the full report per mint for 1h so repeat deep scans
+# (paper monitor, re-alerts) are instant; first scan still warms it. ---
+DEEP_CACHE_TTL = 3600  # 1 hour
+
+def deep_cache_get(mint):
+    try:
+        con = db()
+        row = con.execute("SELECT report_json, ts FROM deep_cache WHERE mint=?", (mint,)).fetchone()
+        con.close()
+        if row and time.time() - row["ts"] <= DEEP_CACHE_TTL:
+            return json.loads(row["report_json"])
+    except Exception:
+        pass
+    return None
+
+def deep_cache_put(mint, report):
+    try:
+        con = db()
+        con.execute("INSERT OR REPLACE INTO deep_cache(mint, report_json, ts) VALUES(?,?,?)",
+                    (mint, json.dumps(report), time.time()))
+        con.commit(); con.close()
+    except Exception:
+        pass
