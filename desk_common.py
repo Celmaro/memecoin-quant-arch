@@ -495,6 +495,75 @@ def dex_pair(mint, allow_fallback=True, timeout=20, retries=3):
     pairs.sort(key=lambda p: (p.get("liquidity", {}).get("usd") or 0) + (p.get("volume", {}).get("h24") or 0), reverse=True)
     return pairs[0]
 
+
+# PumpData feed cache reader (Oct 20): primary paper-tick market source.
+# pumpdata_feed.py maintains an atomic pumpdata_cache.json of the desk's
+# watchlist mints (price/reserves/m5 buckets from the free keyless WS stream).
+CACHE_TTL_S = 120           # a watched mint fresh within 2min is usable (feed rows carry
+                            # last-trade price; still fresher & free vs dex polling)
+PUMPDATA_CACHE = os.path.join(DESK, "pumpdata_cache.json")
+_pumpdata_memo = {"t": 0.0, "data": None}
+
+
+def pumpdata_market(mint, max_age_s=CACHE_TTL_S):
+    """Feed-first market for a mint from the PumpData cache (no network).
+
+    Returns a dex_pair-shaped dict (priceUsd/marketCap/liquidity/priceChange/
+    txns/volume) + the raw reserves when the cache row is fresh; None when the
+    feed has no (fresh) row, so callers fall back to dex_pair. Never raises."""
+    try:
+        now = time.time()
+        memo = _pumpdata_memo
+        if now - memo["t"] > 2.0:
+            memo["data"] = json.load(open(PUMPDATA_CACHE))
+            memo["t"] = now
+        body = memo["data"] or {}
+    except Exception:
+        return None
+    row = (body.get("mints") or {}).get(mint)
+    if not row:
+        return None
+    row_t = float(row.get("t") or 0) / 1000.0
+    if not row_t or (time.time() - row_t) > max_age_s:
+        return None
+    px = float(row.get("px_usd") or 0)
+    if px <= 0:
+        return None
+    mc = float(row.get("mc_usd") or 0)
+    liq = float(row.get("liq_usd") or 0)
+    chg_m5 = row.get("chg_m5")
+    vol_m5 = float(row.get("vol_m5_usd") or 0)
+    vol_h1 = float(row.get("vol_h1_usd") or 0)
+    return {
+        "priceUsd": px,
+        "marketCap": mc,
+        "liquidity": {"usd": liq},
+        "priceChange": {"m5": chg_m5},           # feed-derived (None for fresh coins <5m)
+        "txns": {"m5": {"buys": int(row.get("b5") or 0), "sells": int(row.get("s5") or 0)}},
+        "volume": {"m5": vol_m5, "h1": vol_h1, "h24": None},   # h24 feed can't see — None
+        "baseToken": {"symbol": None},
+        "px_sol": row.get("px_sol"),
+        "tokensInPool": row.get("B"),
+        "quoteInPool": row.get("Q"),
+        "source": "pumpdata",
+    }
+
+
+def market_for(mint, timeout=10, retries=1):
+    """Paper-tick market fetch: PumpData feed FIRST, DexScreener fallback.
+    The feed is free/keyless/live; dex_pair remains the fallback so a missing or
+    stale cache row (quiet coin, feed down) never blocks the tick."""
+    try:
+        m = pumpdata_market(mint)
+        if m:
+            return m
+    except Exception:
+        pass
+    try:
+        return dex_pair(mint, allow_fallback=True, timeout=timeout, retries=retries) or {}
+    except Exception:
+        return {}
+
 def rugcheck(mint, full=False):
     cfg = load_config()
     url = RUGCHECK.format(mint, "/report" if full else "/report/summary") + f"?api_key={cfg['FLUX_KEY']}"

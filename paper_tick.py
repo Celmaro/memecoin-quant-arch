@@ -2,7 +2,7 @@
 """Paper-trade tick: mark positions to market, apply MC-adaptive exit engine, execute paper clips/exits."""
 import sys, json, time, os
 sys.path.insert(0, "/home/agentuser/memecoin-quant")
-from desk_common import dex_pair
+from desk_common import dex_pair, market_for
 import position_monitor as pm
 
 BOOK = "/home/agentuser/memecoin-quant/paper_book.json"
@@ -81,6 +81,39 @@ def save_book(b):
         os.fsync(f.fileno())
     os.replace(tmp, BOOK)
 
+_GATE_EMIT_FILE = os.path.expanduser("~/memecoin-quant/.gate_emit_state.json")
+
+def _gate_emit_ok(sym, reason, how, cooldown_s=300):
+    """Dedupe repeated GATE/no-market lines per (symbol, reason, stage-path).
+
+    USER-APPROVED Oct 20 (\"this feels like spam\"): the same blocked position was
+    printing 'GATE X: stage engine no-op' + '— nothing booked' EVERY tick for 30+
+    minutes. Now the FIRST block of a (sym, reason) prints, then the line is
+    suppressed for cooldown_s (300s). When the block clears, the real sell line
+    (EMERGENCY/EXIT) still prints — so you lose noise, never signal.
+    File-backed because the supervisor spawns a fresh paper_tick subprocess each
+    tick — in-memory state would reset every 2 minutes."""
+    key = f"{sym}|{reason}|{how}"
+    now = time.time()
+    try:
+        with open(_GATE_EMIT_FILE) as f:
+            st = json.load(f)
+    except Exception:
+        st = {}
+    last = float(st.get(key) or 0)
+    if now - last < cooldown_s:
+        return False
+    st[key] = now
+    # cap file growth
+    if len(st) > 500:
+        st = dict(sorted(st.items(), key=lambda kv: kv[1])[-300:])
+    tmp = _GATE_EMIT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, _GATE_EMIT_FILE)
+    return True
+
 def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=None, market_ts=None, liq=None):
     """UNIFIED paper sell: risk gate → reserve → stage-curve execute → attribution.
     Returns True if handled. stage1 = target 50% of original, stage3 = full exit.
@@ -102,8 +135,38 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
     allowed, gnotes = gate({"action": "SCALE_OUT" if stage == 1 else "FULL_EXIT",
                             "sell_fraction": frac}, b, key, market_ts=market_ts, quote_ts=None)
     if allowed in ("HOLD", "WAIT_RECONCILE"):
-        out.append(f"GATE {sym}: {reason} blocked — {'; '.join(gnotes)}")
+        if _gate_emit_ok(sym, reason, how):
+            out.append(f"GATE {sym}: {reason} blocked — {'; '.join(gnotes)}")
         return False
+    # USER-APPROVED (Oct 20): EMERGENCY exits at >=90% confidence BYPASS the
+    # reservation-hold. Previously a stale in-flight intent held the inventory
+    # and the fill deferred tick after tick (ZEE7 bled 0.89x → 0.11x while the
+    # engine screamed EMERGENCY_EXIT 92% every tick). High-confidence emergencies
+    # sell SAME TICK: force-release any foreign intent's stale rows, then sell.
+    is_emergency = ("EMERGENCY" in reason.upper() or "DEAD" in reason.upper() or "HARD_STOP" in reason.upper())
+    conf = 0.0
+    try:
+        # Oct 20 audit: confidence lives in the MONITOR dict (positions.json —
+        # position_monitor writes pos["last_decision"]), NOT in the book row.
+        # The book row has no last_decision key at all → reading it alone
+        # silently returned 0.0 and the force path never fired. Read monitor
+        # first (it is passed in as `pos`), fall back to the book row.
+        ld = (pos.get(mint) or {}).get("last_decision") or p.get("last_decision") or {}
+        conf = float(ld.get("confidence") or 0.0)
+    except Exception:
+        pass
+    force = is_emergency and conf >= 90.0
+    if force:
+        # Drain foreign reservations (rows NOT keyed to this exact intent) so the
+        # sell_delta computed below sees the FULL live position. Kept rows: ours.
+        keep_key = f"{key}:{how}{stage}"
+        rows = p.get("reservations") or []
+        kept = [r for r in rows if r.get("key") == keep_key]
+        if len(kept) != len(rows):
+            p["reservations"] = kept
+            p["reserved_exit_usd"] = round(sum(float(r.get("usd") or 0) for r in kept), 4)
+            save_book(b)
+            out.append(f"FORCE-EXIT {sym}: emergency ≥90% — drained {len(rows) - len(kept)} stale reservation(s)")
     # capture for attribution before position pops
     peak = float(p.get("peak_price") or 0); trough = float(p.get("trough_price") or 0)
     initial = float(p.get("initial_usd") or p["entry_usd"])
@@ -118,10 +181,12 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
     # reserve exactly the sellable slice the target curve needs
     want = sell_delta(b, key, stage)
     if want <= 0.0:
-        out.append(f"GATE {sym}: nothing to sell for stage{stage} (already on/under target)")
+        if _gate_emit_ok(sym, reason, how):
+            out.append(f"GATE {sym}: nothing to sell for stage{stage} (already on/under target)")
         return False
     if not reserve(b, key, want, intent_key=f"{key}:{how}{stage}"):
-        out.append(f"GATE {sym}: reservation failed (in-flight)")
+        if _gate_emit_ok(sym, reason, how):
+            out.append(f"GATE {sym}: reservation failed (in-flight)")
         return False
     # Fix 4 (Oct 19): for emergency exits, never book a deeper dump than the
     # tape confirms. Cap mult at the on-chain multiple when evidence says the
@@ -139,7 +204,8 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
     res = execute_stage(b, key, stage, mult_used, reason=reason, how=how, liq=liq)
     if not res:
         release(b, key, want, intent_key=f"{key}:{how}{stage}")
-        out.append(f"GATE {sym}: stage engine no-op")
+        if _gate_emit_ok(sym, reason, how):
+            out.append(f"GATE {sym}: stage engine no-op")
         return False
     if b.get("trades"):
         b["trades"][-1]["how"] = f"{how}_{reason.lower()}" if how == "decision" else f"{how}"
@@ -246,8 +312,8 @@ def auto_buy():
         if any(p["mint"] == mint for p in b["positions"].values()) or mint in seen_mints or mint in consumed:
             continue
         # FIX 3: minimum liquidity gate ($10K per user spec Oct 17) — below: skip+log
-        from desk_common import dex_pair
-        mkt = dex_pair(mint) or {}
+        from desk_common import market_for
+        mkt = market_for(mint) or {}
         liq = ((mkt.get("liquidity") or {}).get("usd")) or 0
         # P12 (Oct 20): first-seen MC extension gate (mirror entry_call) — never
         # enter a coin already pumped >=1.8x past its call-time MC.
@@ -394,7 +460,7 @@ def entry_call(d, b=None, aegis_score=None):
     aegis_boost = 1.0
     if aegis_score is not None and aegis_score >= 70:
         aegis_boost = 1.25  # mild position-size boost on strong contract/live signals
-    mkt = dex_pair(mint) or {}
+    mkt = market_for(mint) or {}
     liq = ((mkt.get("liquidity") or {}).get("usd")) or 0
     # P12 (Oct 20): first-seen MC extension gate — never chase a coin that has
     # already pumped >=1.8x past the MC printed at the channel call (M_now/M_0).
@@ -521,7 +587,9 @@ def main():
                                             # the moment the snapshot is fetched, not at decision end
         mkt = {}
         try:
-            mkt = dex_pair(mint, allow_fallback=False, timeout=10, retries=1) or {}
+            # PumpData feed FIRST (Oct 20): free keyless WS cache row, no network.
+            # Falls back to DexScreener when the cache is missing/stale.
+            mkt = market_for(mint, timeout=10, retries=1) or {}
         except Exception as e:
             # 429-blip resilience (Oct 19): ONE provider failure must not kill the
             # whole tick (that silently froze the desk for 25 min after a rate-limit
@@ -531,7 +599,9 @@ def main():
             continue
         px = mkt.get("priceUsd")
         if not px:
-            out.append(f"? {sym}: no market"); continue
+            if _gate_emit_ok(sym, "no_market", "main"):
+                out.append(f"? {sym}: no market")
+            continue
         px = float(px)
         _prices[mint] = px
         mc = mkt.get("marketCap") or 0
@@ -636,7 +706,8 @@ def main():
                 # the legacy inline branch which BOOKS the sale as if it succeeded.
                 if not frac_failed:
                     save_book(b); pm.save_positions(pos)
-                    out.append(f"GATE {sym}: fraction sell no-op (dust/hold/in-flight) — nothing booked")
+                    if _gate_emit_ok(sym, decision_action, "decision"):
+                        out.append(f"GATE {sym}: fraction sell no-op (dust/hold/in-flight) — nothing booked")
                     continue
                 stage = None  # only engine-unavailable reaches the legacy fallback
             if stage:
@@ -650,7 +721,8 @@ def main():
                 # (reservation failed, nothing to sell, engine verdict) — the legacy
                 # inline branch below must run ONLY when the stage engine is genuinely
                 # unavailable (import error), never to force a booked sale.
-                out.append(f"GATE {sym}: stage engine no-op — nothing booked")
+                if _gate_emit_ok(sym, decision_action, "decision"):
+                    out.append(f"GATE {sym}: stage engine no-op — nothing booked")
                 save_book(b); pm.save_positions(pos)
                 continue
             # fallback to legacy inline path ONLY if the stage engine is unavailable

@@ -16,7 +16,7 @@ Usage:
 """
 import json, sys, os, time, argparse
 from desk_common import (dex_pair, db, log_event, init_schema, rugcheck,
-                         coinstats_balance)
+                         coinstats_balance, market_for)
 from signals import token_intel, holder_growth, holder_churn, fresh_wallet_power
 import aegis
 
@@ -84,7 +84,7 @@ def analyze(mint, pos):
     """Exit-signal engine v2. Returns dict with signals + recommended action."""
     mkt_ts = time.time()  # audit P1.2 (Oct 18): market observation timestamp — captured at the
                           # moment the snapshot is fetched, before any slow intelligence calls.
-    pair = dex_pair(mint)
+    pair = market_for(mint)  # PumpData feed first (Oct 20), dex fallback
     if not pair:
         return {"ok": False, "signal": "DATA_UNAVAILABLE", "action": "MANUAL_CHECK"}
     px = float(pair.get("priceUsd") or 0)
@@ -639,7 +639,7 @@ def fmt(r):
 
 def cmd_add(args):
     pos = load_positions()
-    pair = dex_pair(args.mint)
+    pair = market_for(args.mint)  # PumpData feed first (Oct 20), dex fallback
     if not pair:
         print(f"ERROR: no pair data for {args.mint}"); return 1
     px = float(pair.get("priceUsd") or 0)
