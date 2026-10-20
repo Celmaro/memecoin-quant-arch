@@ -51,15 +51,15 @@ _outcome_replay.json
   telegram_messages.jsonl, aegis.db, paper_book.json, positions.json,
   pumpdata_cache.json, etc.)
 
-## FLAGGED (no action — tape evidence / user discretion)
+## FLAGGED → DELETED on user order (Oct 20 23:xx)
 
-- **`_grad_cache/` 3.3G + `_shrine_cache/` 1.5G** (4.8G total): Oct-10
-  graduate replay raw + filtered tapes. Both replay tools re-derive on demand
-  (raw `.jsonl.zst` re-downloadable from pumpapi.io / replay.shrine.trade;
-  `.filtered.jsonl` re-derivable from raw). Kept because user's tape-first
-  rule — the hours we downloaded are the audit evidence base. If disk pressure
-  matters more than re-download cost (~10 min/hour), safe to delete the raw
-  `.zst` pairs; ask user first.
+- **`_grad_cache/` 3.3G + `_shrine_cache/` 1.5G (4.8G total) DELETED** (user:
+  "i want them gone"). Both replay tools (`bot/audit/graduate_replay.py`,
+  `shrine_graduate_replay.py`) re-download on demand — verified
+  `if not os.path.exists(raw): download` path intact in both. Any future
+  graduate/shrine replay re-fetches from pumpapi.io / replay.shrine.trade
+  (~10 min/hour) and re-derives `.filtered.jsonl` from raw. Disk freed:
+  79% → 69% (15G free).
 - **`_replay_cache/` 862M** — the Oct-18/19 12h audit window. KEEP (core tape).
 - **cron jobs**: `memecoin-call-notifier`, `memecoin-scan-curator-watchdog`,
   `memecoin-paper-tick`, `replay-12h-backtest*`, `exit-verify*` all
