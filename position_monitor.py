@@ -48,6 +48,22 @@ EXIT_TIERS = [
 CONVICTION_MULT = 1.45
 CONVICTION_STOP_WIDEN = 1.15
 
+# TIME EXITS (Oct 21, CHARON A4/4.1 — validated externally and on our own tape):
+# MAX_HOLD_S: hard time exit — sell at market once a position is this old.
+# The retuned ladder (TP2.0/SL0.75) fixes the stop-then-run leak but still lets
+# a dying coin ride to its 0.75 stop after the action is gone. Charon's
+# 1,146-trade backtest: MAX_HOLD 334 trades at +1.1% avg is what keeps the book
+# from bleeding while killers die. Our STRATEGY_COMPARE (Oct 10 engine replay):
+# +180s time exit flips -15.2%/trade -> -1.6%, win 28% -> 53%. Default 300s =
+# 5min (quick-flip horizon; lower MC flips faster per CONFIG). Conviction holds
+# get the longer user horizon (2h).
+# SIDEWAYS_S: + SIDEWAYS_PNL_PCT: stale-position exit — open N minutes with
+# pnl stuck near zero frees capital instead of waiting for a move.
+MAX_HOLD_S = 300
+MAX_HOLD_CONVICTION_S = 7200   # 2h = user's max horizon for conviction holds
+SIDEWAYS_S = 600
+SIDEWAYS_PNL_PCT = 2.0
+
 ROUND_NUMS = [25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000]
 
 
@@ -219,6 +235,37 @@ def analyze(mint, pos):
     if tot5 >= 8 and b5 / tot5 > 0.7 and chg_m5 < 1:
         signals.append(f"DIVERGENCE: {b5}B/{s5}S but price flat — absorption, whales exiting")
         if action == "HOLD": action = "CLIP_50"
+
+    # --- TIME EXITS (Oct 21, Charon A4/4.1) ---
+    # MAX_HOLD: hard time exit for the quick-flip horizon; conviction holds get
+    # the 2h user horizon. SIDEWAYS is the smarter EARLY exit (flat + old enough
+    # frees capital) so it is checked FIRST; MAX_HOLD is the hard cap for
+    # positions that are still moving. Sticky floors (hard stop / emergency)
+    # already fired above and must NOT be downgraded.
+    hold_s = MAX_HOLD_CONVICTION_S if conviction else MAX_HOLD_S
+    age_s = age_min * 60
+    if action in ("HOLD", "CLIP_50"):
+        if age_s >= SIDEWAYS_S and abs(pnl_pct) < SIDEWAYS_PNL_PCT:
+            signals.append(f"SIDEWAYS: {age_s/60:.0f}min open, |pnl| {abs(pnl_pct):.1f}% < {SIDEWAYS_PNL_PCT}% — frees capital")
+            action = "EXIT_ALL"
+            pos["time_exit_triggered"] = True
+        elif age_s >= hold_s:
+            signals.append(f"MAX_HOLD: {age_s/60:.0f}min >= {hold_s/60:.0f}min — time exit (quick-flip horizon)")
+            action = "EXIT_ALL"
+            pos["time_exit_triggered"] = True
+
+    # --- ATH-PROXIMITY CLIP (Oct 21, Charon topBlastRisk) ---
+    # Charon: current/rangeHigh >= 0.85 = top-blast risk zone (within 15% of the
+    # run's high, momentum fading -> round-trip risk). Complements round_stall
+    # (85-95% of a ROUND number); this catches cliffs BELOW the high-water mark.
+    try:
+        _peak = float(pos.get("peak_price") or entry_px or 0)
+        if _peak > 0 and px / _peak >= 0.85 and (chg_m5 or 0) < 2 and vol_m5 > 0:
+            signals.append(f"ATH_PROXIMITY: px at {px/_peak*100:.0f}% of peak ${_peak} — momentum fading, round-trip risk")
+            if action == "HOLD": action = "CLIP_50"
+            if (chg_m5 or 0) <= -2: action = "EXIT_ALL"
+    except Exception:
+        pass
 
     # --- Behavior-index override (who's behind it) ---
     try:

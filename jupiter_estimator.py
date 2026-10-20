@@ -97,6 +97,44 @@ def quote(mint, usd=20, slippage_bps=500):
     }
 
 
+def quote_fill(mint, usd=20, slippage_bps=500, timeout=6, retries=1):
+    """Fill-to-fill paper pricing (Oct 21, Charon A1): bounded Jupiter quote for a
+    paper ENTRY fill. Returns (fill_px, impact_pct, fee_usd, via) or None.
+
+    fill_px = usd_in / out_tokens — the REAL per-token price a $usd order would
+    land at (impact included). The feed price stays the DECISION mark; this is
+    the FILL price. HARD-BOUNDED by a worker thread (quote()'s own http_json
+    default is 20s x 3 retries — too slow for the paper tick; a hung quote must
+    fall back to the 1% latency slip, never block the tick).
+
+    NOTE: quote() itself is used for reporting with generous budgets; this is
+    the entry-path variant that must never block the tick."""
+    import threading
+    _box = {}
+
+    def _work():
+        try:
+            from jupiter_estimator import quote as _quote
+            _box["r"] = _quote(mint, usd=usd, slippage_bps=slippage_bps)
+        except Exception:
+            _box["r"] = None
+
+    th = threading.Thread(target=_work, daemon=True)
+    th.start()
+    th.join(timeout)  # hard ceiling: paper tick never waits longer than `timeout`
+    if th.is_alive():
+        return None  # quote hung (Jupiter down/flaky) — caller falls back to slip
+    r = _box.get("r")
+    if not isinstance(r, dict) or r.get("via") != "jupiter" or r.get("error"):
+        return None
+    out_tok = float(r.get("out_tokens") or 0)
+    if out_tok <= 0:
+        return None
+    fill_px = usd / out_tok
+    return (fill_px, float(r.get("price_impact_pct") or 0),
+            float(r.get("fee_drag_usd") or 0), "jupiter")
+
+
 def quote_impact(mint, usd=20):
     """Returns price impact as a FRACTION (0.05 = 5%) for a $usd buy, or None.
 

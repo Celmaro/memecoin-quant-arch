@@ -239,6 +239,100 @@ try:
 except Exception as e:
     check("Doc2-7 dust test", "ERR " + str(e)[:60], "no-exception")
 
+# --- Oct 21 CHARON ROUND: time exits + ATH-proximity in the monitor engine ---
+# analyze() is network-heavy; stub every provider so the DECISION logic is what
+# we test, not live data. Same pattern as the scaleout tests (temp book + stubs).
+try:
+    import time as _t
+    import position_monitor as _pm
+    import desk_common as _dc
+
+    _F = {"priceUsd": 1.2e-6, "marketCap": 80_000, "liquidity": {"usd": 25_000},
+          "priceChange": {"m5": 0.5}, "volume": {"m5": 5_000, "h1": 20_000},
+          "txns": {"m5": {"buys": 10, "sells": 5}}, "baseToken": {"symbol": "T"}}
+
+    def _stub_analyze():
+        _pm.market_for = lambda mint, **kw: dict(_F)
+        # provider stubs — every call analyze makes should return empty/neutral fast
+        for name in ("token_intel", "holder_growth", "holder_churn", "fresh_wallet_power"):
+            if hasattr(_pm, name): setattr(_pm, name, lambda *a, **k: {})
+        if hasattr(_pm, "rugcheck"): _pm.rugcheck = lambda *a, **k: {}
+        if hasattr(_pm, "coinstats_balance"): _pm.coinstats_balance = lambda *a, **k: []
+        for name in ("shyft_failed_txs", "fomo_devs_stats", "blix_holders", "blix_alive",
+                     "blix_coin_trades", "blix_narratives", "blix_market", "blix_signal_track"):
+            setattr(_dc, name, lambda *a, **k: ({} if name != "blix_alive" else False))
+        # aegis strategy lookup neutral
+        try:
+            _pm.aegis.strategy_for = lambda mint: "default"
+        except Exception:
+            pass
+        # bot.intelligence layers: all neutral/empty
+        for mod, fn in [("bot.intelligence.exit_intel", "exit_intel"),
+                        ("bot.intelligence.microstructure", "microstructure"),
+                        ("bot.intelligence.wallet_intel", "wallet_distribution_signal"),
+                        ("bot.intelligence.cohort", "cohort_signal_for"),
+                        ("bot.intelligence.event_alerts", "detect_all"),
+                        ("bot.intelligence.lifecycle", "classify"),
+                        ("bot.intelligence.thesis", "evaluate")]:
+            try:
+                import importlib
+                m = importlib.import_module(mod)
+                if mod.endswith("lifecycle"): setattr(m, "classify", lambda *a, **k: (None, []))
+                elif mod.endswith("thesis"): setattr(m, "evaluate", lambda *a, **k: {})
+                elif mod.endswith("event_alerts"): setattr(m, "detect_all", lambda *a, **k: [])
+                else: setattr(m, fn, lambda *a, **k: None)
+            except Exception:
+                pass
+        try:
+            import bot.decision_engine as _de
+            _de.decide = lambda *a, **k: {"action": "HOLD", "sell_fraction": 0, "confidence": 50,
+                                          "thesis_state": "neutral", "reason_codes": []}
+            import bot.decision_engine.evidence_ttl as _ettl
+            _ettl.weight_signals = lambda *a, **k: ([], [])
+            _ettl.historical_weight_signals = lambda *a, **k: ([], [])
+            import bot.persistence as _bp
+            _bp.log_decision = lambda *a, **k: None
+            _bp.log_evidence = lambda *a, **k: None
+            _bp.wallet_history_add = lambda *a, **k: None
+            import bot.decision_engine.risk_gate as _rg
+            _rg.gate = lambda *a, **k: ("SCALE_OUT", ["stub"])
+        except Exception:
+            pass
+
+    _stub_analyze()
+
+    def _mk(age_s, peak=None, px=None):
+        d = {"entry_px": 1e-6, "size": 20.0, "ts": _t.time() - age_s, "symbol": "T", "mint": "X"}
+        if peak: d["peak_price"] = peak
+        if px: d["px_override"] = px
+        return d
+
+    r = _pm.analyze("X", _mk(360))  # 6min old, +20% pnl, non-conviction -> MAX_HOLD
+    check("A4 MAX_HOLD fires EXIT_ALL", r.get("action"), "EXIT_ALL")
+    check("A4 MAX_HOLD signal present", any("MAX_HOLD" in s for s in r.get("signals", [])), True)
+
+    _F["priceUsd"] = 1.03e-6  # net pnl after 3% display fee ≈ -0.1% (flat) -> SIDEWAYS reachable
+    r2 = _pm.analyze("X", _mk(700))  # 11.7min old, flat -> SIDEWAYS (checked before MAX_HOLD)
+    check("A4 SIDEWAYS fires EXIT_ALL", r2.get("action"), "EXIT_ALL")
+    check("A4 SIDEWAYS signal present", any("SIDEWAYS" in s for s in r2.get("signals", [])), True)
+    _F["priceUsd"] = 1.2e-6
+
+    r3 = _pm.analyze("X", _mk(30))  # fresh + no peak -> HOLD, no time signal
+    check("A4 fresh pos no time exit", any("MAX_HOLD" in s or "SIDEWAYS" in s for s in r3.get("signals", [])), False)
+
+    # ATH proximity: peak_price higher than current px (72% => NOT within 15% -> no clip)
+    _F["priceUsd"] = 1.0e-6
+    r4 = _pm.analyze("X", _mk(30, peak=1.4e-6))
+    check("A7 ATH far from peak no clip", any("ATH_PROXIMITY" in s for s in r4.get("signals", [])), False)
+    # within 15% of peak + flat chg => clip
+    _F["priceUsd"] = 1.3e-6  # 93% of 1.4e-6 peak
+    r5 = _pm.analyze("X", _mk(30, peak=1.4e-6))
+    check("A7 ATH_PROXIMITY clips 50%", r5.get("action"), "CLIP_50")
+    check("A7 ATH_PROXIMITY signal present", any("ATH_PROXIMITY" in s for s in r5.get("signals", [])), True)
+    _F["priceUsd"] = 1.2e-6
+except Exception as e:
+    check("A4/A7 time-exit+ATH test", "ERR " + str(e)[:80], "no-exception")
+
 print()
 print("FAILURES:", failures if failures else "NONE — all decision-engine regressions pass")
 sys.exit(1 if failures else 0)

@@ -353,13 +353,6 @@ def auto_buy():
             b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                                 "why": f"seller_flood_{b5}B/{s5}S_5m"})
             continue
-        # Doc2-8 (fill realism): paper entries fill at a small latency slip above the
-        # observed price, modeling front-running by same-second bots. 1% slip.
-        FILL_LATENCY_SLIP_PCT = 1.0
-        px = float(px) * (1 + FILL_LATENCY_SLIP_PCT / 100)
-        # Resolve real symbol from market data when the call record lacks one
-        if sym == "?" or sym == "None":
-            sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
         # FIX 2: confluence size booster — 2+ channels => max size regardless of channel
         # Oct 19: real confluence from ledger (see entry_call for rationale)
         conf = 1
@@ -378,6 +371,27 @@ def auto_buy():
             b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                                 "why": f"insufficient_cash_${b['cash']:.2f}"})
             break
+        # Resolve real symbol from market data when the call record lacks one
+        if sym == "?" or sym == "None":
+            sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
+        # FILL-TO-FILL (Oct 21, Charon A1): prefer a REAL Jupiter buy quote when
+        # available (fill px = usd/out_tokens, impact + fee included); the 1% slip
+        # is only the fallback when the quote is missing/stale. Runs AFTER size is
+        # final so the quote sizes the exact order. Feed price stays the decision
+        # mark — this is the FILL price only.
+        FILL_LATENCY_SLIP_PCT = 1.0
+        _fill = None
+        try:
+            from jupiter_estimator import quote_fill
+            _fill = quote_fill(mint, usd=size, slippage_bps=500)
+        except Exception:
+            _fill = None
+        if _fill:
+            px = _fill[0]  # real per-token fill price incl. impact
+            _fill_note = f"fill={_fill[1]:.1f}%imp ${_fill[2]:.2f}fee"
+        else:
+            px = float(px) * (1 + FILL_LATENCY_SLIP_PCT / 100)
+            _fill_note = "fill=1%slip"
         b["positions"][mint] = {"mint": mint, "symbol": sym, "entry_px": float(px), "size_usd": size,
                                "entry_usd": size, "initial_usd": size, "opened": time.time(),
                                "state": "full", "age_at_buy": age, "reserved_exit_usd": 0.0,
@@ -388,7 +402,8 @@ def auto_buy():
                                # monitor's liq-collapse / volume-drying rules compare entry->now
                                "entry_liq": ((mkt.get("liquidity") or {}).get("usd")) or 0,
                                "entry_vol_h1": (mkt.get("volume") or {}).get("h1") or 0,
-                               "entry_mc": float(mkt.get("marketCap") or 0)}
+                               "entry_mc": float(mkt.get("marketCap") or 0),
+                               "fill_note": _fill_note}
         _note_fill(mint, age)  # Oct 20: populate coins.fill_time_min (was 0% filled)
         b["cash"] = round(b["cash"] - size, 2)
         seen_mints.add(mint)
@@ -400,7 +415,7 @@ def auto_buy():
                                      "msg_id": d.get("msg_id"), "ts": time.time()}) + "\n")
         except Exception:
             pass
-        bought.append(f"BUY ${sym} @ ${px} (${size:.0f}, call {age/60:.0f}m old, {conf}ch{' ⚡confluence' if conf >= 2 else ''}) {mint[:10]}")
+        bought.append(f"BUY ${sym} @ ${px} (${size:.0f}, call {age/60:.0f}m old, {conf}ch{' ⚡confluence' if conf >= 2 else ''}, {_fill_note}) {mint[:10]}")
         import position_monitor as _pm
         pos = _pm.load_positions()
         # audit P1.1 (Oct 18): copy entry baselines into the monitor ledger so the monitor
@@ -501,8 +516,7 @@ def entry_call(d, b=None, aegis_score=None):
                                             "why": f"seller_flood_{b5}B/{s5}S_5m"})
         save_book(b)
         return None, f"seller_flood_{b5}B/{s5}S_5m"
-    FILL_LATENCY_SLIP_PCT = 1.0
-    px = float(px) * (1 + FILL_LATENCY_SLIP_PCT / 100)
+    FILL_LATENCY_SLIP_PCT = 1.0  # defined here; used in the fill block after size is final
     if sym == "?" or sym == "None":
         sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
     # Oct 19 fix: REAL cross-channel confluence (ledger-based). The listener
@@ -524,6 +538,21 @@ def entry_call(d, b=None, aegis_score=None):
                                             "why": f"insufficient_cash_${b['cash']:.2f}"})
         save_book(b)
         return None, f"insufficient_cash_${b['cash']:.2f}"
+    # FILL-TO-FILL (Oct 21, Charon A1): quote AFTER size is final (aegis_boost/
+    # confluence/cash all applied) so the real fill price sizes the exact order.
+    FILL_LATENCY_SLIP_PCT = 1.0
+    _fill = None
+    try:
+        from jupiter_estimator import quote_fill
+        _fill = quote_fill(mint, usd=size, slippage_bps=500)
+    except Exception:
+        _fill = None
+    if _fill:
+        px = _fill[0]  # real per-token fill price incl. impact
+        _fill_note = f"fill={_fill[1]:.1f}%imp ${_fill[2]:.2f}fee"
+    else:
+        px = float(px) * (1 + FILL_LATENCY_SLIP_PCT / 100)
+        _fill_note = "fill=1%slip"
     # P11 (Oct 20): close the risk-gate bypass — the instant_trigger path called
     # entry_call directly and never consulted the exposure cap that risk_gate
     # enforces on the cron path. Same $200 face exposure limit here.
@@ -545,7 +574,8 @@ def entry_call(d, b=None, aegis_score=None):
                            "stages_done": [], "peak_price": float(px), "trough_price": float(px),
                            "entry_liq": liq,
                            "entry_vol_h1": (mkt.get("volume") or {}).get("h1") or 0,
-                           "entry_mc": float(mkt.get("marketCap") or 0)}
+                           "entry_mc": float(mkt.get("marketCap") or 0),
+                           "fill_note": _fill_note}
     _note_fill(mint, max(0, age))  # Oct 20: populate coins.fill_time_min (was 0% filled)
     b["cash"] = round(b["cash"] - size, 2)
     try:
@@ -562,7 +592,7 @@ def entry_call(d, b=None, aegis_score=None):
                  "entry_mc": float(mkt.get("marketCap") or 0)}
     _pm.save_positions(pos)
     save_book(b)
-    line = f"🛒 PAPER BUY ${sym} @ ${px} (${size:.0f}, call {max(0,age):.0f}m old, {conf}ch{' ⚡confluence' if conf >= 2 else ''}) {mint[:10]}"
+    line = f"🛒 PAPER BUY ${sym} @ ${px} (${size:.0f}, call {max(0,age):.0f}m old, {conf}ch{' ⚡confluence' if conf >= 2 else ''}, {_fill_note}) {mint[:10]}"
     return line, None
 
 
@@ -650,6 +680,10 @@ def main():
                                            "ts": p.get("opened", time.time()), "paper": True,
                                            "symbol": sym, "entry_liq": p.get("entry_liq"),
                                            "entry_vol_h1": p.get("entry_vol_h1")}
+                # Oct 21 (Charon topBlastRisk): give monitor the high-water mark so
+                # the ATH_PROXIMITY clip works from the same peak the book tracks.
+                if p.get("peak_price"):
+                    mp["peak_price"] = p["peak_price"]
                 # audit P1.1 (Oct 18): ALWAYS backfill immutable entry baselines from the book
                 # into the monitor record so a stale/missing monitor row never infers entry
                 # conditions from current market data.
@@ -753,10 +787,25 @@ def main():
         # ---- fallback tier engine (Build 5: BACKGROUND moonbags skip deep analyze) ----
         clip1, tp1, tp2, stop = tier_exits(mc)
         action = "HOLD"
-        # FIX #5: stale-hold rule — quick flips only. Any position open >3h closes at market.
-        age_h = (time.time() - p.get("opened", time.time())) / 3600
-        if age_h > 3:
-            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="STALE", how="stale", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
+        # Oct 21 (Charon A4): TIME EXITS in the fallback engine too — MAX_HOLD
+        # replaces the old flat 3h STALE rule: quick flips close at MAX_HOLD_S
+        # (default 5min), conviction holds get MAX_HOLD_CONVICTION_S (2h). The
+        # monitor engine fires these for deep-analyzed positions; this keeps
+        # BACKGROUND moonbags (which skip deep analyze) on the same clock.
+        try:
+            from position_monitor import MAX_HOLD_S, MAX_HOLD_CONVICTION_S, SIDEWAYS_S, SIDEWAYS_PNL_PCT
+        except Exception:
+            MAX_HOLD_S, MAX_HOLD_CONVICTION_S, SIDEWAYS_S, SIDEWAYS_PNL_PCT = 300, 7200, 600, 2.0
+        age_s = time.time() - p.get("opened", time.time())
+        _conv = bool(p.get("conviction")) or p.get("strategy") == "conviction_hold"
+        hold_s = MAX_HOLD_CONVICTION_S if _conv else MAX_HOLD_S
+        stale_reason = None
+        if age_s >= hold_s:
+            stale_reason = f"MAX_HOLD ({age_s/60:.0f}min >= {hold_s/60:.0f}min)"
+        elif state == "full" and age_s >= SIDEWAYS_S and abs((mult - 1) * 100) < SIDEWAYS_PNL_PCT:
+            stale_reason = f"SIDEWAYS ({age_s/60:.0f}min, |pnl| {abs((mult-1)*100):.1f}% < {SIDEWAYS_PNL_PCT}%)"
+        if stale_reason:
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason=stale_reason, how="time", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
         if state == "full" and mult <= 1 + stop:
@@ -811,7 +860,34 @@ def main():
         psize = float(p.get("size_usd") or 0)
         held.append(f"${psym} (${psize:.2f})")
     held_note = f" Held: {', '.join(held)}." if held else ""
+    # Oct 21 (mortdeus riskManager-style): risk level for the DM line — daily
+    # realized PnL proximity to the $20 daily stop, open-position concentration,
+    # and win rate. Gives the desk a visible "stop for the day" state.
+    try:
+        t0_day = time.time() - time.time() % 86400
+        day_pnl = round(sum(float(t.get("pnl") or 0) for t in b.get("trades", [])
+                            if float(t.get("ts") or 0) >= t0_day), 2)
+        day_loss_pct = min(100, max(0, -day_pnl / 20 * 100))  # /$20 daily stop
+        n_open = len(b.get("positions", {}))
+        conc = min(100, n_open / 5 * 100)  # /max 5 positions
+        tr = b.get("trades", [])
+        wr = (sum(1 for t in tr if float(t.get("pnl") or 0) > 0) / max(1, len(tr)) * 100)
+        risk = 0
+        risk += day_loss_pct * 0.5
+        risk += conc * 0.3
+        if wr < 30: risk += 25
+        elif wr < 40: risk += 12
+        lvl = "HIGH" if risk >= 60 else ("MEDIUM" if risk >= 30 else "LOW")
+        day_note = f"⚖️ risk {lvl} (day ${day_pnl:+.2f}/−$20, {n_open}/5 open, wr {wr:.0f}%)"
+        if day_pnl <= -20:
+            day_note += " 🛑 DAILY STOP — no new entries 24h"
+        elif day_pnl <= -16:
+            day_note += " ⚠️ near daily stop"
+    except Exception:
+        day_note = ""
     out.append(f"💼 Paper account: ${eq:.2f} (started ${b['start']:.0f}, {'+' if gain>=0 else ''}{gpct:.0f}% — {mood}). Waiting cash: ${cash:.2f}. Coins held: {len(b['positions'])}.{held_note} Still need ${need:.2f} to reach the $500 goal.")
+    if day_note:
+        out.append(day_note)
     blob = "\n".join(out)
     # 3-min heartbeat: DM the book summary even with no action (user-approved Oct 19;
     # user requested 1m → 3m cadence). Action lines (BUY/EXIT/skip) still send immediately.
