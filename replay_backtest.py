@@ -20,7 +20,7 @@ Pipeline:
      Fees 3% on every sell (Doc1-1).
   5. Report per-mint: entry/exit mults, PnL, vs actual live outcome (paper book).
 """
-import json, os, sys, time, collections, argparse, urllib.request
+import json, os, sys, time, collections, argparse, urllib.request, hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 DESK = os.path.expanduser("~/memecoin-quant")
@@ -47,7 +47,11 @@ def fetch_zst(path, mint_set, limit=8_000_000, reuse_any=False):
         return []
     url = REPLAY.format(path)
     cache_dir = os.path.join(DESK, "_replay_cache")
-    cache_file = os.path.join(cache_dir, path.replace("/", "_") + f".{len(mint_set)}mints.jsonl")
+    # P7 (Oct 20): key by mint-SET hash, not len(mint_set). Two runs with different
+    # 179-mint sets both produced ".179mints.jsonl" → the second run silently read
+    # the FIRST file as if it were its own full tape (partial filtered cache).
+    mint_key = hashlib.sha256(",".join(sorted(mint_set)).encode()).hexdigest()[:16]
+    cache_file = os.path.join(cache_dir, path.replace("/", "_") + f".{mint_key}.jsonl")
     try:
         os.makedirs(cache_dir, exist_ok=True)
         if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
@@ -61,19 +65,29 @@ def fetch_zst(path, mint_set, limit=8_000_000, reuse_any=False):
         # Oct 19 (user "from the tape"): reuse ANY existing cache file for this
         # hour even if it was keyed by a different mint-count — avoids re-
         # downloading hours we already have on disk.
+        # P7 (Oct 20): merge ALL per-hour cache files, not the first. Each old
+        # file holds a DIFFERENT filtered slice (one mint set); taking one loses
+        # the other mints' events (partial cache misread as full tape).
         if reuse_any:
             prefix = path.replace("/", "_")
+            merged = {}
             for cand in sorted(os.listdir(cache_dir)):
-                if cand.startswith(prefix + ".") and cand.endswith("mints.jsonl"):
+                if cand.startswith(prefix + ".") and cand.endswith(".jsonl"):
                     candp = os.path.join(cache_dir, cand)
                     if os.path.getsize(candp) > 0:
-                        out = []
                         for line in open(candp):
                             try:
-                                out.append(_slim(json.loads(line)))
+                                e = _slim(json.loads(line))
+                                # P7: dedupe by (mint, timestamp) — the same event
+                                # can appear in overlapping cache slices; keep every
+                                # DISTINCT event (the full price path, not one per
+                                # mint — "last event wins" destroyed the tape).
+                                merged[(e["mint"], e.get("timestamp"))] = e
                             except Exception:
                                 continue
-                        return out
+            out = sorted(merged.values(), key=lambda e: e.get("timestamp", 0) or 0)
+            if out:
+                return out
     except Exception:
         cache_file = None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -170,33 +184,36 @@ def replay_mint(call, events, verbose=False):
     _, tp1, tp2, stop = tier
     share = 1.0
     clip1_done = False
+    pnl_acc = 0.0  # P6 (Oct 20): accumulate clip profit across the walk
     for g in grouped[fill_idx + 1:]:
         if g["price"] is None:
             continue
         mult = g["price"] / fill_px
         # hard stop
         if mult <= (1 - stop):
-            pnl = share * (mult - 1) * 100 - share * FEE_PCT
+            # P6: fee on PROCEEDS (share*mult), not principal share; add prior clip profit
+            pnl = pnl_acc + share * (mult - 1) * 100 - share * mult * FEE_PCT
             return pnl, "STOP", f"mult={mult:.2f} stop={stop}"
         # tp2 (sell remaining)
         if clip1_done and mult >= tp2:
-            pnl = share * (mult - 1) * 100 - share * FEE_PCT
+            pnl = pnl_acc + share * (mult - 1) * 100 - share * mult * FEE_PCT
             return pnl, "TP2", f"mult={mult:.2f} tp2={tp2}"
         # tp1 (clip 50%)
         if not clip1_done and mult >= tp1:
-            pnl_clip = 0.5 * (mult - 1) * 100 - 0.5 * FEE_PCT
+            pnl_clip = 0.5 * (mult - 1) * 100 - 0.5 * mult * FEE_PCT
+            pnl_acc += pnl_clip  # P6: carry the realized clip into later outcomes
             share = 0.5
             clip1_done = True
         # horizon
         if g["ts"] - (entry_ts * 1000) >= MAX_HORIZON_S * 1000:
-            pnl = share * (mult - 1) * 100 - share * FEE_PCT
+            pnl = pnl_acc + share * (mult - 1) * 100 - share * mult * FEE_PCT
             return pnl, "HORIZON", f"mult={mult:.2f}"
     # no exit condition hit: value at last price
     last = grouped[-1]["price"]
     if last is None:
         return None, "no_last", ""
     mult = last / fill_px
-    pnl = share * (mult - 1) * 100 - share * FEE_PCT
+    pnl = pnl_acc + share * (mult - 1) * 100 - share * mult * FEE_PCT
     return pnl, "OPEN", f"mult={mult:.2f}"
 
 
@@ -214,11 +231,14 @@ def load_live_outcome(mint):
     return None, 0
 
 
+# Oct 20 OFF tape retune — mirrors position_monitor.EXIT_TIERS (single source).
+# Old ladder was stop-then-run suicide on this tape (65% dip <0.85 before 1.30);
+# TP2.0/SL0.75 flips -3.9%/call -> +5.2%. No 1.10 clip.
 EXIT_TIERS = [
-    (0,        1.10, 1.30, 0.15),
-    (40_000,   1.15, 1.35, 0.18),
-    (150_000,  1.20, 1.45, 0.22),
-    (1_500_000,1.30, 1.60, 0.28),
+    (0,        2.00, 2.50, 0.25),
+    (40_000,   2.00, 2.50, 0.25),
+    (150_000,  2.20, 2.80, 0.25),
+    (1_500_000,2.50, 3.00, 0.25),
 ]
 
 

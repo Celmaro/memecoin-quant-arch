@@ -70,13 +70,20 @@ try:
     res = so.execute_stage(book, "TEST2", 3, 1.1, reason="EMERGENCY", how="decision")
     # only the decision3 reservation ($80) should be consumed, not the other3 ($20)
     check("P1 reservation isolation sold 80 (not 100)", res["sold_usd"], 80.0)
-    check("P1 other-intent reservation released (not double-spent)",
-          book["positions"].get("TEST2", {}).get("reserved_exit_usd", 0.0), 0.0)
+    # P2 (Oct 20): the other-intent reservation ($20, key other3) must SURVIVE —
+    # it was reserved by a different intent and was not sold. Old code zeroed the
+    # whole pool, silently discarding the unsold lock (stranded basis).
+    check("P2 other-intent reservation survives (20 not zeroed)",
+          book["positions"].get("TEST2", {}).get("reserved_exit_usd", -1.0), 20.0)
     # audit P0.4 (Oct 18): a stage-3 exit with a residual $20 basis must NOT discard the
     # residual position (it still has sellable value + cash owed). It stays tracked.
     check("P0.4 residual basis stays tracked after partial stage-3",
           book["positions"].get("TEST2", {}).get("entry_usd"), 20.0)
     check("P0.4 closed only when basis depleted", res.get("closed"), False)
+    # P2 (Oct 20): the residual $20 must be CLOSABLE once its own reservation is
+    # sold — a done stage with sellable basis re-enters (self-healing), never strands.
+    res2 = so.execute_stage(book, "TEST2", 3, 1.1, reason="EMERGENCY", how="other")
+    check("P2 residual stage-3 re-enters (not stuck on done)", res2 is not None, True)
 except Exception as e:
     check("P1 reservation isolation setup", "ERR " + str(e)[:60], "no-exception")
 
@@ -159,7 +166,8 @@ try:
 except Exception as e:
     check("Doc1-1 fee test", "ERR " + str(e)[:60], "no-exception")
 
-# --- Doc1-4: sub-$1K liq exit = unsellable total loss (proceeds 0) ---
+# --- Doc1-4 (Oct 19 FIX): sub-$1K liq exit requires 2 CONFIRMED reads ---
+# liq=400 is a confirmed-low FIRST read -> HOLD (streak=1), no write-off
 try:
     import json
     from bot.position_manager import scaleout as so
@@ -169,11 +177,51 @@ try:
                    "peak_price": 1e-6, "trough_price": 1e-6}}}
     so.load_book = lambda: json.loads(json.dumps(book))
     so.save_book = lambda b: None
-    res = so.execute_fraction(book, "ILLIQ1", 1.0, 0.8, reason="STOP", how="frac", liq=400.0)
-    check("Doc1-4 unsellable -> total loss pnl", res["pnl"], -50.0)
+    res1 = so.execute_fraction(book, "ILLIQ1", 1.0, 0.8, reason="STOP", how="frac", liq=400.0)
+    check("Doc1-4 first low-liq read -> HOLD (None)", res1, None)
+    check("Doc1-4 no write-off on first read", len(book.get("trades") or []), 0)
+    check("Doc1-4 streak=1 after first read", book["positions"]["ILLIQ1"].get("_low_liq_streak"), 1)
+    # SECOND consecutive confirmed-low read -> now the total loss books.
+    # P3 (Oct 20): the streak counts INDEPENDENT reads only — two executor calls
+    # in the SAME tick share one snapshot and must NOT double-bump. Simulate the
+    # next tick (>=60s later) by clearing the bump timestamp.
+    book["positions"]["ILLIQ1"]["_low_liq_bump_ts"] = 0.0
+    res2 = so.execute_fraction(book, "ILLIQ1", 1.0, 0.8, reason="STOP", how="frac", liq=400.0)
+    check("Doc1-4 second low-liq read -> total loss pnl", res2["pnl"], -50.0)
     check("Doc1-4 illiq flag set", (book.get("trades") or [{}])[-1].get("illiq"), True)
+    check("Doc1-4 reason has UNSELLABLE", "+UNSELLABLE" in (book.get("trades") or [{}])[-1].get("reason", ""), True)
+    # P3 (Oct 20): SAME-TICK double read must NOT bump the streak to 2
+    book2 = {"cash": 0.0, "realized": 0.0, "positions": {
+        "ILLIQ3": {"mint": "illiq3", "entry_px": 1e-6, "entry_usd": 50.0, "size_usd": 50.0,
+                   "initial_usd": 50.0, "state": "full", "stages_done": [], "reserved_exit_usd": 0.0,
+                   "peak_price": 1e-6, "trough_price": 1e-6}}}
+    so.load_book = lambda: json.loads(json.dumps(book2))
+    so.save_book = lambda b: None
+    so.execute_fraction(book2, "ILLIQ3", 1.0, 0.8, reason="STOP", how="frac", liq=400.0)
+    so.execute_fraction(book2, "ILLIQ3", 1.0, 0.8, reason="STOP", how="frac", liq=400.0)
+    check("P3 same-tick low-liq reads do NOT double-bump", book2["positions"]["ILLIQ3"].get("_low_liq_streak"), 1)
+    check("P3 same-tick still HOLD (no premature write-off)", len(book2.get("trades") or []), 0)
 except Exception as e:
     check("Doc1-4 unsellable test", "ERR " + str(e)[:60], "no-exception")
+
+# --- Doc1-4b: a single liq=0 (API miss / unknown) NEVER writes off, even repeatedly
+try:
+    import json
+    from bot.position_manager import scaleout as so
+    book = {"cash": 0.0, "realized": 0.0, "positions": {
+        "ILLIQ2": {"mint": "illiq2", "entry_px": 1e-6, "entry_usd": 50.0, "size_usd": 50.0,
+                   "initial_usd": 50.0, "state": "full", "stages_done": [], "reserved_exit_usd": 0.0,
+                   "peak_price": 1e-6, "trough_price": 1e-6}}}
+    so.load_book = lambda: json.loads(json.dumps(book))
+    so.save_book = lambda b: None
+    r1 = so.execute_fraction(book, "ILLIQ2", 1.0, 0.8, reason="STOP", how="frac", liq=0)
+    r2 = so.execute_fraction(book, "ILLIQ2", 1.0, 0.8, reason="STOP", how="frac", liq=0)
+    r3 = so.execute_fraction(book, "ILLIQ2", 1.0, 0.8, reason="STOP", how="frac", liq=0)
+    check("Doc1-4b liq=0 never writes off (all HOLD)", (r1, r2, r3), (None, None, None))
+    check("Doc1-4b no trades booked", len(book.get("trades") or []), 0)
+    check("Doc1-4b streak stayed 0 (unknown != confirmed)", book["positions"]["ILLIQ2"].get("_low_liq_streak"), 0)
+except Exception as e:
+    check("Doc1-4b unknown-liq test", "ERR " + str(e)[:60], "no-exception")
 
 # --- Doc2-7: dust tranche (< $2.5) partial is skipped unless it closes ---
 try:

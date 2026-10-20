@@ -31,11 +31,18 @@ except Exception:
     FEE_BPS = 3.0
 
 # MC-adaptive exit plan: (mc_floor, clip1_mult, clip2_mult, stop_loss%)
+# Oct 20 OFF tape retune (user: "most calls do at least 50% — engine broken?"):
+# the 12h PumpAPI tape (170 calls) PROVED the old 1.10-clip/1.30-TP/0.15-stop
+# ladder was stop-then-run suicide — 65% of calls dip below 0.85 BEFORE hitting
+# 1.30 (median peak 1.73x; 58% reach 1.5x), so the tight stop booked -15% on the
+# shakeout and the clip gave away half at +10% into the run. Tape sweep (same
+# fills, only exits changed): old ladder -3.9%/call -> TP2.0/SL0.75 +5.2%,
+# TP2.5/SL0.75 +5.4%. Direction holds in BOTH half-windows. No 1.10 clip.
 EXIT_TIERS = [
-    (0,        1.10, 1.30, 0.15),
-    (40_000,   1.15, 1.35, 0.18),
-    (150_000,  1.20, 1.45, 0.22),
-    (1_500_000,1.30, 1.60, 0.28),
+    (0,        2.00, 2.50, 0.25),
+    (40_000,   2.00, 2.50, 0.25),
+    (150_000,  2.20, 2.80, 0.25),
+    (1_500_000,2.50, 3.00, 0.25),
 ]
 # Conviction mode relaxes targets (hold longer, ride further)
 CONVICTION_MULT = 1.45

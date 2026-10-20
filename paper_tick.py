@@ -138,7 +138,7 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
             pass
     res = execute_stage(b, key, stage, mult_used, reason=reason, how=how, liq=liq)
     if not res:
-        release(b, key, want)
+        release(b, key, want, intent_key=f"{key}:{how}{stage}")
         out.append(f"GATE {sym}: stage engine no-op")
         return False
     if b.get("trades"):
@@ -511,6 +511,7 @@ def main():
     b = load_book()
     pos = pm.load_positions()  # SINGLE authoritative monitor snapshot (audit P1 Oct 18)
     out = []
+    _prices = {}   # mint -> priceUsd captured in the main loop (equity reuse, no refetch)
     for mint, p in list(b["positions"].items()):
         if time.time() > TICK_DEADLINE:
             out.append(f"⏱ tick budget hit — deferring {len(b['positions']) - list(b['positions']).index(mint)} position(s) to next tick")
@@ -532,6 +533,7 @@ def main():
         if not px:
             out.append(f"? {sym}: no market"); continue
         px = float(px)
+        _prices[mint] = px
         mc = mkt.get("marketCap") or 0
         mult = px / p["entry_px"]
         entry_usd = p["size_usd"]
@@ -708,15 +710,19 @@ def main():
             if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="TP", how="tp", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
-        plan_s = f"sell half at +{(tp1-1)*100:.0f}%, sell all at +{(tp2-1)*100:.0f}%, cut losses at {stop*100:.0f}%"
+        plan_s = f"sell half at +{(tp1-1)*100:.0f}%, sell all at +{(tp2-1)*100:.0f}%, cut losses at {abs(stop)*100:.0f}%"
         out.append(f"• ${sym}: worth ${cur_usd:.2f} ({'+' if mult>=1 else ''}{(mult-1)*100:.0f}% since buy) — {action}. Plan: {plan_s}")
     save_book(b); pm.save_positions(pos)
     # FIX #6: recompute equity from book (staged executor already updated cash/realized)
+    # TIMEOUT FIX (Oct 20): the old loop re-fetched dex_pair for EVERY remaining
+    # position with NO deadline — with 74 open positions it blew the supervisor's
+    # 120s subprocess timeout on every tick (desk silent for hours, heartbeats
+    # stale). Now reuse the prices already fetched in the main loop.
     openval = 0.0
-    for sym, p in b["positions"].items():
-        mkt = dex_pair(p["mint"], allow_fallback=False, timeout=10, retries=1) or {}
-        px = mkt.get("priceUsd")
-        if px: openval += p["size_usd"] * float(px) / p["entry_px"]
+    for mint, p in b["positions"].items():
+        px = _prices.get(mint)
+        if px and p.get("entry_px"):
+            openval += p["size_usd"] * float(px) / p["entry_px"]
     cash = b.get("cash", 0.0)
     eq = cash + openval
     b["realized"] = round(b.get("realized", 0.0), 2)
