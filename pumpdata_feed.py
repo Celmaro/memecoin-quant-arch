@@ -179,18 +179,27 @@ def run():
         is rejected (too_many_connections). Manual connect/disconnect per cycle
         guarantees exactly one live socket at any time. (Oct 20 fix.)"""
         sio = socketio.Client(reconnection=False, reconnection_attempts=0)
-        seen = {"n": 0, "last": time.time()}
+        seen = {"n": 0, "last": time.time(), "last_evt": time.time()}
 
         @sio.on("connect")
         def on_connect():
             _log(f"connected — watch {len(_watch)} mints, sinceSlot={_last_block}")
+            seen["last_evt"] = time.time()
+            def ack(resp):
+                if isinstance(resp, dict) and resp.get("error"):
+                    _log(f"sub ack err: {str(resp)[:120]}")
             sio.emit("subscribe_stream",
                      {"protocols": ["PUMPFUN", "PUMPSWAP"],
-                      "sinceSlot": _last_block or None})
+                      "sinceSlot": _last_block or None}, callback=ack)
+            # subscribe to SOL price too (keyless): keeps the write queue fed so
+            # engineio's write loop never aborts on 30s idle, AND gives us a
+            # live SOL rate from the stream.
+            sio.emit("subscribe_sol_price")
 
         @sio.on("stream")
         def on_stream(e):
             seen["n"] += 1
+            seen["last_evt"] = time.time()
             try:
                 apply_trade(e)
             except Exception:
@@ -200,7 +209,12 @@ def run():
                 _log(f"alive — {seen['n']} events/min, watch {len(_watch)}, rows {len(_state)}")
                 seen["n"], seen["last"] = 0, now
 
-        return sio
+        @sio.on("*")
+        def on_any(ev, data):
+            if ev not in ("stream", "connect", "disconnect", "sol_price"):
+                _log(f"ev {ev}: {str(data)[:120]}")
+
+        return sio, seen
 
     # refresh SOL/USD periodically (free REST)
     def _sol_loop():
@@ -221,11 +235,25 @@ def run():
             _watch = set(list(_watch)[:MAX_MINTS])
         sio = None
         try:
-            sio = make_client()
+            sio, seen = make_client()
             sio.connect(SOCKET_URL, wait_timeout=12)
+            last_ka = 0
             while sio.connected:
                 write_cache()
                 time.sleep(1.0)
+                # keepalive (Oct 20): engineio's write loop self-destructs after
+                # 30s with an idle write queue, which kills the read loop too.
+                # A periodic emit keeps the queue fed and the connection alive
+                # (subscribe_sol_price is keyless + gives a live SOL rate).
+                if time.time() - last_ka > 15:
+                    sio.emit("subscribe_sol_price")
+                    last_ka = time.time()
+                # stall watchdog (Oct 20): the transport can die silently
+                # ("packet queue is empty" without a disconnect event) — if no
+                # stream event for 60s, break out and force a fresh cycle.
+                if time.time() - seen["last_evt"] > 60:
+                    _log("stall watchdog — no stream event for 60s, reconnecting")
+                    break
         except Exception as ex:
             _log("cycle err: %s", str(ex)[:120] if str(ex) else type(ex).__name__)
         finally:
