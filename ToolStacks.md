@@ -390,3 +390,17 @@ Docs: https://blixvip.com/app#/api · Base: `https://blixvip.com/api`
 - `GET /api/stream` — every event as it happens (SSE/NDJSON market stream).
 - App is Next.js SPA; `/app` → `/start` login wall. No anonymous API key endpoint; needs Blix account/credentials.
 - **AEGIS mapping:** market-regime context once auth exists; not wired until credentials supplied.
+
+## PUMPDATA (sol.shrine.trade) — LIVE PROBED Oct 20 2026, FREE keyless
+Docs: https://pumpdatamonorepository.pages.dev/pump/llms-full.txt (full 3,360-line spec)
+Base: https://sol.shrine.trade  · Replay: https://replay.shrine.trade/pump/{YYYY/MM/DD/HH}.jsonl.zst (hourly zstd, index.json lists hours; 848 hours Sep14→Oct20 present, incl. 2026/10/10 and 2026/10/18-19)
+- GET /sol-price → {priceUSD, time} — live SOL/USD (verified $104.24)
+- GET /metadata?mint=<mint> — name/symbol/decimals/supply/launchpad/quote, active pool after migrations, graduated_at, mint_authority/freeze_authority, pumpfun curve, creator (verified: Odyssey full metadata)
+- WS socket.io at https://sol.shrine.trade (python-socketio installed in desk venv):
+  * subscribe {pool} → price ticks {pool, price, priceUSD, mcap, time} (verified)
+  * subscribe_stream {protocols:[PUMPFUN,PUMPSWAP,...], sinceSlot} → full trades {signature, block, timestamp, action, protocol, mint, pool, price, tokenAmount, quoteAmount, tokensInPool, quoteInPool, tradersInvolved, breakdown[]} (verified live; carries pool reserves for constant-product sizing)
+  * subscribe_trades {pool}, subscribe_new_tokens, subscribe_migrations, subscribe_sol_price — free keyless
+  * subscribe_ohlcv / ohlcv_history — 1s candles, need FREE key from Telegram group t.me/+nEqAowTK8BZhZjFk
+- REST cap 3 req/s/IP/endpoint; WS 50 subs/conn, one open stream per type per IP; sinceSlot resume (24h replay); dedupe on signature+pool
+- Trading (NOT needed for paper): POST /api/lightspeed (0.25%, needs ls_ key), /api/local-trade, /api/send — real execution, never used by paper desk
+- Verdict: replaces DexScreener/Gecko fragility for paper mark-to-market (reserves in stream = rule-3 constant-product sizing), independent backtest tape (cross-validate pumpapi.io numbers), free. NOT a signal source (curated Telegram only).
