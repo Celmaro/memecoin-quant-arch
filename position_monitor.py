@@ -16,7 +16,7 @@ Usage:
 """
 import json, sys, os, time, argparse
 from desk_common import (dex_pair, db, log_event, init_schema, rugcheck,
-                         coinstats_balance, market_for)
+                         market_for)
 from signals import token_intel, holder_growth, holder_churn, fresh_wallet_power
 import aegis
 
@@ -105,7 +105,11 @@ def analyze(mint, pos):
         return {"ok": False, "signal": "DATA_UNAVAILABLE", "action": "MANUAL_CHECK"}
     px = float(pair.get("priceUsd") or 0)
     mc = float(pair.get("marketCap") or 0)
-    liq = (pair.get("liquidity") or {}).get("usd") or 0
+    _liq_raw = (pair.get("liquidity") or {}).get("usd")
+    # Oct 21 fix: None = UNKNOWN (feed hasn't measured liq yet), 0 = confirmed zero.
+    # `or 0` collapsed missing data into a phantom DEAD/LIQUIDITY_WITHDRAWAL exit
+    # on coins with live buy tape (CLOUT buys $2,742 sold @0.99x on "liq 0.0%").
+    liq = float(_liq_raw) if _liq_raw not in (None, "") else None
     vol = pair.get("volume") or {}
     vol_m5, vol_h1, vol_h24 = vol.get("m5") or 0, vol.get("h1") or 0, vol.get("h24") or 0
     chg = pair.get("priceChange") or {}
@@ -187,10 +191,12 @@ def analyze(mint, pos):
     # --- Liquidity collapse (FIX #3: missing-liq fallback) ---
     stored_entry_liq = pos.get("entry_liq")
     entry_liq = float(stored_entry_liq or liq or 0)
-    if stored_entry_liq and float(stored_entry_liq) > 0 and liq < float(stored_entry_liq) * 0.5:
+    # Oct 21 fix: liq may be None (UNKNOWN) — collapse checks only fire on
+    # CONFIRMED liquidity values, never on missing data.
+    if liq is not None and stored_entry_liq and float(stored_entry_liq) > 0 and liq < float(stored_entry_liq) * 0.5:
         signals.append(f"LIQ_COLLAPSE: ${liq:,.0f} < 50% of entry ${float(stored_entry_liq):,.0f}")
         action = "EMERGENCY_EXIT"
-    elif not stored_entry_liq and liq > 0 and mult <= 0.75:
+    elif liq is not None and not stored_entry_liq and liq > 0 and mult <= 0.75:
         # FIX #3: NO entry liquidity snapshot was stored at buy time — a >25%
         # price drawdown with any reported liquidity is collapse risk (price proxy)
         signals.append(f"LIQ_MISSING_DRAWDOWN: no entry liq, mult {mult:.2f} <= 0.75 with ${liq:,.0f} liq")
@@ -198,7 +204,9 @@ def analyze(mint, pos):
         pos["emergency_triggered"] = True  # non-overridable: contract may not downgrade
 
     # --- LIQ=0 -> DEAD (ghost/dumped position: no one can exit at $0) ---
-    if liq <= 0:
+    # Oct 21 fix: only CONFIRMED zero liq is DEAD. liq=None = UNKNOWN data —
+    # a missing feed row was collapsing to 0 and emergency-exiting healthy coins.
+    if liq is not None and liq <= 0:
         signals.append("LIQ=0 — dead/dumped position, no liquidity to exit into")
         action = "DEAD"
 
@@ -283,68 +291,13 @@ def analyze(mint, pos):
         signals.append("BEHAVIOR: smart wallets behind -> hold longer")
         conviction = True
 
-    # --- GOOD-WALLET SELLING (CoinStats top-holder balance, Yoda's autopilot rule) ---
-    try:
-        holders = (rugcheck(mint, full=True) or {}).get("topHolders") or []
-        # Non-LP, non-deployer top holders with meaningful pct
-        suspects = [h for h in holders[:8] if (h.get("owner") or "") != "So11111111111111111111111111111111111111112"]
-        holder_balances = []
-        for h in suspects[:3]:
-            owner = h.get("owner") or ""
-            if not owner: continue
-            bal_list = coinstats_balance(owner, "solana")
-            # Find our mint in CoinStats balance response
-            mine = None
-            for item in bal_list:
-                tid = item.get("contractAddress") or item.get("tokenAddress") or item.get("id") or ""
-                if str(tid).lower() == mint.lower():
-                    mine = item; break
-            if mine:
-                qty = float(mine.get("balance") or mine.get("amount") or 0)
-                holder_balances.append((owner[:10], h.get("pct"), qty))
-                pos.setdefault("holder_snapshot", {})[owner] = max(pos["holder_snapshot"].get(owner, 0), qty)
-        # If any tracked holder's balance dropped >50% vs snapshot -> good wallets selling
-        for owner, pct, qty in holder_balances:
-            snap = pos.get("holder_snapshot", {}).get(owner, 0)
-            if snap > 0 and qty < snap * 0.5:
-                signals.append(f"GOOD_WALLET_SELLING: {owner} balance {qty:,.0f} < 50% of snapshot {snap:,.0f}")
-                if action == "HOLD": action = "CLIP_50"
-                if mult <= 1.0: action = "EXIT_ALL"
-    except Exception:
-        pass
-
+    # --- GOOD_WALLET_SELLING REMOVED (Oct 21 simplification): source was CoinStats
+    # --- top-holder balance — 406 credit-locked since Oct 16, always [].
+    # --- BLIX holder movement (7.1) covers the same Yoda autopilot rule live.
     # --- DEEP-ENRICHMENT GATES (Oct 18 — throttled to once per position per 15 min) ---
     try:
         last_deep = pos.get("deep_enrich_ts") or 0
         if time.time() - last_deep > 900:  # 15-min throttle
-            # 4. Shyft failed-tx = sell-block detector (free) -> escalate by count
-            try:
-                from desk_common import shyft_failed_txs
-                fails = shyft_failed_txs(mint, limit=10)
-                if fails:
-                    if len(fails) >= 3:
-                        signals.append(f"SELL_BLOCK_DETECTED: {len(fails)} failed txs touching mint")
-                        action = "EMERGENCY_EXIT"
-                    elif len(fails) >= 1:
-                        signals.append(f"FAILED_TXS: {len(fails)} recent failed txs (dynamic-honeypot watch)")
-                        if action == "HOLD": action = "CLIP_50"
-            except Exception:
-                pass
-            # 5. FomoAPI devs: dev realized PnL closing = exit bias (budgeted)
-            try:
-                from desk_common import fomo_devs_stats
-                fd = fomo_devs_stats(mint)
-                if fd and fd.get("devs"):
-                    for drow in fd["devs"][:3]:
-                        if isinstance(drow, dict) and (drow.get("realizedPnlUsd") or 0) < 0:
-                            signals.append(f"DEV_EXIT_BIAS: dev realized {drow.get('realizedPnlUsd')}")
-                            if action == "HOLD": action = "CLIP_50"
-                if fd and fd.get("stats", {}).get("top10_pct"):
-                    t10 = fd["stats"]["top10_pct"]
-                    if t10 and t10 > 70:
-                        signals.append(f"FOMO_TOP10_{t10}%")
-            except Exception:
-                pass
             pos["deep_enrich_ts"] = time.time()
     except Exception:
         pass
@@ -565,7 +518,7 @@ def analyze(mint, pos):
             "retention": retention,
             "fresh_buyers": (pos.get("wallet_power") or {}).get("new_buyer_count"),
             "vol_ratio": (vol_h1 / entry_v) if entry_v else None,
-            "liq_pct_of_entry": (liq / entry_liq * 100) if entry_liq else None,
+            "liq_pct_of_entry": ((liq / entry_liq * 100) if (entry_liq and liq is not None) else None),
             "mult": mult,
         })
         pos["thesis"] = thesis
@@ -660,7 +613,8 @@ def analyze(mint, pos):
 
 def fmt(r):
     L = [f"  {r['symbol']} {r['token']}... px=${r['px']:.8f} mult={r['mult']:.2f}x PnL={r['pnl_pct']:+.1f}% (${r['pnl_usd']:+.2f}) {'🔒CONVICTION' if r['conviction'] else ''}"]
-    L.append(f"  MC=${r['mc']:,.0f} liq=${r['liq']:,.0f} | 5m vol=${r['vol_m5']:,.0f} chg {r['chg_m5']:+.1f}% | B/S {r['b5']}/{r['s5']} | age={r['age_min']:.0f}m")
+    liq_s = "n/a" if r['liq'] is None else f"{r['liq']:,.0f}"
+    L.append(f"  MC=${r['mc']:,.0f} liq=${liq_s} | 5m vol=${r['vol_m5']:,.0f} chg {r['chg_m5']:+.1f}% | B/S {r['b5']}/{r['s5']} | age={r['age_min']:.0f}m")
     h = r.get("holders")
     if h:
         L.append(f"  🧠 buyers 1h={h.get('buyers_1h')} 6h={h.get('buyers_6h')} unique={h.get('unique_buyers')} sellers={h.get('unique_sellers')}")
@@ -691,7 +645,11 @@ def cmd_add(args):
         print(f"ERROR: no pair data for {args.mint}"); return 1
     px = float(pair.get("priceUsd") or 0)
     mc = float(pair.get("marketCap") or 0)
-    liq = (pair.get("liquidity") or {}).get("usd") or 0
+    _liq_raw = (pair.get("liquidity") or {}).get("usd")
+    # Oct 21 fix: None = UNKNOWN (feed hasn't measured liq yet), 0 = confirmed zero.
+    # `or 0` collapsed missing data into a phantom DEAD/LIQUIDITY_WITHDRAWAL exit
+    # on coins with live buy tape (CLOUT buys $2,742 sold @0.99x on "liq 0.0%").
+    liq = float(_liq_raw) if _liq_raw not in (None, "") else None
     vh1 = (pair.get("volume") or {}).get("h1") or 0
     intel = token_intel(args.mint)
     try:

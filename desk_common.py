@@ -26,7 +26,7 @@ def load_config():
         return _cfg_cache
     cfg = {"HELIUS_KEY": None, "SHYFT_KEY": None, "FLUX_KEY": None,
            "BIRDEYE_KEY": None, "JUPITER_KEY": None, "AVE_KEY": None,
-           "FOMO_KEY": None, "BITQUERY_KEY": None, "COINSTATS_KEY": None,
+           "BITQUERY_KEY": None, "COINSTATS_KEY": None,
            "DEXPAPRIKA_KEY": None, "PUMPDEV_KEY": None, "HMQ_BOT_TOKEN": None,
            "SOLANATRACKER_KEY": None}
     try:
@@ -54,11 +54,9 @@ def load_config():
     if m: cfg["JUPITER_KEY"] = m.group(1)
     m = re.search(r"Ave\.ai:\s*([A-Za-z0-9]+)", text)
     if m: cfg["AVE_KEY"] = m.group(1)
-    m = re.search(r"FomoAPI:\s*(fapi_[A-Za-z0-9]+)", text)
-    if m: cfg["FOMO_KEY"] = m.group(1)
-    # Oct 21: NEW Fomo-API (api.fomo-api.com — wallet PnL/trader leaderboard,
-    # fomo_live_ keys). Different product/host from legacy FomoAPI (api.fomoapi.io,
-    # fapi_ keys, 402-dead). Cohort/leaderboard source; saves SolanaTracker credits.
+    # Oct 21: Fomo-API (api.fomo-api.com — wallet PnL/trader leaderboard,
+    # fomo_live_ keys). Legacy FomoAPI (api.fomoapi.io, fapi_ keys) removed
+    # Oct 21 simplification — 402-dead product. Cohort source; saves SolanaTracker credits.
     m = re.search(r"Fomo-API \(wallet-pnl, live\):\s*(fomo_live_[A-Za-z0-9_-]+)", text)
     if m: cfg["FOMO_LIVE_KEY"] = m.group(1)
     else: cfg["FOMO_LIVE_KEY"] = None
@@ -412,49 +410,6 @@ def mother_wallet(wallet, n=5):
 
 # ---------- Tier-0/Tier-1 helpers (verified endpoints) ----------
 
-FOMO_NETWORKS = {"solana": 1399811149, "robinhood": 4663, "base": 8453, "bsc": 56}
-# Oct 21 real-engineering: FomoAPI is 402 paid-locked from this box (live probe),
-# but had NO circuit breaker - every AEGIS scan burned ~300ms + a budget slot on
-# a dead endpoint 24/7 (Bitquery/CoinStats were already breakered). 30-min breaker.
-_FOMO_DEAD_UNTIL = [0.0]
-def _fomo_breaker_ok():
-    return time.time() >= _FOMO_DEAD_UNTIL[0]
-def _fomo_arm_breaker():
-    _FOMO_DEAD_UNTIL[0] = time.time() + 1800
-    try:
-        log_event({"event": "FOMOAPI_BREAKER", "detail": "402 paid-locked/empty"})
-    except Exception:
-        pass
-def fomo_holders(mint, chain="solana"):
-    """FomoAPI smart-money holders — REQUIRES ?network=<chainId> (probed: 200 only with it)."""
-    cfg = load_config()
-    fk = cfg.get("FOMO_KEY")
-    if not fk: return []
-    net = FOMO_NETWORKS.get(chain, FOMO_NETWORKS["solana"])
-    try:
-        url = f"https://api.fomoapi.io/token/{mint}/holders?network={net}&limit=25"
-        st, data = http_json(url, headers={"Authorization": f"Bearer {fk}"})
-        if isinstance(data, dict) and data.get("available") is False:
-            _fomo_arm_breaker()
-            return []
-        if isinstance(data, dict) and data.get("error"):
-            _fomo_arm_breaker()
-            return []
-        return data.get("holders") or (data.get("data") or {}).get("holders") or []
-    except Exception:
-        return []
-
-def fomo_user(handle):
-    """FomoAPI trader resolution (2,500 credits — call sparingly, cache in actors)."""
-    cfg = load_config()
-    fk = cfg.get("FOMO_KEY")
-    if not fk or not _fomo_breaker_ok(): return None
-    try:
-        url = f"https://api.fomoapi.io/v2/users/{handle}"
-        st, data = http_json(url, headers={"Authorization": f"Bearer {fk}"}, retries=2)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
 
 def bitquery_graphql(query, dataset="realtime"):
     """Bitquery V2 GraphQL (streaming.bitquery.io). Correct host for Solana/EVM.
@@ -471,35 +426,6 @@ def bitquery_graphql(query, dataset="realtime"):
     except Exception:
         return None
 
-def fomo_board(mint, chain="solana"):
-    """FomoAPI token boards (working endpoints) — find a mint on trending/most-held/graduated.
-    Returns {symbol, holders, network, marketCapUsd} or None. CONTEXT ONLY (never an entry signal)."""
-    cfg = load_config()
-    fk = cfg.get("FOMO_KEY")
-    if not fk or not _fomo_breaker_ok(): return None
-    want_net = FOMO_NETWORKS.get(chain, 1399811149)
-    for board in ("trending", "most-held", "graduated"):
-        try:
-            url = f"https://api.fomoapi.io/v2/leaderboard/tokens/{board}?limit=150"
-            st, data = http_json(url, headers={"Authorization": f"Bearer {fk}"})
-            if isinstance(data, dict) and data.get("error"):
-                _fomo_arm_breaker()
-                return None
-            for t in (data.get("tokens") or []):
-                tk = t.get("token") or {}
-                if str(tk.get("address", "")).lower() == mint.lower():
-                    return {"symbol": tk.get("symbol"), "holders": t.get("holders"),
-                            "network": t.get("network"), "marketCapUsd": t.get("marketCapUsd"),
-                            "board": board}
-        except Exception:
-            continue
-    return None
-
-# (coinstats_balance defined once below at line ~557 WITH the 406 circuit breaker;
-#  an older dup without the breaker was removed Oct 20 P2-8.)
-
-# module-level circuit breaker for Bitquery (402 credit-locked; recalib Oct 18)
-_BQ_DEAD_UNTIL = [0.0]
 
 def bitquery_imbalance(mint, limit=30):
     """USD-weighted buy/sell imbalance via Bitquery V2 — DOCUMENTED query shape (verified).
@@ -759,37 +685,6 @@ def ttl_cache_put(key, val):
 # never burns a tick on it (audit P2-5: "still tries it for top holders each analysis").
 _COINSTATS_DEAD_UNTIL = [0.0]
 
-def coinstats_balance(wallet, connection="solana"):
-    """CoinStats wallet balance (X-API-KEY). Returns LIST directly.
-
-    ⚠️ Oct 16 2026: free-tier credits exhausted -> every endpoint 406. Circuit
-    breaker: after the first 406 the path returns [] for 30 min without calling
-    (audit P2-5). Logs a degraded marker once so the desk knows, not silently.
-    """
-    if time.time() < _COINSTATS_DEAD_UNTIL[0]:
-        return []
-    cfg = load_config()
-    ck = cfg.get("COINSTATS_KEY")
-    if not ck: return []
-    try:
-        url = f"https://openapiv1.coinstats.app/v1/wallet/balance?address={wallet}&connectionId={connection}"
-        st, data = http_json(url, headers={"X-API-KEY": ck, "Accept": "application/json"})
-        if isinstance(data, list):
-            return data
-        res = data.get("result") or []
-        return res if isinstance(res, list) else []
-    except Exception:
-        # 406 = credits exhausted; mark degraded once + circuit-break 30 min
-        _COINSTATS_DEAD_UNTIL[0] = time.time() + 1800
-        try:
-            log_event({"event": "COINSTATS_DEGRADED", "detail": "406 credits limit"})
-        except Exception:
-            pass
-        return []
-
-# mint-vs-wallet discrimination: a valid SPL token MINT is owned by the Token
-# program (or is a token-2022/metadata mint); a plain wallet is owned by the
-# System program. Cached per address (Telegram-intake boundary, audit §3).
 def is_token_mint(address, timeout_cache=300):
     """Return True if `address` is an SPL token/Token-2022/Metaplex MINT account.
 
@@ -934,17 +829,6 @@ def walletintel_leaderboard(sort="score", limit=10):
     except Exception:
         return []
 
-def solscan_chaininfo():
-    """Solscan free chaininfo — VERIFIED live (token JWT header, NOT Bearer)."""
-    try:
-        cfg = load_config()
-        jwt = cfg.get("SOLSCAN_JWT")
-        hdrs = {"User-Agent": UA}
-        if jwt: hdrs["token"] = jwt
-        st, d = http_json("https://public-api.solscan.io/chaininfo", headers=hdrs)
-        return (d or {}).get("data")
-    except Exception:
-        return None
 
 def cabalspy_wallets(chain="solana", wtype="kol", limit=20):
     """CabalSpy labeled KOL/smart/whale roster (10k credits free/mo)."""
@@ -962,30 +846,6 @@ def cabalspy_wallets(chain="solana", wtype="kol", limit=20):
     except Exception:
         return []
 
-def madeonsol_kol_feed(limit=10):
-    """MadeOnSol KOL trade feed — CF-blocked from this box; returns [] here.
-    P2-8 (Oct 20): DNS fail-fast — madeonsol.com does not resolve from this box,
-    so don't burn per-call timeouts on a guaranteed-empty feed.
-    Works from user-network/x402. Base: madeonsol.com/api/v1 (NOT api.madeonsol.com)."""
-    if not _host_ok("madeonsol.com"):
-        return []
-    try:
-        cfg = load_config()
-        key = cfg.get("MADEONSOL_KEY")
-        if not key: return []
-        st, d = http_json("https://madeonsol.com/api/v1/kol/feed?limit=%d" % limit,
-                          headers={"Authorization": f"Bearer {key}"})
-        return (d or {}).get("trades") or []
-    except Exception:
-        return []
-
-# --- BLIX RADAR CLIENT (Oct 18 — localhost:4420, all endpoints verified live) ---
-BLIX = "http://localhost:4420"
-
-# P2-8 (Oct 20): Blix localhost service is PARTIALLY down (webapp/trades/pumpswap/
-# rugcheck/helius-config/telegram endpoints dead). Add a per-endpoint circuit
-# breaker so dead ones don't burn a timeout every call; alive ones stay fast.
-_BLIX_DEAD = {}  # endpoint -> dead_until ts
 def _blix(path, timeout=10):
     """GET a Blix endpoint; returns dict/list or None on failure (breaker for dead paths)."""
     now = time.time()
@@ -1091,14 +951,12 @@ def blix_wallet(address):
 # persisted to ~/memecoin-quant/credit_budget.json (thread-safe-ish via file write).
 CREDIT_BUDGETS = {
     "helius_wallet":    {"daily": 500,   "cost": 100},   # Wallet API 100cr/call
-    "fomoapi":          {"daily": 2500,  "cost": 250},   # devs/stats 250cr
     "solanatracker":    {"daily": 500,   "cost": 1},     # 10k/mo free -> keep light
     "walletintel":      {"daily": 10,    "cost": 1},
     "ave_top100":       {"daily": 200,   "cost": 1},     # keyed, free-ish w/ limits
     "ave_risk":         {"daily": 200,   "cost": 1},     # P2-7: Ave contract-risk report is keyed — budget it
-    "madeonsol":        {"daily": 180,   "cost": 1},     # 200/day free, leave headroom
     "cabalspy":         {"daily": 500,   "cost": 10},    # 10k/mo
-}
+}  # fomoapi + madeonsol entries REMOVED Oct 21 (402/403-dead providers deleted)
 
 # P2-8 (Oct 20): shared DNS fail-fast for network-dead providers. A host that
 # won't resolve (rugcheck/cabalspy/madeonsol on this box) must not burn 12s of
@@ -1238,44 +1096,6 @@ def helius_wallet(wallet):
         return None
 
 # 4. Shyft failed-tx tape (free REST — sell-block detector)
-def shyft_failed_txs(mint, limit=20):
-    """Recent FAILED transactions touching a mint — dynamic-honeypot / sell-block proof.
-    Free REST (getTransactionsForAddress with filters status=failed)."""
-    try:
-        st, d = http_json(
-            f"https://rpc.shyft.to?api_key={load_config().get('SHYFT_KEY')}", method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": UA},
-            body={"jsonrpc": "2.0", "id": 1, "method": "getTransactionsForAddress",
-                  "params": [mint, {"limit": limit,
-                                    "filters": [{"status": "failed"}]}]}, timeout=25)
-        res = (d or {}).get("result") or []
-        if isinstance(res, list):
-            return [t for t in res if isinstance(t, dict)]
-        return []
-    except Exception:
-        return []
-
-# 5. FomoAPI token devs + stats (250cr — budgeted; credits may be exhausted -> graceful)
-def fomo_devs_stats(mint):
-    if not budget("fomoapi", cost=250):
-        return None
-    try:
-        key = load_config().get("FOMO_KEY")
-        if not key: return None
-        st, d = http_json(f"https://api.fomoapi.io/v2/token/{mint}/devs?networkId=1399811149",
-                          headers={"Authorization": f"Bearer {key}"}, timeout=20)
-        devs = (d or {}).get("devs") or []
-        st2, d2 = http_json(f"https://api.fomoapi.io/v2/token/{mint}/stats?networkId=1399811149",
-                            headers={"Authorization": f"Bearer {key}"}, timeout=20)
-        stats = (d2 or {}).get("data") or {}
-        out = {"devs": devs[:5], "stats": {
-            "holders": stats.get("holders"), "top10_pct": stats.get("top10HoldersPercent"),
-            "windows": stats.get("windows")}}
-        return out
-    except Exception:
-        return None
-
-# 6. SolanaTracker whale/KOL trades (credits — budgeted)
 def st_whales(min_volume=1000, limit=20):
     if not budget("solanatracker"):
         return []
@@ -1410,35 +1230,7 @@ def cabalspy_connections(wallet):
         return []
 
 # 14. MadeOnSol buyer-quality / signals-performance / depth (CF-blocked here -> graceful)
-def madeonsol_buyer_quality(mints):
-    """Batch buyer-quality for a list of mints (≤50). BUDGETED; 200/day free."""
-    if not budget("madeonsol"):
-        return []
-    if not _host_ok("madeonsol.com"):
-        return []
-    try:
-        key = load_config().get("MADEONSOL_KEY")
-        if not key: return []
-        st, d = http_json("https://madeonsol.com/api/v1/tokens/batch/buyer-quality", method="POST",
-                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": UA},
-                          body={"mints": mints[:50]}, timeout=30)
-        return (d or {}).get("tokens") or []
-    except Exception:
-        return []
 
-def madeonsol_signal_perf(signal_name, history=False):
-    if not _host_ok("madeonsol.com"):
-        return []
-    try:
-        key = load_config().get("MADEONSOL_KEY")
-        if not key: return None
-        st, d = http_json(f"https://madeonsol.com/api/v1/signals/{signal_name}/performance?history={'true' if history else 'false'}",
-                          headers={"Authorization": f"Bearer {key}", "User-Agent": UA}, timeout=25)
-        return d or None
-    except Exception:
-        return None
-
-# 15. Jupiter Swap v2 quote (recommended path; drop-in for v1)
 def jupiter_quote_v2(mint, usd=20, slippage_bps=500):
     """Swap v2 quote (SOL->mint). Returns dict w/ priceImpactPct fraction, outAmount, or None."""
     try:

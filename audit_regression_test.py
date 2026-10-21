@@ -263,8 +263,8 @@ try:
         for name in ("token_intel", "holder_growth", "holder_churn", "fresh_wallet_power"):
             if hasattr(_pm, name): setattr(_pm, name, lambda *a, **k: {})
         if hasattr(_pm, "rugcheck"): _pm.rugcheck = lambda *a, **k: {}
-        if hasattr(_pm, "coinstats_balance"): _pm.coinstats_balance = lambda *a, **k: []
-        for name in ("shyft_failed_txs", "fomo_devs_stats", "blix_holders", "blix_alive",
+        # coinstats/shyft/fomo_devs stubs REMOVED Oct 21 — providers deleted (402/406/403-dead)
+        for name in ("blix_holders", "blix_alive",
                      "blix_coin_trades", "blix_narratives", "blix_market", "blix_signal_track"):
             setattr(_dc, name, lambda *a, **k: ({} if name != "blix_alive" else False))
         # aegis strategy lookup neutral
@@ -338,6 +338,62 @@ try:
     _F["priceUsd"] = 1.2e-6
 except Exception as e:
     check("A4/A7 time-exit+ATH test", "ERR " + str(e)[:80], "no-exception")
+
+# --- Oct 21 FIX ROUND 2: pool-rotation fill floor + attribution partials/dedupe ---
+# POOL-ROTATION (METOO class): a claimed deep dump that contradicts the coin's
+# OWN feed samples (60-300s old) is the residual-pool signature — the fill must
+# be floored at the stable mult, not booked at 0.087x.
+try:
+    import bot.position_manager.scaleout as so
+    import os as _os
+    import tempfile, time as _tt
+    _tmp = tempfile.mkdtemp()
+    _cache = _os.path.join(_tmp, "pumpdata_cache.json")
+    _now_ms = _tt.time() * 1000
+    _entry = 3.462671352877755e-05
+    _stable_sol = 3.164e-05 / 105.98
+    _tail = [(_now_ms - (60 + i * 15) * 1000, _stable_sol) for i in range(10)]
+    _body = {"updated": _tt.time(), "sol_usd": 105.98,
+             "mints": {"A3HMVuERxjRiJ": {"px_sol": _stable_sol / 10.5,
+                                          "px_usd": _stable_sol / 10.5 * 105.98,
+                                          "pxs_tail": _tail}}}
+    import json as _jj
+    _jj.dump(_body, open(_cache, "w"))
+    _real_exp = _os.path.expanduser
+    _os.path.expanduser = lambda p: _cache if p.endswith("pumpdata_cache.json") else _real_exp(p)
+    try:
+        _cap, _src = so._onchain_mult("A3HMVuERxjRiJ", 0.0873, _entry)
+    finally:
+        _os.path.expanduser = _real_exp
+    check("POOL-ROTATION floor fires on step", _cap is not None and _src == "feed-rotation", True)
+    check("POOL-ROTATION floors to stable (~0.914)", round(_cap or 0, 2), 0.91)
+except Exception as e:
+    check("POOL-ROTATION test", "ERR " + str(e)[:80], "no-exception")
+
+# attribution dedupe + partials (temp DB only — never the live aegis.db)
+try:
+    import bot.research.attribution as _att
+    import sqlite3
+    _tmp2 = tempfile.mkdtemp()
+    _att.DB = _os.path.join(_tmp2, "test.db")
+    _att.ensure_schema()
+    _pos = {"entry_px": 5e-5, "peak_price": 6e-5, "trough_price": 4e-5, "initial_usd": 20.0}
+    _mG = "4tieigPJCAQbw1C9wBLtg9QZGgPFeuyibRD6Hi2spump"
+    _att.attribute("GUZZLEGOAT", _mG, _pos, 10.51, 9.698880428499815e-05,
+                   price_path=[(0,5e-5),(1,6e-5),(2,9.7e-5)])
+    _tt.sleep(0.64)
+    _att.attribute("GUZZLEGOAT", _mG, _pos, 12.66, 1.0384242187819961e-04,
+                   price_path=[(0,5e-5),(1,6e-5),(2,1.04e-4)])
+    _c = sqlite3.connect(_att.DB)
+    _n = _c.execute("SELECT COUNT(*) c FROM position_attribution WHERE mint=?", (_mG,)).fetchone()[0]
+    check("ATTRIB dedupe collapses 5s same-px double-write", _n, 1)
+    _att.attribute("PC", "72nrwKcGGT", _pos, 9.83, 1.02e-4,
+                   price_path=[(0,5e-5),(1,6e-5),(2,1.02e-4)], partial=True)
+    _row = _c.execute("SELECT detail_json FROM position_attribution WHERE mint='72nrwKcGGT'").fetchone()[0]
+    check("ATTRIB partial flag written", '"partial": true' in _row, True)
+    _c.close()
+except Exception as e:
+    check("ATTRIB dedupe test", "ERR " + str(e)[:80], "no-exception")
 
 print()
 print("FAILURES:", failures if failures else "NONE — all decision-engine regressions pass")

@@ -25,7 +25,11 @@ def main():
 
     if cmd == "scan":
         mint = args[1]
-        deep = "--deep" in args
+        # USER MANDATE (Oct 20): ALL scans are deep scans. The CLI quick-scan
+        # defaulted to deep=False (~seconds, contract-only) — every score a human
+        # sees must come from the full pipeline (deployer memory + live tape).
+        # --shallow opts out explicitly for debug probes.
+        deep = "--shallow" not in args
         import aegis
         rep = aegis.score_coin(mint, deep=deep)
         print(f"AEGIS {rep['symbol'] or mint[:10]}...")
@@ -227,7 +231,7 @@ def main():
         """NEW PROVIDERS (Oct 17): whale-flow tape + wallet PnL + chain metrics.
         Usage: desk.py whales [recent|traders|wallets|chain|pf] [n]"""
         from desk_common import (sol_wales_traders, sol_wales_moves_recent,
-                                 walletintel_leaderboard, solscan_chaininfo,
+                                 walletintel_leaderboard,
                                  walletintel_summary)
         sub = args[1] if len(args) > 1 else "recent"
         n = int(args[2]) if len(args) > 2 else 10
@@ -250,9 +254,6 @@ def main():
             for w in lb[:n]:
                 print(f"  {w.get('wallet','?')[:12]}  score={w.get('score')} wr={w.get('win_rate')}% "
                       f"pnl={w.get('pnl_sol'):+.2f}SOL {w.get('strategy')} trades={w.get('total_trades')}")
-        elif sub == "chain":
-            ci = solscan_chaininfo()
-            print("⛓ Solscan chaininfo:", ci)
         elif sub == "pf":
             # portfolio of a specific wallet (walletintel PnL)
             w = args[2] if len(args) > 2 else None
@@ -375,12 +376,11 @@ def main():
         if not mint:
             print("usage: desk.py deep <mint>"); return 1
         from desk_common import (ave_top100_holders, rugcheck_insiders, rugcheck_lockers,
-                                 shyft_failed_txs, dexscreener_metas_trending,
+                                 dexscreener_metas_trending,
                                  rugcheck_stats_new, jupiter_quote_v2, budget_remaining,
-                                 goplus_address_security, cabalspy_bundle, cabalspy_signals,
-                                 madeonsol_buyer_quality, madeonsol_signal_perf)
+                                 goplus_address_security, cabalspy_bundle, cabalspy_signals)
         print(f"🔬 DEEP ENRICHMENT {mint[:12]}...")
-        print(f"   credit budget: ave_top100={budget_remaining('ave_top100')} fomo={budget_remaining('fomoapi')} "
+        print(f"   credit budget: ave_top100={budget_remaining('ave_top100')} "  # fomoapi removed Oct 21 (402-dead)
               f"st={budget_remaining('solanatracker')}")
         # 7 Ave top100
         th = ave_top100_holders(mint)
@@ -393,9 +393,6 @@ def main():
         print(f"[9] Rugcheck insiders: {len(rgi) if isinstance(rgi, list) else 'n/a'} net(s)")
         rgl = rugcheck_lockers(mint)
         print(f"    lockers: {'PAID(401)' if rgl is None else 'ok'}")
-        # 4 Shyft failed
-        fails = shyft_failed_txs(mint)
-        print(f"[4] Shyft failed txs: {len(fails) if fails else 0}")
         # 11 DexScreener metas
         metas = dexscreener_metas_trending()
         print(f"[11] DexScreener metas trending: {len(metas)} themes")
@@ -420,8 +417,6 @@ def main():
         # 13 CabalSpy + 14 MadeOnSol (blocked here — show graceful)
         cb = cabalspy_bundle(mint)
         print(f"[13] CabalSpy bundle: {'ok' if cb else 'n/a (network-blocked here)'}")
-        bq = madeonsol_buyer_quality([mint])
-        print(f"[14] MadeOnSol buyer-quality: {'ok' if bq else 'n/a (network-blocked here)'}")
         return 0
 
     if cmd == "score-trend":

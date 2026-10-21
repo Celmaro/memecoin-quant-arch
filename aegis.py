@@ -8,7 +8,7 @@ Also hosts the behavior index (actors -> post-buy strategy).
 import json, time, re
 from desk_common import (db, init_schema, dex_pair, rugcheck, rpc, log_event, helius_txs,
                          deep_cache_get, deep_cache_put,
-                         helius_asc_txs, mother_wallet, ave_risk, fomo_holders, fomo_user, fomo_board,
+                         helius_asc_txs, mother_wallet, ave_risk,
                          goplus_security, budget)
 
 # Learning-loop cache (Oct 19): {ts, data} for aegis_weight_overrides.json
@@ -217,81 +217,6 @@ def strategy_for(mint):
 
 # ---------- Tier 1.2: FomoAPI smart-money overlay (auto behavior index) ----------
 
-def fomo_overlay(mint, chain="solana", max_resolve=3):
-    """Smart-money overlay at intake: FomoAPI holders -> trader track records -> actor tags.
-    Tags smart_wallet (verified, positive PnL), kol (high followers), and links their solana
-    wallets to the actors table so strategy_for() can trigger conviction_hold / front_run_exit.
-    Falls back to the working token boards (fomo_board) when the holders endpoint is down.
-    Returns {'holders': [...], 'tagged': [...], 'smart_money_count': N, 'board': {...} or None}."""
-    # P2-7 (Oct 20): budget gate. fomo_holders+fomo_user burn 250cr each; without
-    # a shared gate the overlay keeps calling past the daily quota (credit_budget.json
-    # showed fomoapi all-hit today → silent degradation).
-    if not budget("fomoapi"):
-        return {"holders": [], "tagged": [], "smart_money_count": 0, "board": None}
-    holders = fomo_holders(mint, chain=chain)
-    board = None
-    if not holders:
-        # holders endpoint is upstream-flaky (503s); use board context as fallback
-        board = fomo_board(mint, chain=chain)
-    tagged = []
-    sm_count = 0
-    # Read-only lookups on a short-lived connection; never hold a write txn
-    # across slow network calls (that locks out other desk processes).
-    con = db()
-    try:
-        cached = {}
-        for h in [x.get("handle") for x in holders if x.get("handle")]:
-            row = con.execute("SELECT class, strategy FROM actors WHERE actor=?", (h,)).fetchone()
-            if row:
-                cached[h] = (row["class"], row["strategy"])
-    finally:
-        con.close()
-    resolved = 0
-    for h in holders[:max_resolve + 4]:
-        handle = h.get("handle")
-        if not handle:
-            continue
-        # cache check: already an actor with a class? (prefetched above, no open conn)
-        cls_cached = cached.get(handle)
-        if cls_cached and cls_cached[0] in ("smart_wallet", "kol", "rug_deployer"):
-            if cls_cached[0] == "smart_wallet": sm_count += 1
-            tagged.append({"handle": handle, "class": cls_cached[0]})
-            continue
-        if resolved >= max_resolve:
-            continue
-        u = fomo_user(handle)
-        resolved += 1
-        if not u:
-            continue
-        pnl = u.get("pnl") or {}
-        verified = bool(u.get("verified"))
-        followers = int(u.get("followers") or 0)
-        trades = int(u.get("trades") or 0)
-        pnl_all = float((pnl.get("all") if isinstance(pnl, dict) else 0) or 0)
-        pnl_7d = float((pnl.get("7d") if isinstance(pnl, dict) else 0) or 0)
-        if verified and trades >= 3 and (pnl_7d > 0 or pnl_all > 0):
-            cls, strat, conf = "smart_wallet", "conviction_hold", 0.8
-            sm_count += 1
-        elif followers >= 5000 or (pnl_all > 100_000 and trades > 0):
-            cls, strat, conf = "kol", "front_run_exit", 0.6
-        else:
-            cls, strat, conf = "trader", "default", 0.4
-        tag_actor(handle, cls, strategy=strat, confidence=conf,
-                  notes=f"fomo overlay pnl7d={pnl_7d:.0f} pnlAll={pnl_all:.0f} followers={followers} verified={verified}")
-        wallets = u.get("wallets") or {}
-        if wallets.get("solana"):
-            # short-lived write conn per row (no held txn across the loop)
-            wcon = db()
-            try:
-                wcon.execute("INSERT OR REPLACE INTO actors(actor, class, confidence, strategy, notes, updated_ts) VALUES(?,?,?,?,?,?)",
-                             (wallets["solana"], cls, conf, strat, f"fomo wallet for {handle}", time.time()))
-                wcon.execute("INSERT OR IGNORE INTO first_buyers(coin_mint, wallet, rank, ts, size) VALUES(?,?,?,?,?)",
-                             (mint, wallets["solana"], 100 + len(tagged), time.time(), 0))
-                wcon.commit()
-            finally:
-                wcon.close()
-        tagged.append({"handle": handle, "class": cls, "pnl_7d": round(pnl_7d), "followers": followers})
-    return {"holders": holders, "tagged": tagged, "smart_money_count": sm_count, "board": board}
 
 # ---------- Score ----------
 
@@ -312,6 +237,36 @@ def score_coin(mint, deep=False):
     verdict = "LIVE"
     flags = []
 
+    # --- CALL-MC DECAY (Oct 20, user: "Top 10 98%, sell pressure, biggest wallet 78%,
+    # MC already -89%. But score 72???") ---
+    # The scorer used to be BLIND to the call context: coins.mc_at_call (the MC the
+    # channel printed when it called the coin) is stored by remember_call_meta, but
+    # score_coin never compared current MC against it. SLAB was called at $71,853,
+    # scanned hours-later at $11,112 (-84.5%) and STILL scored 72 LIVE. A coin that
+    # has already dumped >50% from its call MC is a poisoned call, not a fresh launch.
+    try:
+        _cc = db().execute("SELECT mc_at_call FROM coins WHERE mint=?", (mint,)).fetchone()
+        _decay_ratio = None
+        if _cc and _cc[0]:
+            _mc_now = (m.get("mc") or 0)
+            if _mc_now and float(_cc[0]) > 0:
+                _decay_ratio = _mc_now / float(_cc[0])
+        if _decay_ratio is not None:
+            if _decay_ratio < 0.10:
+                score -= 50; flags.append(f"call_mc_decay_{1-_decay_ratio:.0%}")
+            elif _decay_ratio < 0.25:
+                score -= 35; flags.append(f"call_mc_decay_{1-_decay_ratio:.0%}")
+            elif _decay_ratio < 0.50:
+                score -= 20; flags.append(f"call_mc_decay_{1-_decay_ratio:.0%}")
+            elif _decay_ratio < 0.80:
+                score -= 8; flags.append(f"call_mc_decay_{1-_decay_ratio:.0%}")
+            elif _decay_ratio >= 1.8:
+                # coin already pumped 1.8x past call — P12 entry gate blocks the buy;
+                # score reflects it too (chasing risk)
+                score -= 10; flags.append(f"call_mc_pumped_{_decay_ratio:.1f}x")
+    except Exception:
+        pass  # decay bonus never blocks scoring
+
     # Contract snapshot checks
     if a.get("mint_authority") or r.get("mint_authority"):
         score -= 25; flags.append("mint_authority_present")
@@ -321,9 +276,24 @@ def score_coin(mint, deep=False):
         score -= 40; flags.append("RUGGED_FLAG")
         verdict = "RUGGED"
     if r.get("graph_insiders"):
-        score -= 10; flags.append("insider_graph_detected")  # recalib: -15->-10
-    if r.get("transfer_fee"):
-        score -= 10; flags.append("transfer_fee_present")
+        # Oct 20 audit (12h live marks, n=149): insider_graph_detected → +17.2pp
+        # lift (34.6% win vs 17.4% base); rug_insider_nets_x1 +21pp, x2 +32.6pp.
+        # The old -10 static penalty was INVERTED — it penalized the model's best
+        # predictors. Static weight now NEUTRAL (0); the learning loop owns this
+        # flag's sign from empirical outcomes (learned delta was already +2.2).
+        flags.append("insider_graph_detected")
+    # Oct 20 audit: rugcheck transferFee is a DICT {'pct': 0, ...} — `if r.get("transfer_fee")`
+    # was truthy for ANY dict, so transfer_fee_present fired on every mint even at pct=0
+    # (verified 25/25 latest mints pct==0 yet 300/300 scans flagged it, phantom -10 that
+    # also blocked the clean_snapshot +15). Normalize to pct and flag only when > 0.
+    _tf = r.get("transfer_fee")
+    _tf_pct = 0.0
+    if isinstance(_tf, dict):
+        _tf_pct = float(_tf.get("pct") or 0)
+    elif isinstance(_tf, (int, float)):
+        _tf_pct = float(_tf or 0)
+    if _tf_pct > 0:
+        score -= 10; flags.append(f"transfer_fee_present_{_tf_pct:.1f}%")
     if isinstance(r.get("risks"), list):
         # Dedupe penalties by category (audit F6): several "bundle/sniper" rows
         # were each subtracting -15, over-punishing a single underlying issue.
@@ -344,9 +314,13 @@ def score_coin(mint, deep=False):
     # P1-3 (Oct 20): raw Rugcheck summary exposes top10 concentration as
     # top10HolderPct (not top10_pct — that key exists only in our derived map).
     # Read the SUMMARY field if the full-report derivation is absent.
+    # Oct 20 audit FIX: used to reference `summary` — a LOCAL inside
+    # check_top10_and_lp, undefined in score_coin scope → NameError whenever
+    # topHolders was empty (top10_pct=None). check_top10_and_lp already merges
+    # summary fields into r; read TOP10 from r only.
     t10pct = r.get("top10_pct")
     if not isinstance(t10pct, (int, float)):
-        t10pct = (summary or {}).get("top10HolderPct") or (summary or {}).get("top10Share") or 0
+        t10pct = r.get("top10HolderPct") or r.get("top10Share") or 0
     try:
         t10pct = float(t10pct or 0)
     except Exception:
@@ -439,17 +413,8 @@ def score_coin(mint, deep=False):
     except Exception:
         pass
 
-    # --- 11th check: SMART MONEY overlay (FomoAPI, bounded +/-6) ---
-    try:
-        ov = fomo_overlay(mint)
-        n_sm = (ov or {}).get("smart_money_count") or 0
-        if n_sm >= 3:
-            score += 6; flags.append(f"smart_money_x{n_sm}")
-        elif n_sm == 2:
-            score += 3; flags.append("smart_money_x2")
-        # smart money tagged but SELLING is handled by behavior index elsewhere
-    except Exception:
-        pass
+    # --- 11th check REMOVED (Oct 21): FomoAPI 402-dead; smart-money overlay
+    # unable to produce signal. Replaced by fomo-live cohort when wired. ---
 
     # --- 12th check: SLIPPAGE AT DESK SIZE ($20) via Jupiter ---
     try:
@@ -534,11 +499,14 @@ def score_coin(mint, deep=False):
         if ins and isinstance(ins, list):
             nets = len(ins)
             if nets > 0:
-                score -= 5 * min(nets, 3); flags.append(f"rug_insider_nets_x{nets}")
+                # Oct 20 audit: NET ZERO weights (was -5/net). Live marks showed
+                # rug_insider_nets_x1 +21pp / x2 +32.6pp lift — penalizing them
+                # was inverted. Learning loop owns the sign going forward.
+                flags.append(f"rug_insider_nets_x{nets}")
                 # transfer-type networks = involved wallets; trade-type = bought-in insiders
                 trade_nets = sum(1 for n in ins if n.get("network_type") == "trade")
                 if trade_nets > 0:
-                    score -= 5; flags.append(f"rug_trade_insiders_x{trade_nets}")
+                    flags.append(f"rug_trade_insiders_x{trade_nets}")
     except Exception:
         pass  # rugcheck down — never block
 
@@ -785,6 +753,29 @@ def score_coin(mint, deep=False):
                 flags.append(f"entity_labels({adj:+d})")
                 for nt in notes:
                     flags.append(nt)  # e.g. "Wallet… is Binance (exchange) — supply distribution risk"
+            # Oct 20 PIPI/SHLRT lesson (user: "PIPI was given 70 then immediately dumped"):
+            # first-block SNIPER-BOT wallets in the launch's first buyers are the single
+            # best dump predictor (12h audit: first-block snipers -> 0% win, n=7-22), yet
+            # each one costs only -5 via entity_labels and the LEARNING overrides are keyed
+            # by exact wallet string so NEW sniper wallets carry ZERO learned weight.
+            # Add a CATEGORICAL penalty: N distinct sniper wallets in first buyers.
+            try:
+                from aegis_entity_labels import behavioral_labels
+                n_snipers = 0
+                for w in wl:
+                    lbl, cat = behavioral_labels(w)
+                    if cat == "mev":
+                        n_snipers += 1
+                # Oct 20 24h audit: even ONE first-block sniper kills — x1 snipers
+                # (E7CD4J 87% dead, E6cZWf 87%, 5k2Ckk 85%) were slipping through
+                # because the old penalty started at x2. Ladder: 1->10, 2->15,
+                # 3->25, 4+->30 (bounded).
+                if n_snipers >= 1:
+                    pen = 10 if n_snipers == 1 else min(15 + 10 * (n_snipers - 2), 30)
+                    score -= pen
+                    flags.append(f"first_block_sniper_wallets_x{n_snipers} (-{pen})")
+            except Exception:
+                pass
     except Exception:
         pass  # enrichment down — never block
     # AEGIS is now interpretable: 4 category sub-scores + 2 new live checks + dedupe.
@@ -882,7 +873,7 @@ def score_coin(mint, deep=False):
                         # Clean token bonus: no NEGATIVE flags + LP locked => genuinely clean snapshot.
                         # Positive/neutral flags (smart_money, deep_pool_liq, deployer_other_coins,
                         # clean_snapshot itself) must NOT block the bonus (audit F6).
-    _NEG_PREFIXES = ("insider", "transfer_fee", "bundle", "lp_", "mint_", "freeze_",
+    _NEG_PREFIXES = ("transfer_fee", "bundle", "lp_", "mint_", "freeze_",
                      "copycat", "top10", "AVE_", "dirty", "rugger", "wash",
                      "slow", "fragility", "vol_liq", "slippage", "RUGGED", "drained",
                      "lp_unlocked", "mint_risk", "freeze_risk", "micro_cvd_neg",
@@ -891,9 +882,9 @@ def score_coin(mint, deep=False):
                      "bitquery_sell_imbalance", "ws_sell_pressure", "thin_pool_liq_mc",
                      "low_liq_mc", "gmgn_snipers", "gmgn_bundler", "gmgn_wash",
                      "gmgn_rug_ratio", "gmgn_t10", "entity_labels", "ave_smart_exits",
-                     "ave_top1", "rug_insider_nets", "rug_trade_insiders", "blix_top10",
+                     "ave_top1", "blix_top10",
                      "blix_dev_", "blix_snipers", "known_rugger", "deep_pool_risk",
-                     "holder_dump", "whale_holds_dump", "fomo_")
+                     "first_block_sniper", "call_mc_decay", "holder_dump", "whale_holds_dump", "fomo_")
     _neg = [f for f in flags if any(f.startswith(p) for p in _NEG_PREFIXES)]
     if not _neg and verdict != "RUGGED" and isinstance(r.get("lp_locked_pct"), (int, float)) and r["lp_locked_pct"] >= 90:
         score += 15
@@ -925,6 +916,13 @@ def score_coin(mint, deep=False):
         else: verdict = "LIVE"
 
     strategy = strategy_for(mint) if deep else "default"
+    # USER MANDATE (Oct 20): EVERY scan is a deep scan. Audit-proof marker so
+    # scan_log flags_json carries the depth used — a scan_log row with deep_scan
+    # ran the full pipeline (deployer memory, first buyers, WalletIntel, live
+    # tape checks 8-24); a non-deep call (only the CLI --shallow debug probe)
+    # is self-evident by its absence. Also recorded in log_event.
+    if deep:
+        flags.append("deep_scan")
     if m.get("symbol"):
         con = db()
         con.execute("""INSERT INTO coins(mint, symbol, mc_at_call, liq_at_call, deployer, score, verdict, strategy, updated_ts)
