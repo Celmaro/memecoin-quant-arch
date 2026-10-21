@@ -56,6 +56,12 @@ def load_config():
     if m: cfg["AVE_KEY"] = m.group(1)
     m = re.search(r"FomoAPI:\s*(fapi_[A-Za-z0-9]+)", text)
     if m: cfg["FOMO_KEY"] = m.group(1)
+    # Oct 21: NEW Fomo-API (api.fomo-api.com — wallet PnL/trader leaderboard,
+    # fomo_live_ keys). Different product/host from legacy FomoAPI (api.fomoapi.io,
+    # fapi_ keys, 402-dead). Cohort/leaderboard source; saves SolanaTracker credits.
+    m = re.search(r"Fomo-API \(wallet-pnl, live\):\s*(fomo_live_[A-Za-z0-9_-]+)", text)
+    if m: cfg["FOMO_LIVE_KEY"] = m.group(1)
+    else: cfg["FOMO_LIVE_KEY"] = None
     m = re.search(r"Bitquery:\s*(ory_at_[A-Za-z0-9._-]+)", text)
     if m: cfg["BITQUERY_KEY"] = m.group(1)
     m = re.search(r"CoinStats[^:]*:\s*([0-9a-fA-F]{20,})", text)
@@ -398,7 +404,18 @@ def mother_wallet(wallet, n=5):
 # ---------- Tier-0/Tier-1 helpers (verified endpoints) ----------
 
 FOMO_NETWORKS = {"solana": 1399811149, "robinhood": 4663, "base": 8453, "bsc": 56}
-
+# Oct 21 real-engineering: FomoAPI is 402 paid-locked from this box (live probe),
+# but had NO circuit breaker - every AEGIS scan burned ~300ms + a budget slot on
+# a dead endpoint 24/7 (Bitquery/CoinStats were already breakered). 30-min breaker.
+_FOMO_DEAD_UNTIL = [0.0]
+def _fomo_breaker_ok():
+    return time.time() >= _FOMO_DEAD_UNTIL[0]
+def _fomo_arm_breaker():
+    _FOMO_DEAD_UNTIL[0] = time.time() + 1800
+    try:
+        log_event({"event": "FOMOAPI_BREAKER", "detail": "402 paid-locked/empty"})
+    except Exception:
+        pass
 def fomo_holders(mint, chain="solana"):
     """FomoAPI smart-money holders — REQUIRES ?network=<chainId> (probed: 200 only with it)."""
     cfg = load_config()
@@ -409,6 +426,10 @@ def fomo_holders(mint, chain="solana"):
         url = f"https://api.fomoapi.io/token/{mint}/holders?network={net}&limit=25"
         st, data = http_json(url, headers={"Authorization": f"Bearer {fk}"})
         if isinstance(data, dict) and data.get("available") is False:
+            _fomo_arm_breaker()
+            return []
+        if isinstance(data, dict) and data.get("error"):
+            _fomo_arm_breaker()
             return []
         return data.get("holders") or (data.get("data") or {}).get("holders") or []
     except Exception:
@@ -418,7 +439,7 @@ def fomo_user(handle):
     """FomoAPI trader resolution (2,500 credits — call sparingly, cache in actors)."""
     cfg = load_config()
     fk = cfg.get("FOMO_KEY")
-    if not fk: return None
+    if not fk or not _fomo_breaker_ok(): return None
     try:
         url = f"https://api.fomoapi.io/v2/users/{handle}"
         st, data = http_json(url, headers={"Authorization": f"Bearer {fk}"}, retries=2)
@@ -446,12 +467,15 @@ def fomo_board(mint, chain="solana"):
     Returns {symbol, holders, network, marketCapUsd} or None. CONTEXT ONLY (never an entry signal)."""
     cfg = load_config()
     fk = cfg.get("FOMO_KEY")
-    if not fk: return None
+    if not fk or not _fomo_breaker_ok(): return None
     want_net = FOMO_NETWORKS.get(chain, 1399811149)
     for board in ("trending", "most-held", "graduated"):
         try:
             url = f"https://api.fomoapi.io/v2/leaderboard/tokens/{board}?limit=150"
             st, data = http_json(url, headers={"Authorization": f"Bearer {fk}"})
+            if isinstance(data, dict) and data.get("error"):
+                _fomo_arm_breaker()
+                return None
             for t in (data.get("tokens") or []):
                 tk = t.get("token") or {}
                 if str(tk.get("address", "")).lower() == mint.lower():

@@ -113,30 +113,11 @@ def wash_lpi_check(mint, pair=None):
 # ---------- 4. OHLCV ingestion (DexPaprika) → realized vol + max drawdown ----------
 
 def fetch_ohlcv_dexpa(mint, interval="1h", limit=48):
-    """OHLCV for risk math — DexPaprika pool OHLCV via pools/search (verified, keyed).
-    Token-level OHLCV is paid (403); this pool route returns a bare list of candles."""
-    try:
-        hdrs = {}
-        key = load_config().get("DEXPAPRIKA_KEY")
-        if key: hdrs["Authorization"] = key
-        # 1) find the token's pool
-        st_s, s = http_json(f"https://api.dexpaprika.com/networks/solana/pools/search?token_address={mint}&limit=1", headers=hdrs)
-        results = (s or {}).get("results") or []
-        if results:
-            pool = results[0].get("id")
-            url = (f"https://api.dexpaprika.com/networks/solana/pools/{pool}/ohlcv"
-                   f"?start=-{max(2, limit)}h&limit={limit}&interval=1h")
-            st, data = http_json(url, headers=hdrs)
-            if isinstance(data, list):
-                candles = []
-                for row in data:
-                    if isinstance(row, dict) and (row.get("price_close") is not None or row.get("close") is not None):
-                        candles.append(row)
-                if candles:
-                    return candles
-    except Exception:
-        pass
-    # fallback: GeckoTerminal pool OHLCV (free; may 429 under load)
+    """OHLCV for risk math — GeckoTerminal pool OHLCV FIRST (free, 50ms, verified
+    Oct 21), DexPaprika now paywalled (402) so it's only the last-resort fallback.
+    (Oct 21 real-engineering: was DexPaprika-first, burning up to 10s per call on
+    a 402-paywalled provider; the free working source must be tried first.)"""
+    # fallback was PRIMARY now: GeckoTerminal pool OHLCV (free; may 429 under load)
     try:
         t = http_json(f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}/pools?page=1&limit=1")
         pools = (t[1].get("data") or [])
@@ -149,7 +130,29 @@ def fetch_ohlcv_dexpa(mint, interval="1h", limit=48):
                 if isinstance(row, list) and len(row) >= 6:
                     candles.append({"time": row[0], "price_open": row[1], "price_high": row[2],
                                     "price_low": row[3], "price_close": row[4], "volume": row[5]})
-            return candles
+            if candles:
+                return candles
+    except Exception:
+        pass
+    # paywalled fallback: DexPaprika pool OHLCV via pools/search (only if it ever returns)
+    try:
+        hdrs = {}
+        key = load_config().get("DEXPAPRIKA_KEY")
+        if key: hdrs["Authorization"] = key
+        st_s, s = http_json(f"https://api.dexpaprika.com/networks/solana/pools/search?token_address={mint}&limit=1", headers=hdrs, timeout=8)
+        results = (s or {}).get("results") or []
+        if results:
+            pool = results[0].get("id")
+            url = (f"https://api.dexpaprika.com/networks/solana/pools/{pool}/ohlcv"
+                   f"?start=-{max(2, limit)}h&limit={limit}&interval=1h")
+            st, data = http_json(url, headers=hdrs, timeout=8)
+            if isinstance(data, list):
+                candles = []
+                for row in data:
+                    if isinstance(row, dict) and (row.get("price_close") is not None or row.get("close") is not None):
+                        candles.append(row)
+                if candles:
+                    return candles
     except Exception:
         pass
     return []
