@@ -73,6 +73,21 @@ def save_book(b):
         raise ValueError("save_book refused: positions must be dict, trades must be list")
     if not isinstance(b.get("cash"), (int, float)) or not isinstance(b.get("start"), (int, float)):
         raise ValueError("save_book refused: cash/start must be numeric")
+    # BOOK INVARIANTS (Oct 21, smoke-test-clobber + phantom-+$30.8M incidents):
+    # refuse writes that would enshrine a corrupt trade. (1) Every trade mult must
+    # be within [0.001, 20] — a $20 paper position booking mult 1.59M (pnl +$30.8M)
+    # or my smoke-test $200 fake sale is a corrupted write. (2) Trade pnl must be
+    # within [-30, 400] for a ≤$25 basis (3% fee + capped 10x gain bound) — anything
+    # beyond is a phantom. (3) The write must carry at least the structural keys.
+    for _t in b.get("trades") or []:
+        _m = float(_t.get("mult") or 0)
+        if abs(_m) > 20.0:
+            raise ValueError(f"save_book refused: trade {_t.get('symbol')} mult {_m:.4g} "
+                             f"outside [-20, 20] — refusing to book a phantom gain/loss")
+        _p = float(_t.get("pnl") or 0)
+        if _p > 400.0 or _p < -30.0:
+            raise ValueError(f"save_book refused: trade {_t.get('symbol')} pnl {_p:.2f} "
+                             f"outside [-30, 400] — refusing to book a phantom gain/loss")
     import tempfile
     tmp = BOOK + ".tmp"
     with open(tmp, "w") as f:
@@ -209,6 +224,10 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
         return False
     if b.get("trades"):
         b["trades"][-1]["how"] = f"{how}_{reason.lower()}" if how == "decision" else f"{how}"
+    # Oct 21: print the BOOKED mult (post _onchain_mult/_confirm_gain caps), not
+    # the raw claim — the DM line must match the ledger (CUPSEY printed 62.50x
+    # but booked 10.0x because the gain cap fired).
+    booked_mult = float(b["trades"][-1].get("mult") or mult_used) if b.get("trades") else mult_used
     save_book(b)
     if res["closed"]:
         pos.pop(sym, None)  # legacy symbol-key cleanup (no-op if keyed by mint)
@@ -224,14 +243,14 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
         except Exception:
             pass
         em = "EMERGENCY" if "EMERGENCY" in reason.upper() or "DEAD" in reason.upper() else "EXIT"
-        out.append(f"{em} {sym} @ {mult:.2f}x -> sold ${res['sold_usd']:.2f} (pnl {res['pnl']:+.2f}) [{reason} → stage{stage}] | gate: {'; '.join(gnotes) or 'ok'}")
+        out.append(f"{em} {sym} @ {booked_mult:.2f}x -> sold ${res['sold_usd']:.2f} (pnl {res['pnl']:+.2f}) [{reason} → stage{stage}] | gate: {'; '.join(gnotes) or 'ok'}")
     else:
         # audit P1.1: after a partial stage sale, sync the remaining basis into the monitor
         # ledger so size-dependent analysis (PnL, exit-capacity) uses the true remaining size.
         if pos.get(mint) is not None:
             pos[mint]["size"] = float(res.get("remaining") or 0.0)
             pos[mint]["entry_usd"] = float(res.get("remaining") or 0.0)
-        out.append(f"CLIP {sym} @ {mult:.2f}x -> sold ${res['sold_usd']:.2f} (pnl {res['pnl']:+.2f}) → remaining ${res['remaining']:.2f} (target-curve) | gate ok")
+        out.append(f"CLIP {sym} @ {booked_mult:.2f}x -> sold ${res['sold_usd']:.2f} (pnl {res['pnl']:+.2f}) → remaining ${res['remaining']:.2f} (target-curve) | gate ok")
     return True
 
 def tier_exits(mc):
@@ -476,9 +495,14 @@ def entry_call(d, b=None, aegis_score=None):
         age = time.time() - ts
         if age > 300:
             return None, f"stale_call_{age/60:.0f}m"
-    # dedupe: open positions + consumed ledger
-    if any(p.get("mint") == mint for p in b["positions"].values()) or mint in _consumed_mints():
-        return None, "already_held_or_consumed"
+    # dedupe: open positions + consumed ledger — SEPARATE reasons (Oct 21, user:
+    # "Separate them") so the card says WHICH guard fired: still holding the coin
+    # vs already traded+exited it once. Both are no-rebuy, but they answer
+    # different questions (current exposure vs historical consumption).
+    if any(p.get("mint") == mint for p in b["positions"].values()):
+        return None, "already_held"
+    if mint in _consumed_mints():
+        return None, "already_consumed"
     # AEGIS veto (audit policy Oct 20): <30 = hard veto, 70+ = mild size boost.
     # Applies AFTER dedupe so consumed/holding mints aren't double-logged.
     if aegis_score is not None and aegis_score < 30:
@@ -770,40 +794,17 @@ def main():
                     out.append(f"GATE {sym}: stage engine no-op — nothing booked")
                 save_book(b); pm.save_positions(pos)
                 continue
-            # fallback to legacy inline path ONLY if the stage engine is unavailable
-            if stage is None and "unavailable" in (out[-1] if out else ""):
-                frac = frac or (0.5 if decision_action == "CLIP_50" else 1.0)
-                # Oct 21 CORRUPTION CAP (phantom-book incident): the legacy inline
-                # writer had NO cap — a scale-corrupted entry_px made mult 1.59M
-                # and a $20 position "sold" for +$30.8M (paper_book_CORRUPT_... .
-                # The stage engine has MAX_BOOKED_GAIN_MULT; this fallback must too.
-                try:
-                    from bot.position_manager.scaleout import MAX_BOOKED_GAIN_MULT as _MAXG, _confirm_gain
-                except Exception:
-                    _MAXG, _confirm_gain = 10.0, None
-                if float(mult or 0) > _MAXG:
-                    if _confirm_gain:
-                        _cap = _confirm_gain(mint, float(mult), float(p.get("entry_px") or 0))
-                        if _cap is not None:
-                            mult = _cap
-                    if float(mult or 0) > _MAXG:
-                        out.append(f"CORRUPT-CAP {sym}: mult {mult:.4g} > cap {_MAXG:.0f} — booking at cap")
-                        mult = _MAXG
-                sold = entry_usd * frac * mult
-                pnl = sold - entry_usd * frac
-                b["realized"] = round(b.get("realized", 0.0) + pnl, 2)
-                b["cash"] = round(b.get("cash", 0.0) + sold, 2)
-                b.setdefault("trades", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
-                    "entry_px": p["entry_px"], "exit_px": px, "mult": round(mult, 4),
-                    "pnl": round(pnl, 2), "how": f"decision_{decision_action.lower()}",
-                    "closed": frac >= 0.99})
-                if frac >= 1.0:
-                    # P0 (Oct 20): book is MINT-keyed — pop(sym) never removed it.
-                    b["positions"].pop(mint, None)
-                    b["positions"].pop(sym, None)
-                    pos.pop(mint, None)
-                else:
-                    p["size_usd"] = entry_usd * (1 - frac); p["size"] = p["size_usd"]; p["state"] = "half"
+            # LESS-CODE (Oct 21): NO legacy inline booking path. There used to be
+            # a SECOND book-writer here (the +$30.8M phantom culprit) that only ran
+            # when the stage engine reported "unavailable" — a duplicated write path
+            # that drifted from the capped engine and booked uncapped mults. If the
+            # stage engine is genuinely unavailable (import error), DEFER the sell
+            # loudly and keep the position for the next tick — never book through a
+            # hand-rolled path that can't share scaleout's MAX_BOOKED_GAIN_MULT
+            # and _confirm_gain safeguards. One writer, verified invariants.
+            elif stage is None and "unavailable" in (out[-1] if out else ""):
+                if _gate_emit_ok(sym, decision_action, "decision"):
+                    out.append(f"ENGINE {sym}: stage engine unavailable — sale DEFERRED (kept for next tick)")
                 save_book(b); pm.save_positions(pos)
                 continue
             # gate blocked or no-op -> fall through to tier engine for another opinion
