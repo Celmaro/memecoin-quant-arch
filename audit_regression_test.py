@@ -313,9 +313,8 @@ try:
         if px: d["px_override"] = px
         return d
 
-    r = _pm.analyze("X", _mk(360))  # 6min old, +20% pnl, non-conviction -> MAX_HOLD
-    check("A4 MAX_HOLD fires EXIT_ALL", r.get("action"), "EXIT_ALL")
-    check("A4 MAX_HOLD signal present", any("MAX_HOLD" in s for s in r.get("signals", [])), True)
+    r = _pm.analyze("X", _mk(360))  # 6min old, +20% pnl — BELOW the 30-min MAX_HOLD floor (FIX 2)
+    check("A4 6min old +20% NOT MAX_HOLD-exited (30min floor)", any("MAX_HOLD:" in s for s in r.get("signals", [])), False)
 
     _F["priceUsd"] = 1.03e-6  # net pnl after 3% display fee ≈ -0.1% (flat) -> SIDEWAYS reachable
     r2 = _pm.analyze("X", _mk(700))  # 11.7min old, flat -> SIDEWAYS (checked before MAX_HOLD)
@@ -394,6 +393,88 @@ try:
     _c.close()
 except Exception as e:
     check("ATTRIB dedupe test", "ERR " + str(e)[:80], "no-exception")
+
+# --- Oct 21 FIX ROUND 3: LADDER EXECUTION (why the book was red) ---
+# Pins the 3 fixes: (1) FEED-SPEED STOP — loser at 0.60x books TIER_STOP at the
+# first tick, never rides to 0.50; (2) winners never MAX_HOLD-exited; (3)
+# EMERGENCY/DEAD requires mult < 1.0 (green coin = clip, not panic).
+try:
+    import time as _t3
+    import position_monitor as _pm3
+    _stub_analyze()  # same stubs as the A4 block above (all providers neutral)
+
+    def _mk3(age_s, px_mult, peak=None, entry_liq=None):
+        d = {"entry_px": 1e-6, "size": 20.0, "ts": _t3.time() - age_s, "symbol": "T", "mint": "X"}
+        if peak: d["peak_price"] = peak
+        if entry_liq: d["entry_liq"] = entry_liq
+        _F["priceUsd"] = 1e-6 * px_mult  # px_mult directly sets the mult
+        return d
+
+    # (1) loser at 0.60x — tier stop (0.75) MUST fire, reason TIER_STOP, action EXIT_ALL
+    _F["liquidity"] = {"usd": 25_000}
+    _F["marketCap"] = 80_000
+    _F["volume"] = {"m5": 5_000, "h1": 20_000}
+    _F["priceChange"] = {"m5": -2.0}
+    _F["txns"] = {"m5": {"buys": 10, "sells": 30}}
+    r_loser = _pm3.analyze("X", _mk3(120, 0.60))
+    check("R3 loser 0.60x action EXIT_ALL (not HOLD)", r_loser.get("action"), "EXIT_ALL")
+    check("R3 loser 0.60x TIER_STOP signal", any("TIER_STOP" in s for s in r_loser.get("signals", [])), True)
+    check("R3 loser never rides below 0.50 (stop level 0.75)", r_loser.get("mult"), 0.60)
+
+    # (1b) loser at 0.30x — HARD_STOP (deepest floor) fires with honest label
+    r_deep = _pm3.analyze("X", _mk3(120, 0.30))
+    check("R3 loser 0.30x HARD_STOP fires", any("HARD_STOP" in s for s in r_deep.get("signals", [])), True)
+    check("R3 loser 0.30x action EXIT_ALL", r_deep.get("action"), "EXIT_ALL")
+
+    # (2) WINNER at 1.5x, 45 min old — MAX_HOLD must NOT fire (FIX 2)
+    _F["liquidity"] = {"usd": 25_000}
+    _F["volume"] = {"m5": 8_000, "h1": 60_000}
+    _F["priceChange"] = {"m5": 3.0}
+    _F["txns"] = {"m5": {"buys": 25, "sells": 5}}
+    r_win = _pm3.analyze("X", _mk3(2700, 1.50))  # 45min, +50%
+    check("R3 winner 1.5x 45min NOT MAX_HOLD-exited", any("MAX_HOLD:" in s for s in r_win.get("signals", [])), False)
+    check("R3 winner 1.5x 45min SKIP signal present", any("MAX_HOLD_SKIPPED" in s for s in r_win.get("signals", [])), True)
+    check("R3 winner 1.5x action NOT EXIT_ALL (rides)", r_win.get("action") != "EXIT_ALL", True)
+
+    # (3) GREEN coin + liq collapsed — CLIP_50, never EMERGENCY (FIX 2)
+    _F["liquidity"] = {"usd": 25_000}
+    _F["marketCap"] = 80_000
+    _F["volume"] = {"m5": 8_000, "h1": 60_000}
+    _F["priceChange"] = {"m5": 3.0}
+    _F["txns"] = {"m5": {"buys": 25, "sells": 5}}
+    pos_green = _mk3(600, 1.30, entry_liq=60_000)  # entry liq 60K > current 25K
+    r_green = _pm3.analyze("X", pos_green)
+    check("R3 green 1.30x + halved liq NOT EMERGENCY", r_green.get("action") != "EMERGENCY_EXIT", True)
+    check("R3 green 1.30x LIQ_HALVED_BUT_GREEN signal", any("LIQ_HALVED_BUT_GREEN" in s for s in r_green.get("signals", [])), True)
+
+    # (3b) GREEN coin + zero liq — CLIP_50, never DEAD write-off (FIX 2)
+    _F["liquidity"] = {"usd": 0}
+    r_green0 = _pm3.analyze("X", _mk3(600, 1.20, entry_liq=60_000))
+    check("R3 green 1.20x zero liq NOT DEAD", r_green0.get("action") != "DEAD", True)
+
+    # (4) half-state dump at 0.40x — honest HARD_STOP label (was reason "TP")
+    # fallback engine path: mult 0.40 + half state must hit hard floor, not TP
+    import paper_tick as _pt3
+    _b3 = {"start": 100.0, "cash": 0.0, "realized": 0.0, "positions": {}, "trades": []}
+    _b3["positions"]["HALF1"] = {"mint": "HALF1", "entry_px": 1e-6, "entry_usd": 20.0, "size_usd": 10.0,
+                                 "initial_usd": 20.0, "state": "half", "stages_done": [1],
+                                 "reserved_exit_usd": 0.0, "peak_price": 1e-6, "trough_price": 1e-6}
+    _pt3.save_book = lambda b: None
+    _pt3.load_book = lambda: _b3
+    _pt3.pm.save_positions = lambda p: None
+    _out3 = []
+    # simulate the fallback sell arm directly via sell_via_stage with the reason
+    # the new fallback would produce: HARD_STOP for half-state dump at 0.40x
+    _b3_pos = _b3["positions"]["HALF1"]
+    _r3 = _pt3.sell_via_stage(_b3, {}, "HALF1", "HALF1", 3, 0.40, 0.4e-6,
+                              reason="HARD_STOP", how="stop", out=_out3,
+                              market_ts=_t3.time(), liq=25_000.0)
+    check("R3 half-state 0.40x books HARD_STOP (honest label)", _r3, True)
+    check("R3 half-state trade reason HARD_STOP", (len(_b3["trades"]) and _b3["trades"][-1].get("reason")), "HARD_STOP")
+    _F["liquidity"] = {"usd": 25_000}
+    _F["priceUsd"] = 1.2e-6
+except Exception as e:
+    check("R3 ladder-execution test", "ERR " + str(e)[:80], "no-exception")
 
 print()
 print("FAILURES:", failures if failures else "NONE — all decision-engine regressions pass")

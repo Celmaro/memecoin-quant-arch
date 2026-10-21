@@ -250,6 +250,21 @@ def sell_via_stage(b, pos, sym, mint, stage, mult, px, reason, how="stage", out=
         if pos.get(mint) is not None:
             pos[mint]["size"] = float(res.get("remaining") or 0.0)
             pos[mint]["entry_usd"] = float(res.get("remaining") or 0.0)
+        # Oct 21 FIX (anomaly #2): PARTIAL closes were never attributed — the DB
+        # only got rows for res["closed"] full exits. PC's +9.83 clip, LENA's
+        # -0.40 clip and METOO's +0.09 frac all vanished from position_attribution,
+        # under-reporting real PnL. Attribute the tranche with partial=True.
+        try:
+            from bot.research.attribution import attribute, record_event
+            _path_p = [(0, entry_px), (1, peak if peak > 0 else entry_px), (2, px)]
+            attribute(sym, p.get("mint"),
+                      {"entry_px": entry_px, "peak_price": peak, "trough_price": trough, "initial_usd": initial},
+                      realized_pnl=res["pnl"], exit_px=px, decision_px=decision_px, price_path=_path_p,
+                      partial=True)
+            record_event(p.get("mint"), "PARTIAL_CLOSE",
+                         {"symbol": sym, "reason": reason, "pnl": res["pnl"], "stage": stage})
+        except Exception:
+            pass
         out.append(f"CLIP {sym} @ {booked_mult:.2f}x -> sold ${res['sold_usd']:.2f} (pnl {res['pnl']:+.2f}) → remaining ${res['remaining']:.2f} (target-curve) | gate ok")
     return True
 
@@ -675,6 +690,39 @@ def main():
         cur_usd = entry_usd * mult
         state = p.get("state", "full")
 
+        # FIX 1 (Oct 21): FEED-SPEED STOP — runs EVERY tick at the feed-cache
+        # price, BEFORE the (cadence-gated) deep analyze. A position at/under
+        # its tier stop or hard floor sells THIS tick, no matter the analyze
+        # cadence (NORMAL = 300s, BACKGROUND = 900s — a dump used to ride from
+        # 0.75x to 0.09x between deep analyzes; 14 below-stop trades, -$110).
+        # Never fires on green (thresholds are at 0.75x / 0.50x).
+        try:
+            from position_monitor import tier_for as _tf
+            _tier = _tf(float(mc) or 0)
+            _stop_at = 1.0 - float(_tier[3] or 0.25)
+        except Exception:
+            _stop_at = 0.75
+        _floor_at = float(p.get("hard_stop_mult") or 0.50)
+        if mult <= _floor_at:
+            # Hard floor is the DEEPER stop — check it first so a 0.30x
+            # gap-through books HARD_STOP (crashed through the floor),
+            # not the shallower TIER_STOP label.
+            if mint in pos: pos[mint]["hard_stop_triggered"] = True
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="HARD_STOP", how="stop", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
+                save_book(b); pm.save_positions(pos)
+                continue
+            # Stop intent fired but the fill is blocked (gate/reservation in-
+            # flight) — DEFER, never let the decision engine downgrade a stop.
+            save_book(b); pm.save_positions(pos)
+            continue
+        if mult <= _stop_at:
+            if mint in pos: pos[mint]["tier_stop_triggered"] = True
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="TIER_STOP", how="stop", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
+                save_book(b); pm.save_positions(pos)
+                continue
+            save_book(b); pm.save_positions(pos)
+            continue
+
         # ---- decision-contract execution (doc-1): monitor's analyze() drives exits ----
         # MFE/MAE high-water marks (Build 7: attribution needs peak/trough)
         if px > float(p.get("peak_price") or 0): p["peak_price"] = px
@@ -768,6 +816,27 @@ def main():
                     # P1.1: sync remaining size into the monitor ledger
                     if not res.get("closed"):
                         pos[mint]["size"] = res.get("remaining", 0.0)
+                    # Oct 21 FIX (anomaly #2): the frac path bypasses sell_via_stage
+                    # entirely, so NEITHER partial nor full frac closes ever reached
+                    # position_attribution (METOO's +0.09 frac had no DB row). All
+                    # REALIZED frac closes get attributed here (partial flag per close).
+                    try:
+                        from bot.research.attribution import attribute, record_event
+                        fpeak = float(p.get("peak_price") or px)
+                        ftrough = float(p.get("trough_price") or px)
+                        f_pp = [(0, float(p["entry_px"])), (1, fpeak if fpeak > 0 else p["entry_px"]), (2, px)]
+                        attribute(sym, p.get("mint"),
+                                  {"entry_px": float(p["entry_px"]), "peak_price": fpeak,
+                                   "trough_price": ftrough, "initial_usd": float(p.get("initial_usd") or p.get("entry_usd") or 0)},
+                                  realized_pnl=res["pnl"], exit_px=px, price_path=f_pp,
+                                  partial=not res.get("closed"))
+                        record_event(p.get("mint"), "POSITION_CLOSE" if res.get("closed") else "PARTIAL_CLOSE",
+                                     {"symbol": sym, "reason": decision_action, "pnl": res["pnl"],
+                                      "frac": frac})
+                    except Exception:
+                        pass
+                    if res.get("closed"):
+                        pos.pop(mint, None)
                     save_book(b); pm.save_positions(pos)
                     continue
                 # P0 (Oct 20): a None from execute_fraction is a legit no-op (dust
@@ -821,41 +890,44 @@ def main():
         # monitor engine fires these for deep-analyzed positions; this keeps
         # BACKGROUND moonbags (which skip deep analyze) on the same clock.
         try:
-            from position_monitor import MAX_HOLD_S, MAX_HOLD_CONVICTION_S, SIDEWAYS_S, SIDEWAYS_PNL_PCT
+            from position_monitor import MAX_HOLD_S, MAX_HOLD_CONVICTION_S, SIDEWAYS_S, SIDEWAYS_PNL_PCT, max_hold_for
         except Exception:
-            MAX_HOLD_S, MAX_HOLD_CONVICTION_S, SIDEWAYS_S, SIDEWAYS_PNL_PCT = 300, 7200, 600, 2.0
+            MAX_HOLD_S, MAX_HOLD_CONVICTION_S, SIDEWAYS_S, SIDEWAYS_PNL_PCT, max_hold_for = 1800, 7200, 600, 2.0, (lambda mc: 1800)
         age_s = time.time() - p.get("opened", time.time())
         _conv = bool(p.get("conviction")) or p.get("strategy") == "conviction_hold"
-        hold_s = MAX_HOLD_CONVICTION_S if _conv else MAX_HOLD_S
+        hold_s = MAX_HOLD_CONVICTION_S if _conv else max_hold_for(float(mc) or 0)
         stale_reason = None
-        if age_s >= hold_s:
-            stale_reason = f"MAX_HOLD ({age_s/60:.0f}min >= {hold_s/60:.0f}min)"
+        # FIX 2 (Oct 21): MAX_HOLD fires ONLY on losers/flat (mult <= 1.0) —
+        # winners ride to TP2/clips (same rule as the monitor engine).
+        if age_s >= hold_s and mult <= 1.0:
+            stale_reason = f"MAX_HOLD ({age_s/60:.0f}min >= {hold_s/60:.0f}min at {mult:.2f}x)"
+        elif age_s >= hold_s and mult > 1.0:
+            stale_reason = None  # green + old = ride (FIX 2)
         elif state == "full" and age_s >= SIDEWAYS_S and abs((mult - 1) * 100) < SIDEWAYS_PNL_PCT:
             stale_reason = f"SIDEWAYS ({age_s/60:.0f}min, |pnl| {abs((mult-1)*100):.1f}% < {SIDEWAYS_PNL_PCT}%)"
         if stale_reason:
             if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason=stale_reason, how="time", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
-        if state == "full" and mult <= 1 + stop:
-            # P0-1 RESTORED (Oct 19, user-approved): MC-adaptive tier stop fires
-            # FIRST in the fallback engine too. stop is NEGATIVE here (tier_exits
-            # returns -0.15..-0.28), so 1+stop = 0.85..0.72 — a real early stop.
-            # Previously only the 0.50 floor existed -> every loser rode to -50%.
-            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="TIER_STOP", how="stop", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
+        # FIX 1 (Oct 21): tier stop + hard floor apply to BOTH states (the old
+        # state=="full" gate let half-state positions ride past 0.75 to 0.50;
+        # the old half-state 'TP' branch even booked a 0.50 dump as reason TP).
+        if mult <= 0.50:
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="HARD_STOP", how="stop", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
-        if state == "full" and mult <= 0.50:
-            # FIX (user #1): price-based hard stop in the fallback engine too —
-            # liquidity-independent floor at 0.50x, catches tokens that dump
-            # before the deep decision engine gets a clean read.
-            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="HARD_STOP", how="stop", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
+        if mult <= 1 + stop:
+            if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="TIER_STOP", how="stop", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
         if state == "full" and mult >= tp1:
             if sell_via_stage(b, pos, sym, mint, 1, mult, px, reason="CLIP1", how="clip1", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue
-        elif state == "half" and (mult >= tp2 or mult <= 0.50):
+        elif state == "half" and mult >= tp2:
+            # FIX 1 (Oct 21): ONLY the honest take-profit — the old `or mult <= 0.50`
+            # arm booked a crashed half position as reason "TP". Hard floor above
+            # now catches that dump with the honest HARD_STOP label.
             if sell_via_stage(b, pos, sym, mint, 3, mult, px, reason="TP", how="tp", out=out, market_ts=mkt_ts, liq=((mkt.get("liquidity") or {}).get("usd") or 0)):
                 save_book(b); pm.save_positions(pos)
                 continue

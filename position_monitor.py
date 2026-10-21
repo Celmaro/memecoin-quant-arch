@@ -50,19 +50,26 @@ CONVICTION_STOP_WIDEN = 1.15
 
 # TIME EXITS (Oct 21, CHARON A4/4.1 — validated externally and on our own tape):
 # MAX_HOLD_S: hard time exit — sell at market once a position is this old.
-# The retuned ladder (TP2.0/SL0.75) fixes the stop-then-run leak but still lets
-# a dying coin ride to its 0.75 stop after the action is gone. Charon's
-# 1,146-trade backtest: MAX_HOLD 334 trades at +1.1% avg is what keeps the book
-# from bleeding while killers die. Our STRATEGY_COMPARE (Oct 10 engine replay):
-# +180s time exit flips -15.2%/trade -> -1.6%, win 28% -> 53%. Default 300s =
-# 5min (quick-flip horizon; lower MC flips faster per CONFIG). Conviction holds
-# get the longer user horizon (2h).
-# SIDEWAYS_S: + SIDEWAYS_PNL_PCT: stale-position exit — open N minutes with
-# pnl stuck near zero frees capital instead of waiting for a move.
-MAX_HOLD_S = 300
+# FIX 2 (Oct 21): winners are NEVER time-exited early (the 5-min MAX_HOLD
+# strangled 11 winners at 1.04-1.73x, leaving +$157 on the table — vi2zUPH
+# +2.50 cut at 1.16x after 6min, BAkdiNu +0.09 at 1.04x after 8min). MAX_HOLD
+# now defaults to 30 min (quick-flip horizon) and only fires when NOT in profit
+# (mult <= 1.0); green positions ride to TP2/clips instead.
+MAX_HOLD_S = 1800   # 30 min — quick flip; RULE: only fires when mult <= 1.0
 MAX_HOLD_CONVICTION_S = 7200   # 2h = user's max horizon for conviction holds
+MAX_HOLD_TIER_S = {150_000: 3600, 1_500_000: 5400}  # higher MC = slower flips
 SIDEWAYS_S = 600
 SIDEWAYS_PNL_PCT = 2.0
+
+def max_hold_for(mc):
+    """Tier-aware MAX_HOLD: higher-MC tokens move slower -> longer cap."""
+    t = MAX_HOLD_S
+    for floor, sec in MAX_HOLD_TIER_S.items():
+        if mc >= floor:
+            t = sec
+        else:
+            break
+    return t
 
 ROUND_NUMS = [25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000]
 
@@ -136,6 +143,32 @@ def analyze(mint, pos):
     signals = []
     action = "HOLD"
 
+    # FIX 1 (Oct 21): FEED-SPEED STOP — evaluated FIRST, before token_intel /
+    # holder_growth / exit_intel enrichment (those take 10-30s; by the time the
+    # decision returns, a dump has gapped from 0.75x to 0.09x — the 14-trade
+    # below-stop bleed class, -$110 in one book). The stop fires on the FIRST
+    # tick that sees it, at the feed-cache price, and enrichment is skipped
+    # (a position we're exiting needs no further research).
+    hard_floor = float(pos.get("hard_stop_mult") or 0.50)
+    if mult <= (1 - stop) or mult <= hard_floor:
+        if mult <= (1 - stop):
+            signals.append(f"TIER_STOP: {mult:.2f}x <= {1-stop:.2f}x (tier stop {stop:.0%}, MC ${mc:,.0f})")
+            pos["tier_stop_triggered"] = True
+        if mult <= hard_floor:
+            signals.append(f"HARD_STOP: {mult:.2f}x <= {hard_floor:.2f}x price floor (liquidity-independent)")
+            pos["hard_stop_triggered"] = True
+        action = "EXIT_ALL"
+        return {"ok": True, "token": mint[:10], "symbol": (pair.get("baseToken") or {}).get("symbol", "?"),
+                "px": px, "mc": mc, "liq": liq, "mult": mult, "gross": gross, "net": net,
+                "pnl_usd": pnl_usd, "pnl_pct": pnl_pct, "vol_m5": vol_m5, "vol_h1": vol_h1,
+                "chg_m5": chg_m5, "b5": b5, "s5": s5, "age_min": (time.time() - float(pos.get("ts") or time.time())) / 60,
+                "conviction": conviction, "strategy": "default",
+                "holders": None, "churn": pos.get("holder_churn"),
+                "wallet_power": pos.get("wallet_power"),
+                "lifecycle": None, "lifecycle_why": [],
+                "thesis": None, "exit_intel": None, "micro": None,
+                "signals": signals, "action": action}
+
     # --- Intel from signal engine (slow-grad / wash / fragility) ---
     try:
         intel = token_intel(mint)
@@ -166,36 +199,26 @@ def analyze(mint, pos):
         signals.append(f"CLIP1: {mult:.2f}x >= {c1:.2f}x (sell 50%)")
         action = "CLIP_50"
 
-    # --- Tier stop (P0-1 RESTORED Oct 19, user-approved): MC-adaptive stop fires
-    # FIRST. `stop` = tier[3] (0.15-0.28, tightened by wash flags) was computed but
-    # NEVER READ (audit P0-1) — every position rode to the 0.50 hard floor, turning
-    # 51% of closes into emergency exits. Stop at mult <= 1 - stop.
-    if mult <= (1 - stop):
-        signals.append(f"TIER_STOP: {mult:.2f}x <= {1-stop:.2f}x (tier stop {stop:.0%}, MC ${mc:,.0f})")
-        action = "EXIT_ALL"
-        pos["tier_stop_triggered"] = True  # non-overridable: contract may not downgrade
-
-    # --- Hard stop (FIX: price-based circuit breaker, independent of liquidity) ---
-    # User fix #1: exit at a hard price floor (default -50%) even if liquidity data
-    # is missing. The old stop was inverted (mult <= 1 - stop where stop is a
-    # positive fraction made it fire at 1.28x/1.15x ABOVE entry) and was skipped
-    # entirely when liq was None. New logic: hard floor always applies.
-    # The tier stop above fires first; this floor is the FINAL BACKSTOP for
-    # gap-through dumps (a token can blow through -22% to -50% in one tick).
-    hard_floor = float(pos.get("hard_stop_mult") or 0.50)
-    if mult <= hard_floor:
-        signals.append(f"HARD_STOP: {mult:.2f}x <= {hard_floor:.2f}x price floor (liquidity-independent)")
-        action = "EXIT_ALL"
-        pos["hard_stop_triggered"] = True  # non-overridable: contract may not downgrade
+    # --- Tier stop / hard stop: MOVED to the feed-speed block at the top of
+    # analyze() (FIX 1, Oct 21) — fires on the FIRST tick at the feed-cache
+    # price, before enrichment latency gaps the fill. Sticky floors set there
+    # (tier_stop_triggered / hard_stop_triggered) are non-overridable below.
 
     # --- Liquidity collapse (FIX #3: missing-liq fallback) ---
     stored_entry_liq = pos.get("entry_liq")
     entry_liq = float(stored_entry_liq or liq or 0)
     # Oct 21 fix: liq may be None (UNKNOWN) — collapse checks only fire on
     # CONFIRMED liquidity values, never on missing data.
+    # FIX 2 (Oct 21): EMERGENCY requires mult < 1.0 — a green coin (1.08-1.36x)
+    # with halved liq is a CLIP_50 at most, never a panic exit (the 7 phantom
+    # emergency-at-flat class that cut winners at 1.08-1.36x).
     if liq is not None and stored_entry_liq and float(stored_entry_liq) > 0 and liq < float(stored_entry_liq) * 0.5:
-        signals.append(f"LIQ_COLLAPSE: ${liq:,.0f} < 50% of entry ${float(stored_entry_liq):,.0f}")
-        action = "EMERGENCY_EXIT"
+        if mult < 1.0:
+            signals.append(f"LIQ_COLLAPSE: ${liq:,.0f} < 50% of entry ${float(stored_entry_liq):,.0f}")
+            action = "EMERGENCY_EXIT"
+        else:
+            signals.append(f"LIQ_HALVED_BUT_GREEN: ${liq:,.0f} < 50% of entry but mult {mult:.2f}x — clip, don't panic")
+            if action == "HOLD": action = "CLIP_50"
     elif liq is not None and not stored_entry_liq and liq > 0 and mult <= 0.75:
         # FIX #3: NO entry liquidity snapshot was stored at buy time — a >25%
         # price drawdown with any reported liquidity is collapse risk (price proxy)
@@ -206,9 +229,16 @@ def analyze(mint, pos):
     # --- LIQ=0 -> DEAD (ghost/dumped position: no one can exit at $0) ---
     # Oct 21 fix: only CONFIRMED zero liq is DEAD. liq=None = UNKNOWN data —
     # a missing feed row was collapsing to 0 and emergency-exiting healthy coins.
+    # FIX 2 (Oct 21): DEAD requires mult < 1.0 — a GREEN coin (mult >= 1.0) with
+    # confirmed zero liq is CLIP_50/mark-to-market, never a total-loss write-off
+    # (7-book class: EMERGENCY booked at 1.02-1.36x on coins that were UP).
     if liq is not None and liq <= 0:
-        signals.append("LIQ=0 — dead/dumped position, no liquidity to exit into")
-        action = "DEAD"
+        if mult < 1.0:
+            signals.append("LIQ=0 — dead/dumped position, no liquidity to exit into")
+            action = "DEAD"
+        else:
+            signals.append(f"LIQ=0_BUT_GREEN: mult {mult:.2f}x with zero liq — clip profit, don't write off")
+            if action in ("HOLD", "CLIP_50"): action = "CLIP_50"
 
     # --- Volume drying (autopilot exit) ---
     entry_v = float(pos.get("entry_vol_h1") or vol_h1 or 0)
@@ -250,17 +280,24 @@ def analyze(mint, pos):
     # frees capital) so it is checked FIRST; MAX_HOLD is the hard cap for
     # positions that are still moving. Sticky floors (hard stop / emergency)
     # already fired above and must NOT be downgraded.
-    hold_s = MAX_HOLD_CONVICTION_S if conviction else MAX_HOLD_S
+    hold_s = MAX_HOLD_CONVICTION_S if conviction else max_hold_for(mc)
     age_s = age_min * 60
     if action in ("HOLD", "CLIP_50"):
         if age_s >= SIDEWAYS_S and abs(pnl_pct) < SIDEWAYS_PNL_PCT:
             signals.append(f"SIDEWAYS: {age_s/60:.0f}min open, |pnl| {abs(pnl_pct):.1f}% < {SIDEWAYS_PNL_PCT}% — frees capital")
             action = "EXIT_ALL"
             pos["time_exit_triggered"] = True
-        elif age_s >= hold_s:
-            signals.append(f"MAX_HOLD: {age_s/60:.0f}min >= {hold_s/60:.0f}min — time exit (quick-flip horizon)")
+        elif age_s >= hold_s and mult <= 1.0:
+            # FIX 2 (Oct 21): MAX_HOLD fires ONLY on losers/flat (mult <= 1.0).
+            # Winners ride to TP2/clips — the 5-min MAX_HOLD was strangling
+            # 11 winners at 1.04-1.73x (+$157 left on table) and emergency-ing
+            # green coins. Green + old + stalled is handled by SIDEWAYS (flat)
+            # and ATH_PROXIMITY / VOLUME_DRYING (stalled momentum).
+            signals.append(f"MAX_HOLD: {age_s/60:.0f}min >= {hold_s/60:.0f}min at {mult:.2f}x — time exit (quick-flip horizon)")
             action = "EXIT_ALL"
             pos["time_exit_triggered"] = True
+        elif age_s >= hold_s and mult > 1.0:
+            signals.append(f"MAX_HOLD_SKIPPED: {age_s/60:.0f}min old but GREEN ({mult:.2f}x) — riding to TP2 (FIX 2)")
 
     # --- ATH-PROXIMITY CLIP (Oct 21, Charon topBlastRisk) ---
     # Charon: current/rangeHigh >= 0.85 = top-blast risk zone (within 15% of the
@@ -536,7 +573,13 @@ def analyze(mint, pos):
         for e in events:
             if e["sev"] in ("high", "critical"):
                 signals.append(f"EVENT {e['type']}: {e['detail']}")
-                if e["sev"] == "critical": action = "EMERGENCY_EXIT"
+                # FIX 2 (Oct 21): critical events require mult < 1.0 to panic —
+                # a green coin at 1.08-1.36x must never be emergency-exited (the
+                # 7-book phantom-emergency class). Green + critical = CLIP_50.
+                if e["sev"] == "critical" and mult < 1.0: action = "EMERGENCY_EXIT"
+                elif e["sev"] == "critical" and mult >= 1.0:
+                    signals.append(f"EVENT_CRITICAL_BUT_GREEN: {e['type']} at {mult:.2f}x — clip, don't panic")
+                    if action == "HOLD": action = "CLIP_50"
         # Build 2: persist each signal as decaying evidence + compute TTL weights
         now_ev = time.time()
         for s in signals:
