@@ -34,7 +34,17 @@ WRITE_EVERY_S = 5             # flush cache every 5s if changed
 FRESH_CALL_S = 3600           # keep calls in watchlist for 1h
 MAX_MINTS = 400               # cap total tracked (should stay < 40)
 
-_log = lambda msg: print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def _log(msg, *args):
+    """Log with optional printf-style args (Oct 21 fix): callers use
+    _log('cycle err: %s', str(ex)) — a single-arg lambda crashed the feed
+    whenever a cycle raised, and the supervisor kept restarting a dead child."""
+    try:
+        if args:
+            print(f"[{time.strftime('%H:%M:%S')}] {msg % args}", flush=True)
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    except Exception:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 _watch = set()                # mints to track
 _state = {}                   # mint -> market dict

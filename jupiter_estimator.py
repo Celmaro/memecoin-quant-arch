@@ -107,6 +107,12 @@ def quote_fill(mint, usd=20, slippage_bps=500, timeout=6, retries=1):
     default is 20s x 3 retries — too slow for the paper tick; a hung quote must
     fall back to the 1% latency slip, never block the tick).
 
+    Oct 21 PHANTOM-BOOK GUARD: the fill price must be within a sane band of the
+    feed price (0.2x..5x). A Jupiter out_tokens scale error (wrong decimals /
+    raw-vs-token mixup) once produced entry_px ~1e6x too small -> a $20 position
+    booked +$30.8M at mult 1.59M. Out-of-band fill prices are rejected (None) so
+    the caller falls back to the 1% slip — a corrupted FILL is worse than none.
+
     NOTE: quote() itself is used for reporting with generous budgets; this is
     the entry-path variant that must never block the tick."""
     import threading
@@ -131,6 +137,17 @@ def quote_fill(mint, usd=20, slippage_bps=500, timeout=6, retries=1):
     if out_tok <= 0:
         return None
     fill_px = usd / out_tok
+    # sanity band vs the feed price (decision mark) — reject scale-corrupted fills
+    try:
+        from desk_common import market_for
+        _feed = market_for(mint, timeout=5, retries=0) or {}
+        _fp = float(_feed.get("priceUsd") or 0)
+        if _fp > 0:
+            _ratio = fill_px / _fp
+            if not (0.2 <= _ratio <= 5.0):
+                return None  # fill wildly off the feed price — use 1% slip instead
+    except Exception:
+        pass
     return (fill_px, float(r.get("price_impact_pct") or 0),
             float(r.get("fee_drag_usd") or 0), "jupiter")
 

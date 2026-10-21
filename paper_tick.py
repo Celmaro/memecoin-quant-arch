@@ -300,7 +300,18 @@ def auto_buy():
             continue
     parsed.sort(key=lambda x: x[0], reverse=True)  # newest first
     now = time.time()
+    # Oct 21 timeout fix: auto_buy had NO deadline — many fresh calls x market_for
+    # (3.4s each on feed-cache miss) could blow the supervisor's 120s subprocess
+    # window BEFORE the main loop's TICK_DEADLINE even started. That's how 63
+    # positions piled up overnight: call_notifier bought via entry_call, paper_tick
+    # kept timing out, exits never ran. Bound the WHOLE buy scan to the same
+    # 100s budget; the main loop deadline is set in main() AFTER auto_buy, so
+    # auto_buy gets its own ceiling here.
+    import time as _t_buy
+    _BUY_DEADLINE = _t_buy.time() + 90   # < 120s supervisor window (auto_buy + main)
     for t, d in parsed:
+        if _t_buy.time() > _BUY_DEADLINE:
+            break  # budget: stop scanning new calls; the main loop still runs below
         age = now - t
         # FIX #7b: stop at first stale AFTER sorted — but skip anything malformed
         if age > 300:  # only live calls
@@ -762,12 +773,28 @@ def main():
             # fallback to legacy inline path ONLY if the stage engine is unavailable
             if stage is None and "unavailable" in (out[-1] if out else ""):
                 frac = frac or (0.5 if decision_action == "CLIP_50" else 1.0)
+                # Oct 21 CORRUPTION CAP (phantom-book incident): the legacy inline
+                # writer had NO cap — a scale-corrupted entry_px made mult 1.59M
+                # and a $20 position "sold" for +$30.8M (paper_book_CORRUPT_... .
+                # The stage engine has MAX_BOOKED_GAIN_MULT; this fallback must too.
+                try:
+                    from bot.position_manager.scaleout import MAX_BOOKED_GAIN_MULT as _MAXG, _confirm_gain
+                except Exception:
+                    _MAXG, _confirm_gain = 10.0, None
+                if float(mult or 0) > _MAXG:
+                    if _confirm_gain:
+                        _cap = _confirm_gain(mint, float(mult), float(p.get("entry_px") or 0))
+                        if _cap is not None:
+                            mult = _cap
+                    if float(mult or 0) > _MAXG:
+                        out.append(f"CORRUPT-CAP {sym}: mult {mult:.4g} > cap {_MAXG:.0f} — booking at cap")
+                        mult = _MAXG
                 sold = entry_usd * frac * mult
                 pnl = sold - entry_usd * frac
                 b["realized"] = round(b.get("realized", 0.0) + pnl, 2)
                 b["cash"] = round(b.get("cash", 0.0) + sold, 2)
                 b.setdefault("trades", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
-                    "entry_px": p["entry_px"], "exit_px": px, "mult": mult,
+                    "entry_px": p["entry_px"], "exit_px": px, "mult": round(mult, 4),
                     "pnl": round(pnl, 2), "how": f"decision_{decision_action.lower()}",
                     "closed": frac >= 0.99})
                 if frac >= 1.0:
