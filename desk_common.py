@@ -154,22 +154,102 @@ DEFAULT_RATE_LIMITS = {
 }
 set_rate_limits(DEFAULT_RATE_LIMITS)
 
+# ---------------- Helius outage cooldown (Oct 21 latency fix) ----------------
+# Helius quota exhaustion was costing every deep scan ~196s of retry sleeps and
+# every paper_tick a 30s timeout per forensic call. Once the keyed endpoint
+# fails, skip it for HELIUS_COOLDOWN_S (120s). The marker is FILE-BACKED so the
+# supervisor's fresh subprocesses (paper_tick, instant_trigger) inherit the
+# known-dead state at import instead of each paying the discovery cost from 0.
+HELIUS_COOLDOWN_S = 120
+_HELIUS_DEAD_FILE = os.path.join(DESK, ".helius_dead_at")
+_HELIUS_DEAD_AT = 0.0
+
+def _helius_dead_from_disk():
+    try:
+        with open(_HELIUS_DEAD_FILE) as f:
+            return float(f.read().strip() or 0.0)
+    except Exception:
+        return 0.0
+
+_HELIUS_DEAD_AT = _helius_dead_from_disk()
+
+def helius_down():
+    """True while the keyed Helius endpoint is in cooldown (skip its calls)."""
+    return time.time() - _HELIUS_DEAD_AT < HELIUS_COOLDOWN_S
+
+def mark_helius_dead():
+    global _HELIUS_DEAD_AT
+    _HELIUS_DEAD_AT = time.time()
+    try:
+        with open(_HELIUS_DEAD_FILE, "w") as f:
+            f.write(str(_HELIUS_DEAD_AT))
+    except Exception:
+        pass
+
+def mark_helius_alive():
+    global _HELIUS_DEAD_AT
+    _HELIUS_DEAD_AT = 0.0
+    try:
+        if os.path.exists(_HELIUS_DEAD_FILE):
+            os.remove(_HELIUS_DEAD_FILE)
+    except Exception:
+        pass
+
 def rpc(method, params, rpc_url=None, retries=2):
     """RPC call through the shared limiter + retry (audit P2-6: rpc() bypassed
-    the central _limiter and had no retry; now both are consistent)."""
+    the central _limiter and had no retry; now both are consistent).
+
+    Oct 20: Helius quota exhaustion froze intake (is_token_mint -> False for
+    every fresh call). Added a PUBLIC RPC fallback so a keyed-provider outage
+    (429/quota) degrades to the free endpoint instead of returning None for
+    everything. Same soft-fail contract: None only if ALL endpoints fail."""
+    global _HELIUS_DEAD_AT  # kept for direct-set callers/tests
     cfg = load_config()
-    url = rpc_url or f"https://mainnet.helius-rpc.com/?api-key={cfg['HELIUS_KEY']}"
+    # PUBLIC-FIRST (Oct 21 real-engineering): api.mainnet-beta.solana.com is
+    # free + reliable and supports every STANDARD method we call (getAccountInfo,
+    # getSignaturesForAddress, getTransaction, getTokenSupply). Helius becomes a
+    # FALLBACK (saves credits) — it stays the primary ONLY for DAS/enhanced
+    # endpoints public RPC lacks (getTokenAccounts owner queries, v0/enhanced txs).
+    # publicnode is 403-blocked from this box — REMOVED so we never burn 12s per retry.
+    primary = rpc_url or f"https://mainnet.helius-rpc.com/?api-key={cfg['HELIUS_KEY']}"
+    if rpc_url:
+        endpoints = [rpc_url]
+    else:
+        endpoints = ["https://api.mainnet-beta.solana.com",          # PUBLIC first
+                     primary,                                        # Helius fallback
+                     ]
+        # Cooldown (Oct 21): skip a known-429 primary — retrying a dead quota
+        # endpoint wastes 1.5-4.5s per attempt on every call in the scan.
+        if helius_down():
+            endpoints = endpoints[:1]
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     last = None
-    for attempt in range(retries + 1):
-        _limiter.acquire(_host_of(url))
-        try:
-            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=25) as r:
-                return json.loads(r.read().decode()).get("result")
-        except Exception as e:
-            last = e
-            time.sleep(1.5 * (attempt + 1))
+    for url in endpoints:
+        for attempt in range(retries + 1):
+            _limiter.acquire(_host_of(url))
+            try:
+                req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    res = json.loads(r.read().decode())
+                    # JSON-RPC error (e.g. method unsupported on fallback) — try next endpoint
+                    if "error" in res:
+                        last = Exception(str(res["error"]))
+                        break
+                    # keyed endpoint answered — clear the outage marker
+                    if url.startswith("https://mainnet.helius-rpc.com"):
+                        mark_helius_alive()
+                    return res.get("result")
+            except Exception as e:
+                last = e
+                # ANY failure on the keyed endpoint (429 quota, timeout,
+                # connection reset) starts/sustains the cooldown — retrying an
+                # unreachable primary wastes 1.5-4.5s per call on every scan.
+                if url.startswith("https://mainnet.helius-rpc.com"):
+                    mark_helius_dead()
+                # only sleep between attempts — never after the final one
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+        # moved past this endpoint's retries — on to the next (if any)
     return None  # soft-fail contract: callers treat None as missing data
 
 # ---------- GMGN quotation rank (verified free, no key — Oct 16 2026) ----------
@@ -277,6 +357,11 @@ def goplus_security(mint):
 
 def helius_txs(wallet, limit=100, before=None):
     cfg = load_config()
+    # Oct 21 latency: Helius 429 cooldown — a dead keyed endpoint costs a 30s
+    # timeout per call (profile: 6 positions × ~24s = the whole paper_tick
+    # budget). Return [] (honest Ø) instead of burning the tick.
+    if helius_down():
+        return []
     url = f"https://mainnet.helius-rpc.com/v0/addresses/{wallet}/transactions?api-key={cfg['HELIUS_KEY']}&limit={limit}"
     if before: url += f"&before={before}"
     return http_json(url, timeout=30)[1]
@@ -285,6 +370,9 @@ def helius_asc_txs(wallet, limit=10):
     """Forensic: FIRST transactions of a wallet chronologically (mother-wallet attribution).
     Eliminates the N+1 problem — one call instead of paging 25K signatures."""
     cfg = load_config()
+    # Oct 21 latency: same Helius 429 cooldown guard as helius_txs
+    if helius_down():
+        return []
     url = (f"https://mainnet.helius-rpc.com/v0/addresses/{wallet}/transactions"
            f"?api-key={cfg['HELIUS_KEY']}&limit={limit}&sortOrder=asc")
     return http_json(url, timeout=30)[1]
@@ -492,6 +580,40 @@ def dex_pair(mint, allow_fallback=True, timeout=20, retries=3):
     pairs = [p for p in pairs if p.get("priceUsd") or p.get("marketCap")]
     if not pairs:
         return _gecko_pair(mint) if allow_fallback else None
+    # Pool-mismatch glitch guard (Oct 20 audit): DexScreener sometimes attaches a
+    # bogus high-tvl pair to a pump.fun mint (4539srzEL: Meteora pair showed
+    # $6.1B MC / $4.6B liq, px $6.21, while the real pools are pumpfun $43K +
+    # pumpswap $2K, px ~1e-5). Two signatures:
+    #   1. marketCap >> liquidity on a non-bonding-curve dex (MC/liq > 10)
+    #   2. price wildly inconsistent with the mint's other pairs (real pools of
+    #      the same token arbitrage within a few x; a 1000x+ outlier is an
+    #      artifact). Median-price consistency is the primary guard — the glitch
+    #      pair had plausible MC/liq (1.31x) but px 150,000x the real pools.
+    sane = []
+    px_vals = []
+    for p in pairs:
+        try:
+            v = float(p.get("priceUsd") or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            px_vals.append(v)
+    px_vals.sort()
+    med_px = px_vals[len(px_vals) // 2] if px_vals else 0.0
+    for p in pairs:
+        mc = p.get("marketCap") or 0
+        liq = (p.get("liquidity") or {}).get("usd") or 0
+        dex = (p.get("dexId") or "").lower()
+        try:
+            px = float(p.get("priceUsd") or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if mc > 0 and liq > 0 and mc / liq > 10 and dex not in ("pumpfun", "pumpswap", "moonshot"):
+            continue  # implausible MC-to-liq ratio on a pool dex — mismatch artifact
+        if med_px > 0 and px > 0 and px / med_px > 1000:
+            continue  # cross-pair price outlier — mismatched pool artifact
+        sane.append(p)
+    pairs = sane or pairs
     pairs.sort(key=lambda p: (p.get("liquidity", {}).get("usd") or 0) + (p.get("volume", {}).get("h24") or 0), reverse=True)
     return pairs[0]
 
@@ -530,14 +652,16 @@ def pumpdata_market(mint, max_age_s=CACHE_TTL_S):
     if px <= 0:
         return None
     mc = float(row.get("mc_usd") or 0)
-    liq = float(row.get("liq_usd") or 0)
+    liq_raw = row.get("liq_usd")          # None/absent = feed never measured it yet
+    liq = float(liq_raw) if liq_raw not in (None, "") else None
     chg_m5 = row.get("chg_m5")
     vol_m5 = float(row.get("vol_m5_usd") or 0)
     vol_h1 = float(row.get("vol_h1_usd") or 0)
     return {
         "priceUsd": px,
         "marketCap": mc,
-        "liquidity": {"usd": liq},
+        "liquidity": {"usd": liq},        # None = UNKNOWN (Oct 21: missing feed data was
+                                          # collapsing to 0 and triggering phantom DEAD exits)
         "priceChange": {"m5": chg_m5},           # feed-derived (None for fresh coins <5m)
         "txns": {"m5": {"buys": int(row.get("b5") or 0), "sells": int(row.get("s5") or 0)}},
         "volume": {"m5": vol_m5, "h1": vol_h1, "h24": None},   # h24 feed can't see — None
@@ -652,6 +776,14 @@ def is_token_mint(address, timeout_cache=300):
     }
     try:
         acc = rpc("getAccountInfo", [address, {"encoding": "jsonParsed"}])
+        if acc is None:
+            # RPC soft-fail (429/network/quota) — do NOT classify as "not a mint".
+            # Unknown vs definitely-wallet: return None so callers can be permissive
+            # (audit §3 intent: "RPC down: be permissive — still caught by the
+            # freshness gate + scanner path"). Fixed Oct 20: rpc() returns None on
+            # 429 (Helius quota exhausted) and the old code cached False -> EVERY
+            # fresh call was wallet_addr_rejected and intake silently froze.
+            return None
         v = (acc or {}).get("value") or {}
         owner = v.get("owner") or ""
         data = v.get("data") or {}
@@ -1051,8 +1183,10 @@ def goplus_pre_execution(tx_encoded):
 
 # 3. Helius Wallet API: funded_by + identity (100cr/call — budgeted)
 def helius_wallet(wallet):
-    """Who funded a wallet + identity labels. BUDGETED (helius_wallet, 100cr)."""
-    if not budget("helius_wallet"):
+    """Who funded a wallet + identity labels. BUDGETED (helius_wallet, 100cr).
+    Oct 21 real-engineering: also breaker-gated — a quota-dead Helius (any host)
+    must not burn 2 x 20s timeouts on a REST endpoint the public RPC lacks."""
+    if not budget("helius_wallet") or helius_down():
         return None
     try:
         st, d = http_json(f"https://api.helius.xyz/v1/wallet/{wallet}/identity",

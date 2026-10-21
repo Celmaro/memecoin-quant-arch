@@ -5,7 +5,7 @@ Uses the keyed Jupiter Public API at api.jup.ag/swap/v1/quote (Authorization: Be
 which this environment can reach (quote-api.jup.ag does not resolve here).
 Falls back to DexScreener pricing when the quote API is unreachable.
 """
-import sys, urllib.request, urllib.parse, json, re
+import sys, urllib.request, urllib.parse, json, re, time
 from desk_common import SOL_MINT, dex_pair, load_config, http_json
 
 QUOTE = "https://api.jup.ag/swap/v1/quote"
@@ -16,11 +16,21 @@ FEE_BPS = 1.7  # P4 (Oct 20): REAL-QUOTE estimate only (terminal ~0.9% + pool ~0
 
 
 def sol_price():
-    """SOL/USD from DexScreener USDC pair (price.jup.ag doesn't resolve in this env)."""
+    """SOL/USD — FREE PUMPDATA FEED FIRST (Oct 21 real-engineering: the 15s
+    keepalive emit writes sol_usd into pumpdata_cache.json — no DexScreener
+    poll, no 429). DexScreener stays the fallback only when the feed is stale."""
+    try:
+        import os, json as _j
+        cache = os.path.expanduser("~/memecoin-quant/pumpdata_cache.json")
+        d = _j.load(open(cache))
+        v = float(d.get("sol_usd") or 0)
+        upd = float(d.get("updated") or 0)
+        if v > 0 and time.time() - upd <= 180:   # keepalive cadence ~15s; 180s = generous
+            return v
+    except Exception:
+        pass
     try:
         d = dex_pair(SOL_MINT)
-        for p in [d] + ([] if not d else []):
-            pass
         req = urllib.request.Request("https://api.dexscreener.com/latest/dex/tokens/" + SOL_MINT,
                                      headers={"User-Agent": "Mozilla/5.0"})
         data = json.loads(urllib.request.urlopen(req, timeout=20).read())

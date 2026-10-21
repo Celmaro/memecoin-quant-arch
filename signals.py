@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Signal engine: slow-graduation, wash-trade/LPI detector, fragility score (ME2F-lite), OHLCV risk."""
 import time, statistics, json, os
-from desk_common import dex_pair, rpc, rugcheck, db, load_config, http_json, UA, helius_asc_txs
+from desk_common import dex_pair, rpc, rugcheck, db, load_config, http_json, UA, helius_asc_txs, helius_down
 
 # ---------- 1. Slow-graduation (bonding-curve fill time) ----------
 
@@ -9,6 +9,11 @@ def estimate_fill_time(mint, pair_created_ms=None, max_pages=20):
     """Curve fill ≈ (pair creation) - (first tx on mint).
     Uses Helius asc archival lookup (1 call) when possible; falls back to paged
     getSignaturesForAddress. Returns minutes (float) or None."""
+    # Oct 21 latency: with Helius in 429 cooldown, the fast path is dead AND the
+    # paged fallback would page slow public RPC (20 pages × ~2s = 40s per call,
+    # × 6 positions = the whole paper_tick budget). Return honest None instead.
+    if helius_down():
+        return None
     if not pair_created_ms:
         pair = dex_pair(mint)
         if not pair: return None
@@ -262,7 +267,7 @@ def holder_growth(mint, limit=100):
     Excludes the DEX pair account and the mint itself. Returns sampled-window counts
     bucketed 1h/6h/24h, or None when no data. Best-effort (limit=100 recent txs)."""
     cfg = load_config()
-    if not cfg.get("HELIUS_KEY"):
+    if not cfg.get("HELIUS_KEY") or helius_down():   # Oct 21 latency: skip dead endpoint
         return None
     try:
         st, data = http_json(
@@ -337,7 +342,11 @@ def holder_churn(mint, limit=1000):
     Returns None if the snapshot or DAS query fails.
     """
     cfg = load_config()
-    if not cfg.get("HELIUS_KEY"):
+    # Oct 21 real-engineering: Helius is DAS-only here (public RPC has no
+    # getTokenAccounts) — but a quota-dead Helius must NOT burn 30s x 2 retries
+    # per holder_churn call in the deep-scan path. Same cooldown guard as
+    # holder_growth/helius_txs: return None (honest Ø) instead of timing out.
+    if not cfg.get("HELIUS_KEY") or helius_down():
         return None
     snap = _load_holder_snapshot().get(mint) or {}
     # 1) Fetch current holders (DAS getTokenAccounts, single comparable page)

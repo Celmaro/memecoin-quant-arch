@@ -253,6 +253,12 @@ try:
 
     def _stub_analyze():
         _pm.market_for = lambda mint, **kw: dict(_F)
+        # Oct 21 real-engineering (LESS-CODE rule: stub where the import lives):
+        # position_monitor imports BOTH market_for AND dex_pair at module level
+        # (line 18). Stubbing only market_for left a real dex_pair call for the
+        # invalid test mint "X" — a live DexScreener 429/timeout made this test
+        # flaky (failed once with ERR, passed on rerun). No network may slip in.
+        _pm.dex_pair = lambda mint, **kw: dict(_F)
         # provider stubs — every call analyze makes should return empty/neutral fast
         for name in ("token_intel", "holder_growth", "holder_churn", "fresh_wallet_power"):
             if hasattr(_pm, name): setattr(_pm, name, lambda *a, **k: {})
