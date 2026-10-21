@@ -106,7 +106,8 @@ Docs: https://docs.dexpaprika.com/llms.txt · Base: `https://api.dexpaprika.com`
 - `GET /networks/{network}/pools/{pool}/transactions` (paid)
 - `GET /tokens/{addr}` · `GET /search?query=SYM` · `POST /networks/{network}/tokens/prices` (batch ≤10)
 - `GET /usage` — plan/credits
-- **SSE:** `https://streaming.dexpaprika.com` (prices/reserves) · `https://streaming-pro.dexpaprika.com` (txns/candles, paid)
+- **SSE (LIVE-PROBED Oct 21):** `https://streaming.dexpaprika.com` — ⚠️ PRIOR NOTE ("prices/reserves") WAS WRONG: only the OLD deprecated `/stream` was keyless-for-showcase; current paths: `GET /sse/prices?method=token_price&chain=solana&address=<MINT>` (event `token_price`, ~1s, **keyless only for 35 showcase assets** — live probe SOL returned 106.057 ✅; non-showcase pump.mint = 403 keyless), `GET /sse/reserves?method=token_reserves|pool_reserves` (403 keyless — needs FREE key at console.dexpaprika.com, 300K cr/mo), `POST /sse/prices` ≤25 assets (403 keyless — needs key). Free key = 1cr per EVENT delivered (connections free); 10 concurrent SSE/IP; ping 15s. Old `/stream` (t_p) DEPRECATED.
+- **KEY ACTION:** free DexPaprika key unlocks SSE prices+reserves for ALL mints = second independent live tape + live liquidity-collapse stream. NOT wired yet (user signup needed).
 - **Pro host:** `https://api-pro.dexpaprika.com` (Authorization: api_KEY)
 - **Auth:** free key = bare `Authorization: <api_...>` (no scheme word); keyless anon 402 when monthly limit hit
 - **MCP/SDKs/CLI** available
