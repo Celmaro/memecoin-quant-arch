@@ -89,7 +89,11 @@ def http_json(url, timeout=20, retries=3, backoff=2.0, headers=None, method=None
     if data is not None:
         h.setdefault("Content-Type", "application/json")
     last = None
-    for attempt in range(retries):
+    # Oct 21 audit: range(retries) never executed ANY attempt when retries=0
+    # (loop body skipped -> `raise last` of None -> TypeError on every retries=0
+    # call, masking real provider status). `retries` = ADDITIONAL attempts past
+    # the first, so retries=0 must still make ONE request.
+    for attempt in range(max(retries, 1)):
         try:
             req = urllib.request.Request(url, headers=h, data=data, method=method)
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -101,6 +105,11 @@ def http_json(url, timeout=20, retries=3, backoff=2.0, headers=None, method=None
             raise
         except (urllib.error.URLError, TimeoutError, ConnectionResetError) as e:
             last = e; time.sleep(backoff * (attempt + 1))
+    # Oct 21 audit: range(0) (retries=0) never loops -> last=None -> `raise last`
+    # raised TypeError "exceptions must derive from BaseException" on every call.
+    # Never raise a non-exception; return a clean (None, {}) so callers fail soft.
+    if last is None:
+        return None, {}
     raise last
 
 # ---------- RateLimiter: centralized per-host token bucket ----------
