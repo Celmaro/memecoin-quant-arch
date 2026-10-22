@@ -123,6 +123,29 @@ def _save_book_guarded(b):
         os.fsync(f.fileno())
     os.replace(tmp, BOOK)
 
+# DAILY STOP KILL-SWITCH (3rd audit 2.1, Oct 22): the daily-loss stop used to be
+# an advisory DM line — auto_buy/entry_call never checked it, so a fresh signal
+# could still be bought right after the -$20 day. Persist stop_until in the book
+# and gate BOTH entry paths on it (checked before any quote/network work).
+STOP_HOURS = 24.0
+
+def daily_stop_active(b=None):
+    """True while the daily-loss stop is in effect (stop_until in the future)."""
+    try:
+        b = b if b is not None else load_book()
+        until = float(b.get("stop_until") or 0)
+        return until > time.time()
+    except Exception:
+        return False
+
+def daily_stop_remaining_s(b=None):
+    try:
+        b = b if b is not None else load_book()
+        until = float(b.get("stop_until") or 0)
+        return max(0, int(until - time.time()))
+    except Exception:
+        return 0
+
 _GATE_EMIT_FILE = os.path.expanduser("~/memecoin-quant/.gate_emit_state.json")
 
 def _gate_emit_ok(sym, reason, how, cooldown_s=300):
@@ -319,6 +342,10 @@ def _auto_buy_locked():
     b = load_book()
     if not b.get("autobuy", True):
         return []
+    # 3rd audit 2.1: enforced daily-stop kill switch (was advisory DM text).
+    if daily_stop_active(b):
+        _left = daily_stop_remaining_s(b)
+        return [f"⛔ DAILY STOP — no new entries ({_left//3600}h{_left%3600//60}m left)"]
     bought = []
     import json as _j
     # audit P2 (Oct 18): dedupe by MINT only, never by ticker symbol — two
@@ -432,6 +459,19 @@ def _auto_buy_locked():
             b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                                 "why": f"seller_flood_{b5}B/{s5}S_5m"})
             continue
+        # LIVENESS GATE (Oct 22, deep-check #2 — skip-never-life): on-chain tape
+        # proved coins flat for 60s after the call are 13-17% WR / -$61; the
+        # death signal is visible within 60s (f3-dead coins were already flat at
+        # f60). FAIL-CLOSED only on PROVEN death; missing tape = buy anyway.
+        try:
+            from desk_common import liveness_gate
+            lv = liveness_gate(mint, t)
+            if lv is False:
+                b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                    "why": f"never_life_f60"})
+                continue
+        except Exception:
+            pass  # gate never blocks on its own failure — buy-all mandate
         # FIX 2: confluence size booster — 2+ channels => max size regardless of channel
         # Oct 19: real confluence from ledger (see entry_call for rationale)
         conf = 1
@@ -554,6 +594,10 @@ def _entry_call_locked(d, b=None, aegis_score=None):
     b = b if b is not None else load_book()
     if not b.get("autobuy", True):
         return None, "autobuy_disabled"
+    # 3rd audit 2.1: enforced daily-stop kill switch (instant/notifier path too).
+    if daily_stop_active(b):
+        _left = daily_stop_remaining_s(b)
+        return None, f"daily_stop_{_left//3600}h{_left%3600//60}m"
     mint = d.get("mint")
     sym = d.get("symbol") or "?"
     if not mint:
@@ -630,6 +674,19 @@ def _entry_call_locked(d, b=None, aegis_score=None):
                                             "why": f"seller_flood_{b5}B/{s5}S_5m"})
         save_book(b)
         return None, f"seller_flood_{b5}B/{s5}S_5m"
+    # LIVENESS GATE (Oct 22, deep-check #2 — skip-never-life): same 60s-window
+    # rule as auto_buy. FAIL-CLOSED only on PROVEN death; missing tape = buy
+    # anyway (buy-all mandate; None ≠ zero).
+    try:
+        from desk_common import liveness_gate
+        lv = liveness_gate(mint, ts)
+        if lv is False:
+            b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                "why": f"never_life_f60"})
+            save_book(b)
+            return None, "never_life_f60"
+    except Exception:
+        pass
     FILL_LATENCY_SLIP_PCT = 1.0  # defined here; used in the fill block after size is final
     if sym == "?" or sym == "None":
         sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
@@ -1055,10 +1112,22 @@ def _main_locked():
         elif wr < 40: risk += 12
         lvl = "HIGH" if risk >= 60 else ("MEDIUM" if risk >= 30 else "LOW")
         day_note = f"⚖️ risk {lvl} (day ${day_pnl:+.2f}/−$20, {n_open}/5 open, wr {wr:.0f}%)"
+        # 3rd audit 2.1: PERSIST the kill switch, don't just print it. The very
+        # first tick that crosses -$20 arms stop_until (24h); entry paths
+        # (auto_buy/entry_call) check it before any quote work. Only re-arm
+        # (extend) when still bleeding — do NOT shrink an existing stop.
         if day_pnl <= -20:
             day_note += " 🛑 DAILY STOP — no new entries 24h"
+            if float(b.get("stop_until") or 0) < time.time() + STOP_HOURS * 3600:
+                b["stop_until"] = time.time() + STOP_HOURS * 3600
+                save_book(b)
         elif day_pnl <= -16:
             day_note += " ⚠️ near daily stop"
+        # clear the arm once the day recovers above -$16 AND the arm already
+        # expired (never clear a still-active stop, even on a green tick)
+        elif float(b.get("stop_until") or 0) and float(b.get("stop_until") or 0) < time.time():
+            b.pop("stop_until", None)
+            save_book(b)
     except Exception:
         day_note = ""
     out.append(f"💼 Paper account: ${eq:.2f} (started ${b['start']:.0f}, {'+' if gain>=0 else ''}{gpct:.0f}% — {mood}). Waiting cash: ${cash:.2f}. Coins held: {len(b['positions'])}.{held_note} Still need ${need:.2f} to reach the $500 goal.")

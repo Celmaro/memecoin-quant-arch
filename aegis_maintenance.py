@@ -15,7 +15,7 @@ Actions:
 """
 import sys, time, sqlite3, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from desk_common import db
+from desk_common import db, init_schema, log_event
 
 DRY = "--dry-run" in sys.argv
 NOW = time.time()
@@ -25,6 +25,22 @@ def count(con, sql, *a):
     return con.execute(sql, a).fetchone()[0]
 
 def main():
+    # 3rd audit 7.2: aegis_maintenance immediately queried evidence_events and
+    # wallet_history, which are created by bot.persistence.ensure_schema() — NOT
+    # by desk_common.init_schema(). On a fresh checkout the daily job crashed on
+    # a missing table and the supervisor silently rescheduled it for +24h.
+    # Initialize the full schema first (idempotent) so cleanup works everywhere.
+    try:
+        from bot.persistence import ensure_schema
+    except Exception:
+        ensure_schema = None
+    try:
+        if ensure_schema is not None:
+            ensure_schema()
+        else:
+            init_schema()
+    except Exception:
+        init_schema()
     con = db()
     report = {}
 
@@ -84,12 +100,19 @@ def main():
             import subprocess
             p = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "aegis_learn.py"), "--apply"],
                                capture_output=True, text=True, timeout=70)
+            # 3rd audit 7.2: check returncode — a crashed learner (missing table,
+            # traceback) used to be parsed as "no deltas written" = silent success
+            # that appeared to rerun every day while never updating the file.
             n = 0
-            for ln in (p.stdout or "").splitlines():
-                if "wrote" in ln:
-                    lr = ln.strip()
-                if "delta=" in ln:
-                    n += 1
+            if p.returncode != 0:
+                lr = f"FAILED (rc={p.returncode})"
+                report["learning_error"] = (p.stderr or p.stdout or "")[-200:]
+            else:
+                for ln in (p.stdout or "").splitlines():
+                    if "wrote" in ln:
+                        lr = ln.strip()
+                    if "delta=" in ln:
+                        n += 1
             report["learning_deltas"] = n
         except Exception as e:
             report["learning_error"] = str(e)[:80]

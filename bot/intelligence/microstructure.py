@@ -49,8 +49,19 @@ def microstructure(mint, pool=None):
     cvd = (buy_usd - sell_usd) / total if total else 0
     n_buy = len(buys)
     unique_buyers = len(set(t["wallet"] for t in buys if t["wallet"]))
-    big_buys = [t for t in buys if t["usd"] > 0 and t["usd"] >= (buy_usd / n_buy * 3 if n_buy else 1)]
-    concentration = len(big_buys) / n_buy if n_buy else 0
+    # 3rd audit 5.6 (Oct 22): concentration was `fraction of buys >= 3x mean` —
+    # for k such trades, 3k*mean <= n*mean => k/n <= 1/3, so the monitor's
+    # `bc >= 0.6` trigger could NEVER fire. Redefine as the top-5 wallets'
+    # share of buy USD (classic concentration metric, reachable 0..1).
+    _by_buyer = {}
+    for t in buys:
+        if t["wallet"]:
+            _by_buyer[t["wallet"]] = _by_buyer.get(t["wallet"], 0.0) + t["usd"]
+    top5_share = 0.0
+    if _by_buyer:
+        top5_share = sum(sorted(_by_buyer.values(), reverse=True)[:5])
+        top5_share = top5_share / max(buy_usd, 1e-9)
+    concentration = round(top5_share, 2)
     return {
         "cvd": round(cvd, 3),
         "buy_usd": round(buy_usd, 2), "sell_usd": round(sell_usd, 2),

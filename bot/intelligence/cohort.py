@@ -331,9 +331,15 @@ def cohort_signal_for(mint, window_s=3600, now=None):
     buying, selling = set(), set()
     for r in rows:
         ent = canonical_entity(r["wallet"])
-        if r["event"] in ("buy", "BUY"):
+        ev = r["event"]
+        # 3rd audit 5.7: align producer/consumer vocabulary. position_monitor
+        # writes `buy_usd_notional` (fresh_wallet_power USD notional) and
+        # wallet_intel writes `snapshot`; only literal buy/BUY was counted, so
+        # the documented "smart-money consensus" signal never fired from the
+        # monitor's own events. Normalize here so both vocabularies count.
+        if ev in ("buy", "BUY", "buy_usd_notional", "accumulation", "ACCUMULATION"):
             buying.add(ent)
-        elif r["event"] in ("sell", "SELL"):
+        elif ev in ("sell", "SELL", "distribution", "DISTRIBUTION"):
             selling.add(ent)
     buying -= selling  # net position
     if len(selling) >= 2 and not buying:

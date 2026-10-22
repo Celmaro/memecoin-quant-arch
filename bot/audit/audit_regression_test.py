@@ -545,6 +545,86 @@ try:
 except Exception as e:
     check("R23 ext-audit-2 lock", "ERR " + str(e)[:80], "no-exception")
 
+# --- Oct 22 THIRD AUDIT (R24): enforced daily stop, micro concentration,
+#     cohort vocab, notifier burst cursor, GoPlus parser, clean-snapshot list ---
+try:
+    # 2.1: daily stop is a PERSISTED kill-switch checked in every entry path
+    _pt24 = open("/home/agentuser/memecoin-quant/paper_tick.py").read()
+    check("R24 daily-stop helper persists stop_until", "stop_until" in _pt24, True)
+    check("R24 auto_buy checks daily stop", _pt24.count("daily_stop_active(") >= 2, True)
+    check("R24 entry_call checks daily stop", "daily_stop_active(b)" in _pt24, True)
+
+    # 5.6: micro buy concentration = top-5 wallets' share of buy USD (>=0.6 reachable)
+    _mic24 = open("/home/agentuser/memecoin-quant/bot/intelligence/microstructure.py").read()
+    check("R24 micro concentration = top-5 USD share", "top5_share" in _mic24, True)
+
+    # 5.7: cohort consumer accepts producer vocabulary (buy_usd_notional)
+    _coh24 = open("/home/agentuser/memecoin-quant/bot/intelligence/cohort.py").read()
+    check("R24 cohort buys buy_usd_notional", "buy_usd_notional" in _coh24, True)
+
+    # 2.4: notifier must NOT advance watermark when MAX_POST capped the run
+    _nt24 = open("/home/agentuser/.hermes/profiles/profile-b4632e6cdb854166b696555ae7ff4239/scripts/call_notifier.py").read()
+    check("R24 notifier capped-run watermark guard", "len(out) < MAX_POST" in _nt24, True)
+
+    # 5.1: GoPlus transfer_hook routed through _gp_flag (no '0'-string truthiness)
+    _dc24 = open("/home/agentuser/memecoin-quant/desk_common.py").read()
+    check("R24 transfer_hook uses _gp_flag",
+          "transfer_hook\": _gp_flag" in _dc24, True)
+
+    # 3.1: clean-snapshot negative list is case-insensitive + covers ws_dumping
+    _ae24 = open("/home/agentuser/memecoin-quant/aegis.py").read()
+    check("R24 clean-snapshot case-insensitive", "_fl[i].startswith" in _ae24, True)
+    check("R24 clean-snapshot covers ws_dumping/transfer_hook",
+          ("ws_dumping" in _ae24 and "transfer_hook" in _ae24), True)
+
+    # 3.2: ave_top1 dedup refund = 6 (matches the -6 charge)
+    if "aegis" not in _ae24:
+        _ae24 = _ae24  # placeholder
+    check("R24 ave_top1 refund 6", '"ave_top1": 6' in _ae24, True)
+
+    # 3.4: deployer coin_count counts UNIQUE mints via deployer_mints ledger
+    check("R24 deployer unique-mint ledger", "deployer_mints" in _ae24, True)
+
+    # 5.2: fragility derives top10 from topHolders (not a non-existent raw key)
+    _sig24 = open("/home/agentuser/memecoin-quant/signals.py").read()
+    check("R24 fragility top10 from topHolders", "_rc_top10_pct" in _sig24, True)
+
+    # 6.7: zero-decimal mints keep dec=0 (is not None, not truthiness)
+    _ju24 = open("/home/agentuser/memecoin-quant/jupiter_estimator.py").read()
+    check("R24 token_decimals None-check", "dec is not None" in _ju24, True)
+
+    # 6.3: dead /swap/v2/quote PROBE removed (comment text may mention the route)
+    check("R24 no dead v2/quote probe", "QUOTE.replace('/swap/v1/quote','/swap/v2/quote')" not in _ju24, True)
+
+    # 6.6: quote_fill bounded by process-wide semaphore
+    check("R24 quote_fill bounded semaphore", "_QUOTE_SEM" in _ju24, True)
+    check("R24 quote pool slot released by worker", "_Q.release()" in _ju24, True)
+
+    # 6.8: research ladders derive from live EXIT_TIERS (no 1.10/1.30/0.15 literals)
+    _da24 = open("/home/agentuser/memecoin-quant/bot/audit/deep_audit.py").read()
+    check("R24 deep_audit live ladder", ("EXIT_TIERS[0]" in _da24 and "1.10, 1.30" not in _da24), True)
+    _ff24 = open("/home/agentuser/memecoin-quant/bot/audit/flow_filter_audit.py").read()
+    check("R24 flow_filter live proxies", ("EXIT_TIERS" in _ff24 and "return 19.4" not in _ff24 and "return -14.55" not in _ff24), True)
+    _tc24 = open("/home/agentuser/memecoin-quant/bot/audit/tape_coins_audit.py").read()
+    check("R24 tape_coins tier-at-fill", "tier_for(" in _tc24, True)
+    _rp24 = open("/home/agentuser/memecoin-quant/bot/audit/replay_backtest.py").read()
+    check("R24 replay imports live EXIT_TIERS", "from position_monitor import EXIT_TIERS" in _rp24, True)
+
+    # 7.6: entity-label CLI queries real columns
+    _el24 = open("/home/agentuser/memecoin-quant/aegis_entity_labels.py").read()
+    check("R24 entity CLI real columns", "fb.coin_mint" in _el24 and "c.call_ts" in _el24, True)
+
+    # 7.2: maintenance initializes schema + checks learner returncode
+    _am24 = open("/home/agentuser/memecoin-quant/aegis_maintenance.py").read()
+    check("R24 maintenance ensure_schema", "ensure_schema" in _am24, True)
+    check("R24 maintenance learner returncode", "p.returncode != 0" in _am24, True)
+
+    # 7.1/7.4: scan_log DDL carries flags_json + query index migration
+    check("R24 scan_log DDL flags_json", "flags_json TEXT" in _dc24, True)
+    check("R24 scan_log index migration", "idx_scan_log_mint_ts" in _dc24, True)
+except Exception as e:
+    check("R24 third-audit lock", "ERR " + str(e)[:80], "no-exception")
+
 print()
 print("FAILURES:", failures if failures else "NONE — all decision-engine regressions pass")
 sys.exit(1 if failures else 0)

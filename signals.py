@@ -186,6 +186,20 @@ def ohlcv_risk(candles):
 
 # ---------- 5. Fragility (ME2F-lite: whale concentration + volatility + sentiment proxy) ----------
 
+def _rc_top10_pct(report):
+    """Derive top-10 holder concentration from a Rugcheck full report.
+    3rd audit 5.2: raw report exposes `topHolders` (list of {pct}), NOT a
+    `top10_pct` key — reading the raw key silently killed the +30/+15 branch.
+    Mirrors aegis.check_top10_and_lp() so both use the same derivation."""
+    try:
+        top = (report or {}).get("topHolders") or []
+        if top:
+            return sum(float(h.get("pct") or 0) for h in top[:10])
+    except Exception:
+        return None
+    return None
+
+
 def fragility_score(mint, pair=None):
     """0-100 fragility: top-10 concentration (Rugcheck) + vol persistence (OHLCV when available)
     + sentiment proxy (holder churn via txns direction)."""
@@ -193,7 +207,7 @@ def fragility_score(mint, pair=None):
         pair = dex_pair(mint)
         if not pair: return None
     rc = rugcheck(mint, full=True) or {}
-    top10 = rc.get("top10_pct")
+    top10 = _rc_top10_pct(rc)
     chg = pair.get("priceChange") or {}
     txns = pair.get("txns") or {}
     h24 = txns.get("h24") or {}

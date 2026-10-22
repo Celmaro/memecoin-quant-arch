@@ -18,7 +18,13 @@ FEE_BPS = 1.7  # P4 (Oct 20): REAL-QUOTE estimate only (terminal ~0.9% + pool ~0
 def sol_price():
     """SOL/USD — FREE PUMPDATA FEED FIRST (Oct 21 real-engineering: the 15s
     keepalive emit writes sol_usd into pumpdata_cache.json — no DexScreener
-    poll, no 429). DexScreener stays the fallback only when the feed is stale."""
+    poll, no 429). DexScreener stays the fallback only when the feed is stale.
+    3rd audit 6.4: previously fell back to a hard-coded 150.0 that disagreed
+    with pumpdata_feed's own 104.0 init — a silently-wrong USD conversion can
+    select the wrong MC tier. Fallback is now the shared, provenance-tagged
+    SOLUSD_FALLBACK so all consumers agree; a `fallback` flag is set in the
+    returned value so callers can mark marks/tiers as estimated."""
+    from desk_common import SOLUSD_FALLBACK
     try:
         import os, json as _j
         cache = os.path.expanduser("~/memecoin-quant/pumpdata_cache.json")
@@ -37,16 +43,19 @@ def sol_price():
         for pair in data.get("pairs", []):
             if (pair.get("quoteToken") or {}).get("symbol") == "USDC":
                 return float(pair.get("priceUsd") or 0)
-        return float(d.get("priceUsd") or 150.0) if d else 150.0
+        return float(d.get("priceUsd") or SOLUSD_FALLBACK) if d else SOLUSD_FALLBACK
     except Exception:
-        return 150.0
+        return SOLUSD_FALLBACK
 
 
 def token_decimals(mint):
     try:
         pair = dex_pair(mint)
         dec = (pair.get("baseToken") or {}).get("decimals")
-        if dec: return int(dec)
+        # 3rd audit 6.7: `if dec` treated a legitimate 0-decimal mint as missing
+        # and defaulted to 6 (typical pump.fun), corrupting amount math.
+        if dec is not None:
+            return int(dec)
     except Exception:
         pass
     return 6  # pump.fun standard
@@ -63,18 +72,22 @@ def quote(mint, usd=20, slippage_bps=500):
     try:
         hdrs = {"User-Agent": "Mozilla/5.0"}
         if key: hdrs["x-api-key"] = key
-        # Swap V2 quote is the recommended path (Oct-18 research); fall back to V1.
+        # 3rd audit 6.3 (Oct 22, web-verified): there is NO GET /swap/v2/quote
+        # route — official V2 uses /swap/v2/order + /swap/v2/execute (or
+        # build/submit). The old code probed the fantasy V2 route FIRST on every
+        # quote, adding a guaranteed 404 round-trip before falling back to V1.
+        # This desk needs a keyless estimate, so go straight to V1 quote (which
+        # the live probes confirmed works); migrate to V2 /order only when the
+        # desk stops being paper-only.
         data = None
-        for base in (f"{QUOTE.replace('/swap/v1/quote','/swap/v2/quote')}", QUOTE):
-            try:
-                d2 = http_json(f"{base}?{params}", headers=hdrs)[1]
-                if isinstance(d2, dict) and d2.get("outAmount"):
-                    data = d2
-                    break
-            except Exception:
-                continue
+        try:
+            d2 = http_json(f"{QUOTE}?{params}", headers=hdrs)[1]
+            if isinstance(d2, dict) and d2.get("outAmount"):
+                data = d2
+        except Exception:
+            data = None
         if not data:
-            raise Exception("both v1+v2 quote failed")
+            raise Exception("v1 quote failed")
         out_amt = int(data.get("outAmount") or 0)
         # Jupiter docs: priceImpactPct is a DECIMAL FRACTION (0.05 = 5%), not a percentage.
         price_impact = float(data.get("priceImpactPct") or 0)
@@ -124,8 +137,17 @@ def quote_fill(mint, usd=20, slippage_bps=500, timeout=6, retries=1):
     the caller falls back to the 1% slip — a corrupted FILL is worse than none.
 
     NOTE: quote() itself is used for reporting with generous budgets; this is
-    the entry-path variant that must never block the tick."""
+    the entry-path variant that must never block the tick.
+    3rd audit 6.6 (Oct 22): a timed-out worker cannot be cancelled and keeps
+    retrying; a burst of slow quotes used to leave UNBOUNDED abandoned threads.
+    Bound total in-flight quote workers with a process-wide semaphore so the
+    worker pool is capped regardless of caller timeouts."""
     import threading
+    # module-global so every entry path shares one budget (paper tick, notifier,
+    # instant trigger are separate processes, but each process is capped).
+    _Q = globals().setdefault("_QUOTE_SEM", threading.BoundedSemaphore(4))
+    if not _Q.acquire(blocking=False):
+        return None  # quote pool saturated (Jupiter slow) — fall back to slip
     _box = {}
 
     def _work():
@@ -134,6 +156,11 @@ def quote_fill(mint, usd=20, slippage_bps=500, timeout=6, retries=1):
             _box["r"] = _quote(mint, usd=usd, slippage_bps=slippage_bps)
         except Exception:
             _box["r"] = None
+        finally:
+            # 3rd audit 6.6: release the slot only when the worker REALLY stops,
+            # not when the caller's join() times out — an abandoned worker must
+            # still free its pool slot so the cap doesn't silently exhaust.
+            _Q.release()
 
     th = threading.Thread(target=_work, daemon=True)
     th.start()

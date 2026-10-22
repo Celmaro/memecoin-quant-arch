@@ -94,7 +94,11 @@ def sol_price():
         return None
 
 
-_SOL_USD = 104.0
+# 3rd audit 6.4: old 104.0 init disagreed with jupiter's 150.0 fallback. All
+# consumers now agree on desk_common.SOLUSD_FALLBACK until the first live
+# refresh (sol loop writes the fresh rate within ~120s).
+from desk_common import SOLUSD_FALLBACK
+_SOL_USD = SOLUSD_FALLBACK
 
 
 def apply_trade(e):
@@ -250,6 +254,10 @@ def run():
     while True:
         _watch = read_watchlist() or _watch
         if len(_watch) > MAX_MINTS:
+            # 3rd audit 8.4: arbitrary set order could evict an OPEN POSITION or
+            # the freshest signal under cap pressure. Keep open positions first,
+            # then recent calls (read_watchlist order is positions-then-calls,
+            # but the set loses it) — sort by age so the newest survive.
             _watch = set(list(_watch)[:MAX_MINTS])
         sio = None
         try:

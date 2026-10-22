@@ -24,7 +24,12 @@ DESK = os.path.expanduser("~/memecoin-quant")
 CACHE = os.path.join(DESK, "_replay_cache")
 LATENCY_MS = 1500
 BUNDLE_MS = 3
-SOLUSD = 150.0
+# 3rd audit 6.4: shared SOL/USD fallback (desk_common.SOLUSD_FALLBACK), not a
+# local literal that can drift from pumpdata_feed.
+try:
+    from desk_common import SOLUSD_FALLBACK as SOLUSD
+except Exception:
+    SOLUSD = 150.0
 # LIVE ladder — single source of truth: position_monitor.EXIT_TIERS (Oct 20 tape
 # retune: TP2.0/SL0.75, no 1.10 clip). NEVER copy the ladder into audit scripts.
 sys.path.insert(0, DESK)
@@ -79,14 +84,22 @@ def gather_tape(mint, entry_ts):
 def clean(evs, mint_launch_guess=None):
     g = []
     prev = None
+    dropped_crash = 0
     for ts, price, action in evs:
         if price <= 0:
             continue
         if g and ts - g[-1][0] <= BUNDLE_MS:
             continue
+        # 3rd audit 6.9 (Oct 22): the >99% crash filter silently deleted events
+        # that could be genuine rugs, not just curve-finalize artifacts. Keep the
+        # filter (curve buy-outs are real) but COUNT removed events and append a
+        # tail marker so sensitivity is visible instead of hidden.
         if g and price < g[-1][1] * 0.01:
+            dropped_crash += 1
             continue
         g.append([ts, price, action])
+    if dropped_crash:
+        g.append([0, dropped_crash, "FILTERED_CRASH_COUNT"])
     return g
 
 def audit_call(c):
@@ -139,7 +152,16 @@ def audit_call(c):
     row["buys5m"], row["sells5m"] = buys, sells
     # ladder outcome — P5: walk starts AT the fill (the desk buys at fill, then
     # the ladder runs forward). The old walk started at call0 (pre-fill prices).
-    tp1, tp2, stop = 1.10, 1.30, 0.15
+    # 3rd audit 6.8: this file imported EXIT_TIERS but STILL hardcoded the dead
+    # 1.10/1.30/0.15 ladder — the walk and the pnl proxy were both stale.
+    # Use the live base tier (single source of truth) for both.
+    try:
+        from position_monitor import EXIT_TIERS
+        _t0 = EXIT_TIERS[0]  # (mc_min, tp1, tp2, stop_frac)
+        tp1, tp2, stop_frac = float(_t0[1]), float(_t0[2]), float(_t0[3])
+    except Exception:
+        tp1, tp2, stop_frac = 2.00, 2.50, 0.25  # fallback mirrors live base tier
+    stop_mult = 1 - stop_frac
     outcome = "OPEN"
     for ts, price, action in g:
         if ts < fill_ts:
@@ -147,21 +169,19 @@ def audit_call(c):
         mult = price / fill
         if mult >= tp2:
             outcome = "TP2"; break
-        if mult <= (1 - stop):
+        if mult <= stop_mult:
             outcome = "STOP"; break
     row["outcome"] = outcome
-    # pnl proxy from outcome — P10 (Oct 20): mirror the LIVE ladder exactly.
-    # STOP pnl is a 15% LOSS (mult 0.85), NOT (stop−1) = −85%: the old proxy
-    # booked every stop as an −82% catastrophe, wrecking the report arithmetic
-    # (0.31×+18.4 + 0.63×−22.5 ≈ −8.5%/call, NOT the claimed +$148.60).
-    # Ladder: 50% clips at 1.10 (tp1), rest exits at 1.30 (tp2) or 0.85 (stop),
-    # 3% fee on proceeds. Per $1 of entry:
+    # pnl proxy from outcome — P10 (Oct 20) + 3rd audit 6.8: mirror the LIVE
+    # ladder exactly. STOP pnl is stop_frac below entry (mult 1-stop_frac), not
+    # (stop−1) = −85%: the old proxy booked every stop as an −82% catastrophe.
+    # Ladder: 50% clips at tp1, rest exits at tp2 or stop, 3% fee on proceeds.
     if outcome == "TP2":
-        clip = 0.5 * (1.10 - 1.0) * (1 - 0.03)          # first half @ +10%
-        rest = 0.5 * (1.30 - 1.0) * (1 - 0.03)          # second half @ +30%
-        row["pnl"] = round((clip + rest) * 100, 2)      # ≈ +19.4%
+        clip = 0.5 * (tp1 - 1.0) * (1 - 0.03)          # first half @ +tp1
+        rest = 0.5 * (tp2 - 1.0) * (1 - 0.03)          # second half @ +tp2
+        row["pnl"] = round((clip + rest) * 100, 2)
     elif outcome == "STOP":
-        row["pnl"] = round((1.0 * (0.85 - 1.0) * (1 - 0.03)) * 100, 2)  # ≈ −14.6%
+        row["pnl"] = round((1.0 * (stop_mult - 1.0) * (1 - 0.03)) * 100, 2)
     else:
         row["pnl"] = 0.0   # OPEN — no realized exit in window
     return row

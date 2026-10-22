@@ -316,22 +316,6 @@ def split_digest_blocks(text, text_mints):
     return cards
 
 
-def block_fields(block, fallback_sym=None, fallback_mc=None):
-    """Parse symbol + MC from a digest card block."""
-    sym, mc = fallback_sym, fallback_mc
-    m = re.search(r"\$([A-Z][A-Z0-9]{1,11})\b", block)
-    if m:
-        sym = m.group(1)
-    else:
-        m = re.search(r"┌(.+?)\s*\(([A-Z][A-Z0-9]{1,11})\)", block)
-        if m:
-            sym = m.group(2)
-    m = re.search(r"MC:\s*\$([\d.,]+[KMB]?)", block, re.I)
-    if m:
-        mc = parse_mc(m.group(1))
-    return sym, mc
-
-
 def process_message(msg, channel):
     """Record + forward to pipeline. Returns summary line or None.
 

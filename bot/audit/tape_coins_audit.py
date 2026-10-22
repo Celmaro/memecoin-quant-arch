@@ -20,7 +20,12 @@ DESK = os.path.expanduser("~/memecoin-quant")
 CACHE = os.path.join(DESK, "_replay_cache")
 LATENCY_MS = 1500
 BUNDLE_MS = 3
-SOLUSD = 150.0
+# 3rd audit 6.4: shared SOL/USD fallback (desk_common.SOLUSD_FALLBACK), not a
+# local literal that can drift from pumpdata_feed.
+try:
+    from desk_common import SOLUSD_FALLBACK as SOLUSD
+except Exception:
+    SOLUSD = 150.0
 GRAD_MC_USD = 69000.0
 
 _hour_cache = {}
@@ -139,16 +144,16 @@ def audit(mint, call_ts, call_mc, sym, chan):
     row["buys"], row["sells"] = buys, sells
     row["bs5m"] = round(buys5 / max(sells5, 1), 2)
     row["act60"] = act60
-    # ladder (live position_monitor.EXIT_TIERS; base tier) — Oct 22 ext-audit:
-    # this file hardcoded the OLD 1.10/1.30/0.15 ladder while position_monitor
-    # runs TP2.0/SL0.75. Single source now: import EXIT_TIERS and use tier[0]
-    # (base) — same as replay_backtest/deep_audit. NEVER copy ladder literals.
+    # ladder (live position_monitor.EXIT_TIERS; TIER AT FILL MC) — 3rd audit 6.8:
+    # this file used EXIT_TIERS[0] always; the LIVE monitor picks the tier from
+    # the CURRENT market cap at each evaluation (tier_for). Select at fill MC so
+    # research reflects the same MC-adaptive policy. NEVER copy ladder literals.
     try:
         sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
-        from position_monitor import EXIT_TIERS
-        _tier0 = EXIT_TIERS[0]  # (mc_min, tp1, tp2, stop_frac)
-        tp1, tp2 = float(_tier0[1]), float(_tier0[2])
-        stop = float(_tier0[3])  # stop FRACTION below entry (0.25 = 0.75x stop)
+        from position_monitor import EXIT_TIERS, tier_for
+        _t = tier_for(fill_mcq or row.get("call_mc") or 0)
+        tp1, tp2 = float(_t[1]), float(_t[2])
+        stop = float(_t[3])  # stop FRACTION below entry (0.25 = 0.75x stop)
     except Exception:
         tp1, tp2, stop = 2.00, 2.50, 0.25
     outcome = "OPEN"
@@ -161,6 +166,7 @@ def audit(mint, call_ts, call_mc, sym, chan):
         if mult <= (1 - stop):
             outcome = "STOP"; break
     row["outcome"] = outcome
+    row["tier_used"] = [tp1, tp2, stop]
     return row
 
 def main():

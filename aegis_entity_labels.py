@@ -264,9 +264,11 @@ if __name__ == "__main__":
     if args[0] == "--scan-first-buyers":
         n = int(args[1]) if len(args) > 1 else 50
         con = db()
-        rows = con.execute("""SELECT fb.wallet, fb.mint FROM first_buyers fb
-            JOIN coins c ON c.mint = fb.mint
-            ORDER BY c.first_seen DESC LIMIT ?""", (n * 5,)).fetchall()
+        # 3rd audit 7.6: real columns are first_buyers.coin_mint and coins.call_ts
+        # (fb.mint / c.first_seen never existed — CLI raised before enrichment).
+        rows = con.execute("""SELECT fb.wallet, fb.coin_mint FROM first_buyers fb
+            JOIN coins c ON c.mint = fb.coin_mint
+            ORDER BY c.call_ts DESC LIMIT ?""", (n * 5,)).fetchall()
         wallets = sorted({r[0] for r in rows})[:n]
         out = enrich_wallets(wallets)
         print(json.dumps(out, indent=1))

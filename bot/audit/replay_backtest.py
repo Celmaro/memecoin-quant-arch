@@ -29,7 +29,13 @@ LATENCY_MS = 1500          # conservative execution latency buffer (PumpAPI guid
 BUNDLE_MS = 3              # same-token events within 3ms = one Jito bundle
 FEE_PCT = 3.0              # Doc1-1 3% paper fee per sell
 MAX_HORIZON_S = 2 * 3600   # quick-flip horizon
-SOLUSD = 150.0             # pump.fun marketCapQuote/quoteAmount are SOL; tiers are USD (Oct 19 fix)
+# 3rd audit 6.4: single provenance-tagged SOL/USD fallback from desk_common —
+# old literal 150.0 disagreed with pumpdata_feed's 104.0 init; wrong conversion
+# can pick the wrong USD MC tier.
+try:
+    from desk_common import SOLUSD_FALLBACK as SOLUSD
+except Exception:
+    SOLUSD = 150.0
 # Only these event fields are needed for replay — slimming cuts RAM ~10x (Oct 19 OOM fix)
 SLIM_KEYS = ("mint", "timestamp", "price", "marketCapQuote", "action", "quoteAmount")
 
@@ -145,6 +151,7 @@ def replay_mint(call, events, verbose=False):
     evs.sort(key=lambda e: e.get("timestamp") or 0)
     # dedupe Jito bundles: group consecutive same-mint events within BUNDLE_MS
     grouped = []
+    _crash_dropped = 0  # 3rd audit 6.9: count (not silently drop) filtered crashes
     for e in evs:
         ts = e.get("timestamp") or 0
         if grouped and ts - grouped[-1]["ts"] <= BUNDLE_MS:
@@ -158,9 +165,13 @@ def replay_mint(call, events, verbose=False):
             continue  # zero/negative price = data glitch, not a fillable trade (Oct 19)
         # migration artifact guard: a price that collapses below 1% of the running
         # real price = bonding-curve finalize / curve-empty buy-out, not a trade.
+        # 3rd audit 6.9: count (not just silently drop) so genuine rugs removed
+        # by this filter are visible in the run's summary output.
         if price is not None and grouped and grouped[-1]["price"]:
             prev_real = grouped[-1]["price"]
             if price < prev_real * 0.01:
+                _crash_dropped += 1
+                CRASH_DROPPED["count"] += 1
                 continue
         grouped.append({"ts": ts, "price": price, "mc": e.get("marketCapQuote")})
     # entry fill: first event AT/AFTER call_ts + latency
@@ -174,13 +185,9 @@ def replay_mint(call, events, verbose=False):
     if fill_idx is None or fill_px is None:
         return None, "no_fill", ""
     # exit ladder (mirrors position_monitor.EXIT_TIERS + tier_exits)
+    # 3rd audit 6.8: use the LIVE tier_for() helper, not a local copy of the loop.
     mc_entry = float(grouped[fill_idx].get("mc") or 0) * SOLUSD  # SOL -> USD
-    tier = EXIT_TIERS[0]
-    for cand in EXIT_TIERS:
-        if mc_entry >= cand[0]:
-            tier = cand
-        else:
-            break
+    tier = tier_for(mc_entry)
     _, tp1, tp2, stop = tier
     share = 1.0
     clip1_done = False
@@ -234,12 +241,30 @@ def load_live_outcome(mint):
 # Oct 20 OFF tape retune — mirrors position_monitor.EXIT_TIERS (single source).
 # Old ladder was stop-then-run suicide on this tape (65% dip <0.85 before 1.30);
 # TP2.0/SL0.75 flips -3.9%/call -> +5.2%. No 1.10 clip.
-EXIT_TIERS = [
-    (0,        2.00, 2.50, 0.25),
-    (40_000,   2.00, 2.50, 0.25),
-    (150_000,  2.20, 2.80, 0.25),
-    (1_500_000,2.50, 3.00, 0.25),
-]
+# 3rd audit 6.8: import the LIVE ladder instead of keeping a copy that can drift.
+try:
+    sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
+    from position_monitor import EXIT_TIERS, tier_for
+except Exception:
+    EXIT_TIERS = [
+        (0,        2.00, 2.50, 0.25),
+        (40_000,   2.00, 2.50, 0.25),
+        (150_000,  2.20, 2.80, 0.25),
+        (1_500_000,2.50, 3.00, 0.25),
+    ]
+    def tier_for(mc):
+        t = EXIT_TIERS[0]
+        for cand in EXIT_TIERS:
+            if mc >= cand[0]:
+                t = cand
+            else:
+                break
+        return t
+
+# 3rd audit 6.9: module-level crash-filter sink so run summaries show how many
+# >99% events were dropped as suspected curve-finalize artifacts (genuine rugs
+# hidden by the filter become visible).
+CRASH_DROPPED = {"count": 0}
 
 
 def main():
@@ -319,6 +344,9 @@ def main():
             tot += pnl; n += 1
     if n:
         print(f"\nAVG PnL per call (with tape): {tot/n:+.1f}%  (n={n})")
+    if CRASH_DROPPED["count"]:
+        print(f"[3rd audit 6.9] {CRASH_DROPPED['count']} events >99% below prior price were filtered "
+              f"as suspected curve-finalize artifacts — genuine rugs hidden by this filter are counted here.")
     return 0
 
 

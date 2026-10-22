@@ -22,10 +22,21 @@ DESK = os.path.expanduser("~/memecoin-quant")
 CACHE = os.path.join(DESK, "_replay_cache")
 ROWS = json.load(open(os.path.join(DESK, "tape_coins_rows.json")))
 
-# outcome pnl proxy — same convention as deep_audit P10 (TP2 +19.4%, STOP -14.55%)
+# outcome pnl proxy — 3rd audit 6.8: derive from the LIVE base tier (EXIT_TIERS),
+# not the dead 1.10/1.30/0.85 ladder (+19.4%/−14.55% belonged to the old policy).
+# Same math as deep_audit: 50% clip at tp1, rest at tp2 or stop, 3% fee.
 def outcome_pnl(outcome):
-    if outcome == "TP2": return 19.4
-    if outcome == "STOP": return -14.55
+    try:
+        sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
+        from position_monitor import EXIT_TIERS
+        _t0 = EXIT_TIERS[0]
+        tp1, tp2, stop_frac = float(_t0[1]), float(_t0[2]), float(_t0[3])
+    except Exception:
+        tp1, tp2, stop_frac = 2.00, 2.50, 0.25
+    if outcome == "TP2":
+        return round((0.5 * (tp1 - 1.0) + 0.5 * (tp2 - 1.0)) * (1 - 0.03) * 100, 2)
+    if outcome == "STOP":
+        return round(((1 - stop_frac) - 1.0) * (1 - 0.03) * 100, 2)
     return 0.0
 
 def load_tape():

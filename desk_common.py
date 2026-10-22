@@ -47,6 +47,12 @@ CHANNELS = [
 DEXSCREENER = "https://api.dexscreener.com/latest/dex/tokens/{}"
 RUGCHECK = "https://api.rugcheck.xyz/v1/tokens/{}{}"
 SOL_MINT = "So11111111111111111111111111111111111111112"
+# 3rd audit 6.4 (Oct 22): single provenance-tagged SOL/USD fallback. Old code
+# scattered 150.0 (jupiter_estimator, replay/deep/tape audits) and 104.0
+# (pumpdata_feed init) — disagreeing constants could select the wrong USD MC
+# tier. All consumers import THIS value; refresh it from the PumpData feed when
+# live. Notes: ~$150 was the live rate when first written (Oct 2026).
+SOLUSD_FALLBACK = 150.0
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36"
 
 _cfg_cache = None
@@ -445,7 +451,7 @@ def goplus_security(mint):
             "freezable": _gp_flag(item.get("freezable")),
             "closable": _gp_flag(item.get("closable")),
             "transfer_fee": _gp_flag(item.get("transfer_fee")),
-            "transfer_hook": bool(item.get("transfer_hook")),
+            "transfer_hook": _gp_flag(item.get("transfer_hook")),
             "non_transferable": _gp_flag(item.get("non_transferable")),
             "trusted_token": _gp_flag(item.get("trusted_token")),
         }
@@ -730,6 +736,73 @@ def market_for(mint, timeout=10, retries=1):
         return dex_pair(mint, allow_fallback=True, timeout=timeout, retries=retries) or {}
     except Exception:
         return {}
+
+
+# ---- LIVENESS GATE (Oct 22, deep-check #2: skip-never-life filter) ----
+# On-chain truth (79-trade tape audit): coins whose first-3-min peak stayed
+# < 1.10x are 13-17% WR and net -$45.68 (f3) / -$61.35 (f60). The death signal
+# is visible within 60s (every f3-dead coin was already flat at f60). So the
+# live gate uses a 60s window — no 3-min entry delay, honoring the user's
+# latency complaint ("cards 3-4 min late").
+# Semantics: FAIL-CLOSED on PROVEN death (peak < 1.10 with >=3 samples in
+# window), FAIL-OPEN on missing/insufficient tape (buy anyway — the buy-all
+# mandate + data-honesty rule: missing tape is UNKNOWN, never a skip).
+# Unit caveat: the shrine `price` field has inconsistent denominators across
+# pools — but pxs_tail stores SOL px and the gate uses a RATIO (peak/anchor),
+# so any constant per-pool scale cancels. An explicit 8x band guards against
+# a rotation-step sample sneaking into the same window.
+LIVENESS_WINDOW_S = 60
+LIVENESS_MIN_PEAK = 1.10
+LIVENESS_MIN_SAMPLES = 3
+LIVENESS_MAX_RATIO = 8.0   # drop samples >8x anchor (pool-rotation step guard)
+
+def liveness_gate(mint, call_ts, window_s=LIVENESS_WINDOW_S,
+                  min_peak=LIVENESS_MIN_PEAK, min_samples=LIVENESS_MIN_SAMPLES):
+    """Live skip-never-life gate. Returns:
+        True  -> coin showed life (peak >= min_peak in [call_ts, call_ts+window])
+        False -> coin is PROVEN dead (>= min_samples samples, peak < min_peak)
+        None  -> unknown (no tape / < min_samples samples in window) — buy anyway
+    Reads pumpdata_cache pxs_tail (ms-timestamped SOL price samples). Pure read."""
+    if not mint or not call_ts:
+        return None
+    try:
+        body = json.load(open(PUMPDATA_CACHE))
+    except Exception:
+        return None
+    row = (body.get("mints") or {}).get(mint)
+    if not row:
+        return None
+    tail = row.get("pxs_tail") or []
+    if not tail:
+        return None
+    c0 = float(call_ts) * 1000.0
+    c1 = c0 + float(window_s) * 1000.0
+    anchor = None
+    win = []
+    for ts_ms, px in tail:
+        try:
+            ts_ms = float(ts_ms); px = float(px)
+        except Exception:
+            continue
+        if px <= 0:
+            continue
+        if anchor is None and ts_ms >= c0:
+            anchor = px
+        if c0 <= ts_ms <= c1:
+            win.append((ts_ms, px))
+    if anchor is None:
+        # no sample at/after call time — treat oldest in-window sample as anchor
+        if win:
+            anchor = min(win, key=lambda x: x[0])[1]
+        else:
+            return None
+    if anchor <= 0:
+        return None
+    keep = [px for ts, px in win if 0 < px <= anchor * LIVENESS_MAX_RATIO]
+    if len(keep) < min_samples:
+        return None                      # fail-open: not enough tape to prove death
+    peak = max(keep)
+    return peak / anchor >= min_peak
 
 def rugcheck(mint, full=False):
     cfg = load_config()
@@ -1401,7 +1474,7 @@ def init_schema():
     CREATE TABLE IF NOT EXISTS actors(
         actor TEXT PRIMARY KEY, class TEXT, confidence REAL, strategy TEXT, notes TEXT, updated_ts REAL);
     CREATE TABLE IF NOT EXISTS scan_log(
-        mint TEXT, ts REAL, score REAL, verdict TEXT, strategy TEXT, checks_json TEXT);
+        mint TEXT, ts REAL, score REAL, verdict TEXT, strategy TEXT, checks_json TEXT, flags_json TEXT);
     CREATE TABLE IF NOT EXISTS followups(
         mint TEXT PRIMARY KEY, due_ts REAL, kind TEXT, note TEXT, result TEXT, done INTEGER DEFAULT 0,
         outcome TEXT);
@@ -1426,6 +1499,21 @@ def init_schema():
             log_event({"event": "SCHEMA_MIGRATION", "table": "followups", "added": "outcome"})
         except Exception:
             pass
+    # 3rd audit 7.1 (Oct 22): fresh DBs from init_schema() lacked scan_log.flags_json
+    # while aegis.py INSERTs it and aegis_learn.py SELECTs it — the learner raised
+    # immediately on a clean checkout. Versioned migration: add when missing.
+    _sc_cols = [r[1] for r in con.execute("PRAGMA table_info(scan_log)").fetchall()]
+    if "flags_json" not in _sc_cols:
+        try:
+            con.execute("ALTER TABLE scan_log ADD COLUMN flags_json TEXT")
+            log_event({"event": "SCHEMA_MIGRATION", "table": "scan_log", "added": "flags_json"})
+        except Exception:
+            pass
+    # 3rd audit 7.4 (Oct 22): coverage indexes for the learner/holder-growth queries.
+    try:
+        con.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_mint_ts ON scan_log(mint, ts)")
+    except Exception:
+        pass
     con.commit(); con.close()
 
 def mark_status(mint, status):

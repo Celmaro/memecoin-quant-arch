@@ -11,6 +11,10 @@
 #  statistics — no third-party runtime deps required for desk_common/aegis/
 #  position_monitor/journal)
 
+# --- streams / replay (3rd audit 8.6: these were imported but undeclared) ---
+python-socketio   # pumpdata_feed.py WebSocket client
+zstandard         # replay/verification tools read zstd-compressed caches
+
 # --- Telegram intake (MTProto) ---
 telethon==1.45.0
 

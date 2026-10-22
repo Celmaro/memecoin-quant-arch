@@ -125,15 +125,28 @@ def resolve_deployer(mint):
     return None, None, None
 
 def remember_deployer(deployer, mint, ts):
-    if not deployer: return
+    if not deployer or not mint:
+        return
     con = db()
-    row = con.execute("SELECT * FROM deployers WHERE deployer=?", (deployer,)).fetchone()
-    if row:
-        con.execute("UPDATE deployers SET coin_count=coin_count+1, first_seen=? WHERE deployer=?",
-                    (min(row["first_seen"], ts or time.time()), deployer))
-    else:
-        con.execute("INSERT INTO deployers(deployer, first_seen, coin_count) VALUES(?,?,1)",
-                    (deployer, ts or time.time()))
+    # 3rd audit 3.4: coin_count was incremented on EVERY deep rescan of the same
+    # mint, inflating the launch count (deployer with 3 coins scanned 6 times
+    # looked like 6 launches and could award the +5 clean-deployer offset).
+    # Keep an observation ledger (deployer, mint) and count UNIQUE launches.
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS deployer_mints(deployer TEXT, mint TEXT, first_obs REAL, PRIMARY KEY(deployer, mint))")
+        prior = con.execute("SELECT 1 FROM deployer_mints WHERE deployer=? AND mint=?", (deployer, mint)).fetchone()
+        if prior is None:
+            con.execute("INSERT OR IGNORE INTO deployer_mints(deployer, mint, first_obs) VALUES(?,?,?)",
+                        (deployer, mint, ts or time.time()))
+            row = con.execute("SELECT * FROM deployers WHERE deployer=?", (deployer,)).fetchone()
+            if row:
+                con.execute("UPDATE deployers SET coin_count=coin_count+1, first_seen=? WHERE deployer=?",
+                            (min(row["first_seen"], ts or time.time()), deployer))
+            else:
+                con.execute("INSERT INTO deployers(deployer, first_seen, coin_count) VALUES(?,?,1)",
+                            (deployer, ts or time.time()))
+    except Exception:
+        pass  # ledger unavailable — keep old behavior rather than crash the scan
     con.commit(); con.close()
 
 def record_first_buyers(mint, deployer, n=5):
@@ -849,7 +862,7 @@ def score_coin(mint, deep=False):
     # may have charged it) — keep ONE concentration penalty, refund the duplicates.
     conc_flags = [f for f in flags if f.startswith(("top10", "blix_top10", "ave_top1"))]
     if len(conc_flags) > 1:
-        nominal = {"top10_concentration": 10, "blix_top10": 10, "ave_top1": 12}
+        nominal = {"top10_concentration": 10, "blix_top10": 10, "ave_top1": 6}  # 3rd audit 3.2: refund must equal the -6 charge (recalib Oct 22)
         refund = 0.0
         for f in conc_flags[1:]:
             for key, val in nominal.items():
@@ -862,11 +875,22 @@ def score_coin(mint, deep=False):
         flags = [f for f in flags if f not in conc_flags] + [keep]
 
     # Recalibration #2: category sub-scores (signal counts per layer) for interpretability.
+    # 3rd audit 3.3: cat_good only recognized 4 prefixes, so positive signals
+    # (ws_hot_buys, ws_buy_pressure, churn_retention_high, fresh_wallet_power_*,
+    # cohort_accumulation, deployer_wi_strong, blix_dev_board, ...) were counted
+    # in the "bad" bucket. Keep an explicit positive-prefix registry so counts
+    # match polarity. Signals without a positive prefix are neutral here — the
+    # bad bucket must NOT silently absorb them (audit: directionality bug).
+    _GOOD_PREFIXES = ("blix_narrative_heat", "smart_money_", "deep_pool", "clean_snapshot",
+                      "ws_hot_buys", "ws_buy_pressure", "fill_people", "fill_very_slow",
+                      "churn_retention_high", "fresh_wallet_power_", "cohort_accumulation",
+                      "deployer_wi_strong", "blix_dev_board", "blix_sniper_board", "ave_wallets",
+                      "whale_holds_accum", "blix_sol_strong", "deep_pool_liq")
     cat_bad = {k: sum(1 for f in flags if any(f.startswith(p) for p in CAT[k])
-                      and not f.startswith(("blix_narrative_heat", "smart_money_", "deep_pool", "clean_snapshot")))
+                      and not any(f.startswith(g) for g in _GOOD_PREFIXES))
                for k in CAT}
     cat_good = {k: sum(1 for f in flags if any(f.startswith(p) for p in CAT[k])
-                       and f.startswith(("blix_narrative_heat", "smart_money_", "deep_pool", "clean_snapshot")))
+                       and any(f.startswith(g) for g in _GOOD_PREFIXES))
                 for k in CAT}
 
     score = max(0.0, min(100.0, score))
@@ -874,18 +898,28 @@ def score_coin(mint, deep=False):
                         # Positive/neutral flags (smart_money, deep_pool_liq, deployer_other_coins,
                         # clean_snapshot itself) must NOT block the bonus (audit F6).
     _NEG_PREFIXES = ("transfer_fee", "bundle", "lp_", "mint_", "freeze_",
-                     "copycat", "top10", "AVE_", "dirty", "rugger", "wash",
-                     "slow", "fragility", "vol_liq", "slippage", "RUGGED", "drained",
+                     "copycat", "top10", "ave_", "dirty", "rugger", "wash",
+                     "slow", "fragility", "vol_liq", "slippage", "rugged", "drained",
                      "lp_unlocked", "mint_risk", "freeze_risk", "micro_cvd_neg",
                      "micro_buy_conc", "churn_retention_low", "churn_loss",
                      "fresh_wallet_power_none", "fill_bots", "cohort_distribution",
-                     "bitquery_sell_imbalance", "ws_sell_pressure", "thin_pool_liq_mc",
-                     "low_liq_mc", "gmgn_snipers", "gmgn_bundler", "gmgn_wash",
-                     "gmgn_rug_ratio", "gmgn_t10", "entity_labels", "ave_smart_exits",
-                     "ave_top1", "blix_top10",
+                     "bitquery_sell_imbalance", "ws_sell_pressure", "ws_dumping",
+                     "thin_pool_liq_mc", "low_liq_mc", "gmgn_snipers", "gmgn_bundler",
+                     "gmgn_wash", "gmgn_rug_ratio", "gmgn_t10", "entity_labels",
+                     "ave_smart_exits", "ave_top1", "blix_top10",
                      "blix_dev_", "blix_snipers", "known_rugger", "deep_pool_risk",
-                     "first_block_sniper", "call_mc_decay", "holder_dump", "whale_holds_dump", "fomo_")
-    _neg = [f for f in flags if any(f.startswith(p) for p in _NEG_PREFIXES)]
+                     "first_block_sniper", "call_mc_decay", "holder_dump",
+                     "whale_holds_dump", "whale_holds_top10_", "fomo_",
+                     "holder_shrinking_", "transfer_hook", "non_transferable",
+                     "goplus_mintable", "rug_insider_nets_", "rug_trade_insiders_",
+                     "deployer_goplus_risk", "deployer_honeypot_related",
+                     "deployer_phishing", "deployer_sanctioned", "deployer_malicious_",
+                     "deployer_wi_weak", "call_mc_pumped_")
+    _fl = [f.lower() for f in flags]
+    # 3rd audit 3.1: match case-insensitively — provider suffixes differ in case
+    # (AVE_ vs ave_risk_score_*), and a missed negative here lets the +15 clean
+    # bonus ride on top of an adverse flag the comments say should block it.
+    _neg = [f for i, f in enumerate(flags) if any(_fl[i].startswith(p) for p in _NEG_PREFIXES)]
     if not _neg and verdict != "RUGGED" and isinstance(r.get("lp_locked_pct"), (int, float)) and r["lp_locked_pct"] >= 90:
         score += 15
         flags.append("clean_snapshot(+15)")
@@ -893,6 +927,11 @@ def score_coin(mint, deep=False):
     # --- LEARNING LOOP (Oct 19): apply empirical weight overrides from
     # aegis_weight_overrides.json (generated by aegis_learn.py, bounded ±6/flag).
     # Cached 5 min; absent/garbage file = no change. Re-clamped after.
+    # 3rd audit 4.3 (Oct 22): enforce override-file AGE (stale deltas were applied
+    # forever — no generated_ts check), bound the TOTAL override (per-flag ±6 was
+    # unlimited across simultaneously active flags), and normalize feature keys so
+    # a generic file key (transfer_fee_present) matches emitted dynamic flags
+    # (transfer_fee_present_2.0%).
     try:
         import time as _t
         _ov_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -900,13 +939,41 @@ def score_coin(mint, deep=False):
         _now_t = _t.time()
         if _LRN.get("ts", 0) < _now_t - 300:
             with open(_ov_path) as _f:
-                _LRN["data"] = json.load(_f).get("deltas", {})
+                _LRN["meta"] = json.load(_f)
+                _LRN["data"] = _LRN["meta"].get("deltas", {})
                 _LRN["ts"] = _now_t
+        # age gate: reject overrides older than OVERRIDE_MAX_AGE_DAYS unless the
+        # file is hand-authored (no generated_ts means manual, keep it).
+        _born = float(_LRN.get("meta", {}).get("generated_ts") or 0)
+        if _born and _now_t - _born > 14 * 86400:
+            _LRN["data"] = {}  # stale learner output — do not apply
+            flags.append("learn_overrides_stale")
+        _tot = 0.0
         for _f in set(flags):
             _d = _LRN.get("data", {}).get(_f)
+            if not isinstance(_d, (int, float)) and _d is not None:
+                # prefix-normalized match: file key is a base feature name, live
+                # flag carries a dynamic suffix (transfer_fee_present_2.0%)
+                for _k, _v in _LRN.get("data", {}).items():
+                    if isinstance(_v, (int, float)) and _f.startswith(_k + "_"):
+                        _d = _v
+                        break
             if isinstance(_d, (int, float)):
                 score += float(_d)
+                _tot += float(_d)
                 flags.append(f"learned_{_f.replace(' ', '_')}({_d:+.1f})")
+        if abs(_tot) > 15.0:
+            # total-override guard: cap aggregate learned adjustment (±15)
+            _scale = 15.0 / max(abs(_tot), 1e-9)
+            for _i, _fl in enumerate(flags):
+                if _fl.startswith("learned_"):
+                    try:
+                        _val = float(_fl.rsplit("(", 1)[1][:-1])
+                        flags[_i] = f"learned_rescaled({_val * _scale:+.1f})"
+                    except Exception:
+                        pass
+            # recompute score cleanly: subtract old delta sum, add scaled sum
+            score = score - _tot + (_tot * _scale)
     except Exception:
         pass  # learning layer never blocks scoring
     score = max(0.0, min(100.0, score))

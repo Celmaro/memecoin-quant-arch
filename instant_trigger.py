@@ -107,7 +107,7 @@ def main():
         # entry_call's freshness gate + age label see the REAL call time.
         try:
             from paper_tick import entry_call
-            bought, skip = entry_call({"mint": mint, "symbol": sym, "mc": mc, "ts": ts})
+            bought, skip = entry_call({"mint": mint, "symbol": sym, "mc": mc, "ts": ts}, aegis_score=score)
             if bought:
                 out.append(bought)
             elif skip:
