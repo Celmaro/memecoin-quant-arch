@@ -83,9 +83,19 @@ def baseline_policy(price_path):
     pnl += remaining * (mult - 1)
     return pnl
 
-def attribute(symbol, mint, pos, realized_pnl, exit_px, decision_px=None, price_path=None):
-    """Compute and persist attribution for a CLOSED position.
-    pos must carry entry_px, peak/trough (or fallbacks), initial_usd."""
+def attribute(symbol, mint, pos, realized_pnl, exit_px, decision_px=None, price_path=None, partial=False):
+    """Compute and persist attribution for a CLOSED (or partial) position.
+    pos must carry entry_px, peak/trough (or fallbacks), initial_usd.
+
+    Oct 21 fixes:
+    - partial=True marks a PARTIAL-stage close (clip/frac) row so consumers can
+      distinguish full-position closes from tranches. Partials were previously
+      never written (anomaly #2: PC +9.83 clip, LENA -0.40, METOO +0.09 frac had
+      no DB rows).
+    - dedupe: a 5s same-mint window collapses double-writes from concurrent
+      paper_tick runs (GUZZLEGOAT got 2 rows 0.64s apart, +10.51 AND +12.66, for
+      one booked trade). Real re-closes of the same mint are always >5s apart.
+    """
     ensure_schema()
     entry = float(pos.get("entry_px") or 0)
     peak = float(pos.get("peak_price") or max([p for _, p in (price_path or [])] + [entry]))
@@ -108,15 +118,29 @@ def attribute(symbol, mint, pos, realized_pnl, exit_px, decision_px=None, price_
         dva = realized_pnl - base
     import sqlite3
     con = sqlite3.connect(DB)
+    _now = time.time()
+    # Oct 21 dedupe: collapse same-mint double-writes within a 5s window (a
+    # concurrent paper_tick wrote GUZZLEGOAT twice 0.64s apart for one booked
+    # trade). ONLY collapse when the new write's exit px is within 20% of the
+    # existing row — a genuine partial->full pair in quick succession (different
+    # fill price) must keep BOTH rows (PC clip 1.02e-4 vs full 4e-5 = 60% apart).
+    _prior = con.execute(
+        "SELECT exit_px FROM position_attribution WHERE mint=? AND ABS(closed_at - ?) < 5",
+        (mint, _now)).fetchone()
+    if _prior is not None and _prior[0]:
+        _same_px = abs(float(_prior[0]) - float(exit_px or 0)) <= 0.20 * max(abs(float(_prior[0])), 1e-12)
+        if _same_px:
+            con.execute("DELETE FROM position_attribution WHERE mint=? AND ABS(closed_at - ?) < 5",
+                        (mint, _now))
     con.execute(
         "INSERT OR REPLACE INTO position_attribution(symbol, mint, closed_at, entry_px, peak_px,"
         " trough_px, exit_px, mfe, mae, prr, is_exit, realized_pnl, baseline_pnl, dva, detail_json)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (symbol, mint, time.time(), entry, peak, trough, exit_px,
+        (symbol, mint, _now, entry, peak, trough, exit_px,
          round(mfe, 4), round(mae, 4), round(prr, 4), round(is_exit, 4),
          round(realized_pnl, 4), round((baseline_policy(price_path) * initial) if price_path else 0, 4),
          round(dva, 4) if dva is not None else None,
-         json.dumps({"path_points": len(price_path or [])})))
+         json.dumps({"path_points": len(price_path or []), "partial": bool(partial)})))
     con.commit(); con.close()
     return {"mfe": round(mfe, 3), "mae": round(mae, 3), "prr": round(prr, 3),
             "is_exit": round(is_exit, 3), "dva": round(dva, 3) if dva is not None else None}

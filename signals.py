@@ -29,11 +29,16 @@ def estimate_fill_time(mint, pair_created_ms=None, max_pages=20):
                 return max(0.0, (grad_ts - first_ts) / 60.0)
     except Exception:
         pass
-    # Fallback: paged signatures (same as before)
+    # Fallback: paged signatures (same as before) — bounded by a hard time
+    # budget so a slow public RPC cannot eat the whole tick even when Helius
+    # is healthy (Oct 21 second round: profile showed ~46s paging here).
     before = None
     oldest = grad_ts
     crossed = False
+    _t0 = time.time()
     for _ in range(max_pages):
+        if time.time() - _t0 > 12:
+            return None  # budget exceeded — unknown, not 0
         p = [mint, {"limit": 1000}]
         if before: p[1]["before"] = before
         res = rpc("getSignaturesForAddress", p) or []

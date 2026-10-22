@@ -43,21 +43,21 @@ def deep_aegis_card(mint, chan, sym, mc):
     Returns (card_text, score, verdict) or (None, None, None) on failure.
     Delegates to rich_card.build_forensics_card with the call payload so the
     full narrative (flags w/ explanations, market side, holders, authorities,
-    socials, migration, verdict, action plan) reaches the DM."""
+    socials, migration, verdict, action plan) reaches the DM.
+
+    Oct 21 (user: card matches aegis.db): rich_card returns the score/verdict
+    from the SAME deep scan it rendered (the one it wrote to deep_cache). We do
+    NOT call score_coin a second time — that second call produced a divergent
+    card (17.0) vs stored deep_cache (22.0) for $LASTAGENCY when the tape moved
+    between the two scans. One scan, one source of truth.
+    """
     try:
         sys.path.insert(0, DESK)
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from rich_card import build_forensics_card
-        card = build_forensics_card(mint, {"symbol": sym, "channel": chan, "mc": mc})
+        card, score, verdict = build_forensics_card(mint, {"symbol": sym, "channel": chan, "mc": mc})
         if not card:
             return None, None, None
-        import aegis as _a
-        score, verdict = None, None
-        try:
-            rep = _a.score_coin(mint, deep=True)
-            score, verdict = rep.get("score"), rep.get("verdict")
-        except Exception:
-            pass
         return card, score, verdict
     except Exception:
         return None, None, None
@@ -97,6 +97,7 @@ def send_dm(text):
 def main():
     st = load_state()
     last = st.get("last_ts", 0)
+    instant = set(st.get("instant_sent") or [])
     fresh = []
     try:
         with open(CALLS) as f:
@@ -104,6 +105,10 @@ def main():
                 try:
                     c = json.loads(line)
                 except Exception:
+                    continue
+                # P1-5 (Oct 20): skip retracted/dead-mint lines — they were
+                # previously re-delivered as fresh (dead-mint noise).
+                if c.get("retracted") or c.get("dead"):
                     continue
                 ts = float(c.get("ts") or c.get("dt_ts") or 0)
                 if ts > last:
@@ -114,18 +119,29 @@ def main():
     if not fresh:
         return 0  # silent
 
-    # calls.jsonl is NOT chronological — sort by ts ascending, consume oldest first
+    # calls.jsonl is NOT chronological — sort by ts ascending, consume oldest first.
+    # P9 (Oct 20): watermark must be key-based, not ts-only. A >4-call same-ts burst
+    # used to lose the tail forever: next_ts advanced past the post's ts and the
+    # strict `ts > last` filter dropped the remaining same-ts rows. Now we persist a
+    # capped keyed list of handled records (mint:msg_id) and advance the watermark
+    # to the max ts of ALL fresh rows so the burst drains on the NEXT run if
+    # MAX_POST capped it this run.
     fresh.sort(key=lambda c: float(c.get("ts") or 0))
-    posted = fresh[:MAX_POST]
-    next_ts = st.get("last_ts", 0)
-
+    handled = set(st.get("handled_keys") or [])
     out = []
     instant = set(st.get("instant_sent") or [])
-    for c in posted:
+    max_fresh_ts = max(float(c.get("ts") or 0) for c in fresh)
+    for c in fresh:
         mint = c.get("mint") or "?"
-        if mint in instant:
-            next_ts = max(next_ts, float(c.get("ts") or 0))  # already carded instantly
+        key = f"{mint}:{c.get('msg_id') or c.get('ts') or ''}"
+        if key in handled:
             continue
+        if mint in instant:
+            # already carded instantly — mark handled, never re-deliver
+            handled.add(key)
+            continue
+        if len(out) >= MAX_POST:
+            break  # leave the rest for the next run (watermark only max_fresh_ts)
         chan = (c.get("channel") or "?").replace("Trending", "").replace("trending", "")
         sym, mc = c.get("symbol"), None
         try:
@@ -146,26 +162,44 @@ def main():
             out.append(f"📢 New call: ${sym or '?'} (from {chan}){mc_s}\n   CA: {mint}")
         # TRIGGER THE BUY IMMEDIATELY after the AEGIS card (user mandate Oct 19):
         # paper_tick.entry_call applies the $10K liq gate + hygiene + dedupe.
+        # Oct 20: pass the AEGIS score so the <30 veto / 70+ boost policy applies.
         try:
             sys.path.insert(0, DESK)
             from paper_tick import entry_call, load_book
-            bought_line, skip = entry_call(c)
+            bought_line, skip = entry_call(c, aegis_score=score)
             if bought_line:
                 out.append(bought_line)
             elif skip:
                 out.append(f"⏭ skipped: {skip} (${sym or mint[:8]})")
         except Exception as e:
             out.append(f"⚠ auto-buy error {mint[:8]}: {str(e)[:60]}")
-        # watermark advances only if processed
-        next_ts = max(next_ts, float(c.get("ts") or 0))
+        # P9: this call is fully handled (carded + entry attempted) — mark it so a
+        # future run never re-delivers it, even if the watermark sits at the same ts.
+        handled.add(key)
 
-    save_state({"last_ts": next_ts})
+    # P9: watermark advances to the max ts of ALL fresh rows — a >4 same-ts burst
+    # keeps the unconsumed tail eligible next run (they were NOT marked handled).
+    # P1-5 (Oct 20): MERGE — save_state was replacing the whole state dict, wiping
+    # instant_trigger's instant_sent dedupe → double-card risk on every fresh loop.
+    # Audit P1#5 (Oct 22): delivery-before-save — the OLD order saved state
+    # (watermark + handled_keys) BEFORE send_dm, so a failed DM marked calls
+    # handled and they were lost forever (no retry next run). Now: attempt
+    # delivery FIRST, advance state only on success. On failure the watermark
+    # stays put and the SAME calls retry next run.
+    delivered = False
     if out:
         blob = "\n\n".join(out)
         # DM-only delivery: direct bot send first (reliable), cron-stdout as backup
         sent = send_dm(blob)
+        delivered = bool(sent)
         print(blob)
         print(f"\n[delivery: dm_direct={'ok' if sent else 'FAILED — check bot token / DM chat'}]")
+    if delivered or not out:
+        st["last_ts"] = max(st.get("last_ts", 0), max_fresh_ts)
+        st["handled_keys"] = sorted(handled)[-400:]  # capped durability
+        save_state(st)
+    else:
+        print("[delivery FAILED — watermark NOT advanced; retrying next run]")
     return 0
 
 

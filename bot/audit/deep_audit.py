@@ -25,7 +25,13 @@ CACHE = os.path.join(DESK, "_replay_cache")
 LATENCY_MS = 1500
 BUNDLE_MS = 3
 SOLUSD = 150.0
-EXIT_TIERS = [(0, 1.10, 1.30, 0.15), (40_000, 1.15, 1.35, 0.18), (150_000, 1.20, 1.45, 0.22), (1_500_000, 1.30, 1.60, 0.28)]  # LIVE ladder (position_monitor.EXIT_TIERS), single source of truth
+# LIVE ladder — single source of truth: position_monitor.EXIT_TIERS (Oct 20 tape
+# retune: TP2.0/SL0.75, no 1.10 clip). NEVER copy the ladder into audit scripts.
+sys.path.insert(0, DESK)
+try:
+    from position_monitor import EXIT_TIERS
+except Exception:
+    EXIT_TIERS = [(0, 2.00, 2.50, 0.25), (40_000, 2.00, 2.50, 0.25), (150_000, 2.20, 2.80, 0.25), (1_500_000, 2.50, 3.00, 0.25)]
 
 _hour_cache = {}
 

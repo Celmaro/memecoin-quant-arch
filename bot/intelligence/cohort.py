@@ -141,9 +141,71 @@ def st_fetch_wallet_summary(wallet):
     except Exception:
         return None
 
-def refresh(force=False, source="solanatracker"):
+# ---------- Fomo-API v1 fetcher (Oct 21 — NEW product, user-provided key) ----------
+# api.fomo-api.com = "Solana Wallet PnL & Trader Endpoints" — NOT the legacy
+# api.fomoapi.io (402-dead). board=solana = WALLETS ranked by REALIZED PnL on
+# Solana (conservative/auditable: coveragePct + pnlStatus; null never means 0).
+# Free plan: 1,500 calls/mo, 10 rpm, 20 rows/request cap (live-probed Oct 21).
+FL_BASE = "https://api.fomo-api.com"
+
+def _fl_headers():
+    cfg = load_config()
+    key = cfg.get("FOMO_LIVE_KEY")
+    return {"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"} if key else {}
+
+def fl_fetch_leaderboard(window="7d", limit=20):
+    """GET /v1/leaderboard?window=&board=solana — realized-PnL Solana wallet board.
+    Returns rows keyed by `address` (rank, realizedPnlUsd, returnPct, volumeUsd,
+    trades, coveragePct, pnlStatus). No winRate/hold — cohort filter falls back
+    to realized_pnl>0 (refresh() stores win_rate=NULL and the qualifier handles it)."""
+    if not load_config().get("FOMO_LIVE_KEY"):
+        return []
+    w = str(window).lower()
+    win = {"24h": "24h", "24": "24h", "1d": "24h", "7d": "7d", "7": "7d",
+           "30d": "30d", "30": "30d"}.get(w, "7d")
+    url = f"{FL_BASE}/v1/leaderboard?window={win}&board=solana&limit={min(limit, 20)}"
+    try:
+        st, data = http_json(url, headers=_fl_headers(), timeout=20)
+        if not isinstance(data, dict):
+            return []
+        rows = data.get("data") or []
+        out = []
+        for i, r in enumerate(rows, 1):
+            addr = r.get("address")
+            if not addr:
+                continue
+            out.append({"rank": r.get("rank") or i, "wallet": addr,
+                        "address": addr, "realizedPnlUsd": r.get("realizedPnlUsd"),
+                        "winRate": None,  # not provided by this board
+                        "medianHoldSeconds": None,
+                        "volume": r.get("volumeUsd"), "roi": r.get("returnPct"),
+                        "trades": r.get("trades"), "coveragePct": r.get("coveragePct"),
+                        "pnlStatus": r.get("pnlStatus"),
+                        "displayName": r.get("displayName"), "handle": r.get("handle")})
+        return out
+    except Exception:
+        return []
+
+def fl_fetch_wallet(wallet):
+    """GET /v1/wallet/:address — 30-day realized PnL aggregate for one wallet."""
+    if not load_config().get("FOMO_LIVE_KEY"):
+        return None
+    try:
+        st, d = http_json(f"{FL_BASE}/v1/wallet/{wallet}", headers=_fl_headers(), timeout=20)
+        if not isinstance(d, dict) or d.get("error"):
+            return None
+        return {"realizedPnlUsd": d.get("realizedPnlUsd"), "winRate": None,
+                "medianHoldSeconds": None, "volumeUsd": d.get("volumeUsd"),
+                "trades": d.get("trades"), "coveragePct": d.get("coveragePct"),
+                "pnlStatus": d.get("pnlStatus"), "returnPct": d.get("returnPct")}
+    except Exception:
+        return None
+
+def refresh(force=False, source="fomo-live"):
     """Pull all 3 windows, snapshot to DB. Skips if last refresh < 8h ago.
-    source: solanatracker (default, free key, verified) or fomoapi (402-locked as of Oct 16)."""
+    source: fomo-live (DEFAULT Oct 21 — new api.fomo-api.com, free 1,500/mo,
+    realized-PnL Solana wallet board, user-provided key) or solanatracker
+    (free key, verified) or fomoapi (legacy 402-locked as of Oct 16)."""
     ensure_schema()
     con = db()
     last = con.execute("SELECT MAX(observed_at) FROM leaderboard_snapshots").fetchone()[0] or 0
@@ -153,7 +215,12 @@ def refresh(force=False, source="solanatracker"):
     now = time.time()
     saved = 0
     for window in ("24h", "7d", "30d"):
-        rows = st_fetch_leaderboard(window) if source == "solanatracker" else _fetch_window(window)
+        if source == "fomo-live":
+            rows = fl_fetch_leaderboard(window)
+        elif source == "solanatracker":
+            rows = st_fetch_leaderboard(window)
+        else:
+            rows = _fetch_window(window)
         for r in rows:
             addr = r.get("wallet") or r.get("wallet_address") or r.get("address")
             if not addr:
@@ -198,17 +265,26 @@ def qualifying_cohort(snapshot_time=None, source="solanatracker", freshness_s=6 
     set30 = {a for a, w in rows["30D_ROLLING"].items() if (w["realized_pnl_usd"] or 0) > 0}
     inter = set24 & set7 & set30
     # enrich intersection candidates with wallet summaries for the hold-time filter
+    # Oct 21: source-aware. fomo-live (realized board) enriches via fl_fetch_wallet
+    # — coveragePct/pnlStatus already gate completeness, and a None hold is a PASS
+    # (no SolanaTracker credits burned). solanatracker keeps the old ST enrichment.
     out = []
+    _is_fl = source == "fomo-live"
     for a in inter:
         wr = rows["24H_ROLLING"][a]["win_rate"]
         hold_s = None
         if apply_hold_filter:
-            summ = st_fetch_wallet_summary(a)
-            if summ:
-                hold_s = summ.get("medianHoldSeconds")
-                if summ.get("winRate") is not None:
-                    wr = summ["winRate"] / 100 if summ["winRate"] > 1 else summ["winRate"]
-        if apply_hold_filter and (hold_s is None or hold_s < FILTERS["min_median_hold_s"]):
+            if _is_fl:
+                summ = fl_fetch_wallet(a)
+                if summ and summ.get("pnlStatus") == "complete" and (summ.get("coveragePct") or 0) >= 60:
+                    pass  # auditable realized figures — no hold-time gate for this source
+            else:
+                summ = st_fetch_wallet_summary(a)
+                if summ:
+                    hold_s = summ.get("medianHoldSeconds")
+                    if summ.get("winRate") is not None:
+                        wr = summ["winRate"] / 100 if summ["winRate"] > 1 else summ["winRate"]
+        if not _is_fl and apply_hold_filter and (hold_s is None or hold_s < FILTERS["min_median_hold_s"]):
             continue
         out.append({"wallet": a, "entity": canonical_entity(a),
                     "win_rate": wr, "hold_s": hold_s})

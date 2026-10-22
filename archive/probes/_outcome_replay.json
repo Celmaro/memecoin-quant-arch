@@ -1,0 +1,174 @@
+{
+ "res": [
+  {
+   "symbol": "1",
+   "channel": "solearlytrending",
+   "score": 41.0,
+   "call_ts": 1792114066.578099,
+   "call_px": 0.0001508,
+   "pk45": 4.64219887212206,
+   "pk2h": 17.35082181786374,
+   "cl45": 2.513406406182947
+  },
+  {
+   "symbol": "RL",
+   "channel": "SeekrTrending",
+   "score": 57.0,
+   "call_ts": 1792114041.575162,
+   "call_px": 5.929e-05,
+   "pk45": 5.847594188104351,
+   "pk2h": 5.847594188104351,
+   "cl45": 2.307605059201851
+  },
+  {
+   "symbol": "RDSTR",
+   "channel": "solearlytrending",
+   "score": 37.0,
+   "call_ts": 1792113769.3289242,
+   "call_px": 6.678e-05,
+   "pk45": 1.0624862704901656,
+   "pk2h": 2.0926026011349736,
+   "cl45": 0.6140802911187768
+  },
+  {
+   "symbol": "FTR",
+   "channel": "solearlytrending",
+   "score": 47.0,
+   "call_ts": 1792113741.2495818,
+   "call_px": 6.579e-05,
+   "pk45": 0.8320320529805891,
+   "pk2h": 0.8320320529805891,
+   "cl45": 0.13956343254284315
+  },
+  {
+   "symbol": "GAY",
+   "channel": "soltrenchtrending",
+   "score": 30.0,
+   "call_ts": 1792113385.048638,
+   "call_px": 1.276e-05,
+   "pk45": 1.1458187596988991,
+   "pk2h": 1.1458187596988991,
+   "cl45": 0.9534120705471146
+  },
+  {
+   "symbol": "DOGAMI",
+   "channel": "soltrenchtrending",
+   "score": 30.0,
+   "call_ts": 1792113261.5341601,
+   "call_px": 1.287e-05,
+   "pk45": 0.9245395601613464,
+   "pk2h": 0.9245395601613464,
+   "cl45": 0.7899790783579848
+  },
+  {
+   "symbol": "RoadsterX",
+   "channel": "SeekrTrending",
+   "score": 33.0,
+   "call_ts": 1792113090.2704706,
+   "call_px": 5.875e-06,
+   "pk45": 1.0236852385999884,
+   "pk2h": 1.0236852385999884,
+   "cl45": 0.8217379879963735
+  },
+  {
+   "symbol": "ETR",
+   "channel": "solearlytrending",
+   "score": 19.0,
+   "call_ts": 1792112797.0459738,
+   "call_px": 4.333e-05,
+   "pk45": 0.5055576677203629,
+   "pk2h": 0.5055576677203629,
+   "cl45": 0.07579287514073965
+  },
+  {
+   "symbol": "grokazon",
+   "channel": "solearlytrending",
+   "score": 43.0,
+   "call_ts": 1792112629.9441254,
+   "call_px": 0.0002144,
+   "pk45": 1.1451710875565253,
+   "pk2h": 1.1451710875565253,
+   "cl45": 0.7910314364043814
+  },
+  {
+   "symbol": "WAIFU",
+   "channel": "solearlytrending",
+   "score": 47.0,
+   "call_ts": 1792112601.7557805,
+   "call_px": 0.0001041,
+   "pk45": 2.996578787916932,
+   "pk2h": 2.996578787916932,
+   "cl45": 0.018645450409967287
+  },
+  {
+   "symbol": "UNBUY",
+   "channel": "soltrenchtrending",
+   "score": 30.0,
+   "call_ts": 1792112461.4187715,
+   "call_px": 2.762e-05,
+   "pk45": 1.1913319693764652,
+   "pk2h": 1.2184194709579579,
+   "cl45": 0.9836878795393206
+  },
+  {
+   "symbol": "Roadster",
+   "channel": "SeekrTrending",
+   "score": 44.0,
+   "call_ts": 1792112424.0984724,
+   "call_px": 4.328e-05,
+   "pk45": 1.8742657470454986,
+   "pk2h": 1.8742657470454986,
+   "cl45": 0.06888502635182604
+  },
+  {
+   "symbol": "ASSBOY",
+   "channel": "SeekrTrending",
+   "score": 43.0,
+   "call_ts": 1792112071.1207314,
+   "call_px": 2.507e-05,
+   "pk45": 28308.793766989464,
+   "pk2h": 28308.793766989464,
+   "cl45": 27076.566560050895
+  },
+  {
+   "symbol": "dipcat",
+   "channel": "PIRBViewTrending",
+   "score": 40.0,
+   "call_ts": 1792111705.2384715,
+   "call_px": 3.598e-05,
+   "pk45": null,
+   "pk2h": null,
+   "cl45": null
+  },
+  {
+   "symbol": "ANTS",
+   "channel": "soltrenchtrending",
+   "score": 34.0,
+   "call_ts": 1792111582.3694322,
+   "call_px": 1.003e-05,
+   "pk45": 1.4549041699928613,
+   "pk2h": 1.4549041699928613,
+   "cl45": 0.3249245690611652
+  },
+  {
+   "symbol": "BATONMAN",
+   "channel": "SeekrTrending",
+   "score": 53.0,
+   "call_ts": 1792111067.5395205,
+   "call_px": 6.495e-05,
+   "pk45": null,
+   "pk2h": null,
+   "cl45": null
+  },
+  {
+   "symbol": "QUANTA",
+   "channel": "SeekrTrending",
+   "score": 50.0,
+   "call_ts": 1792111042.8696558,
+   "call_px": 4.331e-05,
+   "pk45": 0.9716016439173142,
+   "pk2h": 0.9716016439173142,
+   "cl45": 0.07131005970017344
+  }
+ ]
+}

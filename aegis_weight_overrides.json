@@ -1,0 +1,24 @@
+{
+ "generated_ts": 1792494065.6529033,
+ "min_n": 8,
+ "base_win": 0.48451327433628316,
+ "deltas": {
+  "entity_labels(-10)": -6,
+  "ws_quiet_tape": -6,
+  "ws_sell_pressure": -6,
+  "entity_labels(-15)": -6,
+  "ws_hot_buys": -6,
+  "entity_labels(-5)": -6,
+  "rug_insider_nets_x1": -6,
+  "gmgn_top50_1h_vol": -6,
+  "transfer_fee_present": -6,
+  "7tb75W\u2026 is first-block entry on 13 coins (best rank 0) \u2014 snipe bot (MEV)": -4.2,
+  "blix_dev_flat": -6,
+  "7y5aRd\u2026 is first-block entry on 83 coins (best rank 0) \u2014 snipe bot (MEV)": -3.8,
+  "ws_buy_pressure": -4.9,
+  "entity_labels(-20)": -1.9,
+  "thin_pool_liq_mc_0.0%": -1.4,
+  "insider_graph_detected": 1.7,
+  "top10_concentration": 2.4
+ }
+}

@@ -231,11 +231,14 @@ def load_live_outcome(mint):
     return None, 0
 
 
+# Oct 20 OFF tape retune — mirrors position_monitor.EXIT_TIERS (single source).
+# Old ladder was stop-then-run suicide on this tape (65% dip <0.85 before 1.30);
+# TP2.0/SL0.75 flips -3.9%/call -> +5.2%. No 1.10 clip.
 EXIT_TIERS = [
-    (0,        1.10, 1.30, 0.15),
-    (40_000,   1.15, 1.35, 0.18),
-    (150_000,  1.20, 1.45, 0.22),
-    (1_500_000,1.30, 1.60, 0.28),
+    (0,        2.00, 2.50, 0.25),
+    (40_000,   2.00, 2.50, 0.25),
+    (150_000,  2.20, 2.80, 0.25),
+    (1_500_000,2.50, 3.00, 0.25),
 ]
 
 

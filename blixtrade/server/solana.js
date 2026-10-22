@@ -1,0 +1,131 @@
+import { heliusFetch as fetch } from "./heliuskeys.js";
+// Solana RPC access and swap parsing. Works on the free public RPC (slow, ~1 tx lookup/s);
+// a custom RPC URL in Settings (e.g. a free Helius key) makes wallet tracking much faster.
+import { settings } from "./settings.js";
+import * as health from "./health.js";
+
+export const WSOL = "So11111111111111111111111111111111111111112";
+export const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+export const USDT = "Es9vMFrajDsTVEb4f3xFeKbSkqvn9rk8Y3Y7xMhRzTsH";
+const QUOTES = new Set([WSOL, USDC, USDT]);
+
+const PUBLIC = "https://api.mainnet-beta.solana.com";
+// Without a key the radar spreads over two public endpoints: each limits an IP on its own (requests per
+// method, and "data allowance" per 30 s), so when one says stop the other carries on while it rests.
+export const PUBLIC_POOL = [PUBLIC, "https://solana-rpc.publicnode.com"];
+let pub = 0, pubSince = 0;   // which public endpoint, and since when it is not the preferred one
+// The preferred endpoint is tried again a minute after a switch away from it.
+const url = () => { if (pub && Date.now() - pubSince > 60_000) pub = 0; return settings.rpcUrl?.trim() || PUBLIC_POOL[pub % PUBLIC_POOL.length]; };
+const isPublic = () => !settings.rpcUrl?.trim();
+export const publicUrl = () => PUBLIC_POOL[pub % PUBLIC_POOL.length];
+
+// Per-method pacing. The public endpoint limits each method separately and punishes bursts.
+const pace = new Map();
+const gap = (method) => {
+  if (!isPublic()) return 110;                         // ~9 req/s: fine for Helius free tier
+  return method === "getTransaction" ? 1100 : 450;
+};
+let cooldownUntil = 0;
+export const rpcStats = { calls: 0, errors: 0, limited: 0, last: 0, lastOk: 0, lastError: null, lastErrorAt: 0, coolingUntil: 0, byMethod: {} };
+// Calls and answer bytes per method: the public endpoint's "data allowance" is bytes per 30 s, so this says who spends it.
+function count(method, bytes) { const m = rpcStats.byMethod[method] || (rpcStats.byMethod[method] = { n: 0, kb: 0 }); m.n++; m.kb += bytes / 1024; }
+export const rpcPublic = () => isPublic();
+
+// The public endpoint answers "too many requests" for bursts and "used your data allowance" once an IP
+// has pulled too much; the second needs a much longer rest.
+function limited(msg, attempt) {
+  rpcStats.limited++;
+  // On the public pool the next call goes to the other endpoint at once; the rest is short.
+  if (isPublic() && PUBLIC_POOL.length > 1) { pub = (pub + 1) % PUBLIC_POOL.length; pubSince = Date.now(); rpcStats.switched = (rpcStats.switched || 0) + 1; }
+  const rest = isPublic() && PUBLIC_POOL.length > 1 ? 500 : /data allowance/i.test(msg) ? 60_000 : 4000 * (attempt + 1);
+  cooldownUntil = Math.max(cooldownUntil, Date.now() + rest);
+  rpcStats.coolingUntil = cooldownUntil;
+  rpcStats.lastError = msg; rpcStats.lastErrorAt = Date.now();
+  health.fail("rpc", msg);
+}
+
+export async function rpc(method, params, tries = 3) {
+  for (let attempt = 0; attempt < tries; attempt++) {
+    const wait = Math.max(cooldownUntil, (pace.get(method) || 0)) - Date.now();
+    pace.set(method, Math.max(Date.now(), pace.get(method) || 0) + gap(method));
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    rpcStats.calls++;
+    rpcStats.last = Date.now();
+    let body;
+    try {
+      const r = await fetch(url(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (r.status === 429) { limited("rate limited (429)", attempt); continue; }
+      const text = await r.text();
+      count(method, text.length);
+      body = JSON.parse(text);
+    } catch (e) {
+      if (e.code === "HELIUS_BUDGET") throw e;
+      rpcStats.errors++;
+      rpcStats.lastError = e.name === "TimeoutError" ? "timed out" : e.message; rpcStats.lastErrorAt = Date.now();
+      health.fail("rpc", rpcStats.lastError);
+      if (attempt === tries - 1) throw e;
+      continue;
+    }
+    if (body.error) {
+      if (/too many requests|data allowance|rate limit/i.test(body.error.message)) { limited(body.error.message, attempt); continue; }
+      // A method the fallback endpoint keeps for paying users ("indexed requests require a personal token",
+      // "request blocked"): back to the preferred endpoint for this call, not an error.
+      if (isPublic() && pub && /blocked|personal token|not supported|not allowed|method not found/i.test(body.error.message)) { pub = 0; rpcStats.bounced = (rpcStats.bounced || 0) + 1; continue; }
+      rpcStats.errors++;
+      rpcStats.lastError = body.error.message; rpcStats.lastErrorAt = Date.now();
+      health.fail("rpc", body.error.message);
+      throw new Error(body.error.message);
+    }
+    rpcStats.lastOk = Date.now();
+    health.ok("rpc");
+    return body.result;
+  }
+  throw Object.assign(new Error(`${method}: rate limited`), { limited: true });
+}
+
+export const signatures = (address, opts = {}) => rpc("getSignaturesForAddress", [address, { limit: 20, ...opts }]);
+export const transaction = (sig) => rpc("getTransaction", [sig, { maxSupportedTransactionVersion: 1, encoding: "jsonParsed", commitment: "confirmed" }]);
+
+const amount = (b) => Number(b.uiTokenAmount.amount) / 10 ** b.uiTokenAmount.decimals;
+
+// What `wallet` bought or sold in this transaction. Returns [{ mint, side, tokens, sol, usd }].
+// SOL spent includes wrapped SOL; USDC/USDT legs are counted in USD.
+export function parseSwaps(tx, wallet) {
+  if (!tx || tx.meta?.err) return [];
+  const keys = tx.transaction.message.accountKeys.map((k) => (typeof k === "string" ? k : k.pubkey));
+  const i = keys.indexOf(wallet);
+  const payer = keys[0] === wallet;
+  let sol = i >= 0 ? (tx.meta.postBalances[i] - tx.meta.preBalances[i] + (payer ? tx.meta.fee : 0)) / 1e9 : 0;
+  let stable = 0;
+  const tokens = new Map();
+  const add = (b, sign) => {
+    if (b.owner !== wallet) return;
+    const v = amount(b) * sign;
+    if (b.mint === WSOL) sol += v;
+    else if (b.mint === USDC || b.mint === USDT) stable += v;
+    else tokens.set(b.mint, (tokens.get(b.mint) || 0) + v);
+  };
+  for (const b of tx.meta.preTokenBalances || []) add(b, -1);
+  for (const b of tx.meta.postTokenBalances || []) add(b, +1);
+  const moved = [...tokens].filter(([, d]) => Math.abs(d) > 0);
+  if (!moved.length) return [];
+  // A swap moves one token against SOL or a stablecoin in the opposite direction.
+  // Token-only moves (airdrops, transfers) have no quote leg and are skipped.
+  if (moved.length > 1) return [];
+  const [mint, d] = moved[0];
+  const side = d > 0 ? "buy" : "sell";
+  const quoteSol = Math.abs(sol) > 0.0005 ? Math.abs(sol) : 0;
+  const quoteUsd = Math.abs(stable) > 0.01 ? Math.abs(stable) : 0;
+  if (!quoteSol && !quoteUsd) return [];
+  if (side === "buy" && sol > 0.0005 && !quoteUsd) return [];   // received both token and SOL: not a buy
+  if (side === "sell" && sol < -0.0005 && !quoteUsd) return []; // gave both away: not a sell
+  return [{ mint, side, tokens: Math.abs(d), sol: quoteSol, usd: quoteUsd || null, t: (tx.blockTime || 0) * 1000 }];
+}
+
+export const isQuote = (mint) => QUOTES.has(mint);
+export const validAddress = (a) => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a || "");

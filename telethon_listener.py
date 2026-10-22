@@ -104,6 +104,13 @@ def believable_mint(s):
     try:
         from desk_common import is_token_mint
         ok = is_token_mint(s)
+        if ok is None:
+            # RPC soft-fail (429/quota) — be PERMISSIVE: unknown is not "not a
+            # mint". A wallet-shaped base58 address would still be caught by the
+            # freshness gate + the scanner path later (Oct 20: Helius quota
+            # exhaustion froze intake because rpc() soft-fails to None and the
+            # old code returned False here -> every call wallet_addr_rejected).
+            ok = True
     except Exception:
         ok = True  # RPC down: be permissive (still caught by freshness gate + scanner path)
     _MINT_VALID_CACHE[s] = ok

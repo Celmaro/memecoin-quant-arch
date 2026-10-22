@@ -297,6 +297,25 @@ def scan_new_calls(max_scan=3):
         alerted += 1
         hbump(chan, "emitted")
         sym = sym or "?"
+        # Oct 21 latency fix: instant_trigger already deep-scans + cards this mint
+        # the moment the call lands. Skip the duplicate deep walk here (observed:
+        # 8/15 mints deep-scanned twice, 72-175s apart, when both paths ran cold)
+        # — one cold walk per mint, and the extra Helius/RPC load was slowing the
+        # instant card itself.
+        # Oct 21 latency fix: instant_trigger already deep-scans + cards this mint
+        # the moment the call lands. Skip the duplicate deep walk here (observed:
+        # 8/15 mints deep-scanned twice, 72-175s apart, when both paths ran cold)
+        # — one cold walk per mint, and the extra Helius/RPC load was slowing the
+        # instant card itself.
+        try:
+            _inst = set((json.load(open(os.path.join(DESK, "notifier_state.json"))) or {}).get("instant_sent") or [])
+            _inst = {m[:14] for m in _inst}  # normalize to raw mint
+        except Exception:
+            _inst = set()
+        if mint in _inst:
+            mc_s = f" at ${mc:,.0f} MC" if mc else ""
+            post_hmq(f"📢 New call: ${sym} (from {chan}){mc_s}\n   CA: {mint}\n   (carded — instant trigger)")
+            continue
         if mint and scanned < max_scan:
             try:
                 import aegis

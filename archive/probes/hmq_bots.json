@@ -1,0 +1,51 @@
+{
+ "apecheck_scan_bot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "defadeanalyzerbot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "soul_scanner_bot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "ttfbotbot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "mastrtrade_bot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "proficypricebot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "phanes_bot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "gmgnai_bot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "alphape_bot": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "6126376117": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "pirbview": {
+  "role": "scanner",
+  "first_seen": 0
+ },
+ "glassdexshillbot": {
+  "role": "scanner",
+  "first_seen": 1792241646.497043,
+  "sample": "\ud83d\udfe1 Cart ($Cart)\nVerdict: Caution\nMC $10.7K \u00b7 Liq $6.0K\n\n\ud83d\udfe2 Mint + freeze revoked\n\ud83d\udfe2 Top 10 holders: 22%\n\ud83d\udfe1 LP: still on pump.fun (no LP yet)\n\ud83d\udfe2 Dev BHaF\u2026ZFwT \u00b7 1 token made\n\n\ud83d\udd0d glassdex.io/GLX4\u2026pump\nGLX4XzV"
+ }
+}

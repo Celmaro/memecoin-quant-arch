@@ -453,6 +453,8 @@ def _auto_buy_locked():
         # Audit P1#3 (Oct 22): auto_buy NEVER consulted the exposure cap that
         # risk_gate/entry_call enforce — a cap-rejected signal stayed buyable here.
         # Same $200 face-exposure limit, computed BEFORE the fill quote.
+        # Oct 22 ext-audit P1: FAIL CLOSED — a risk limit must not silently
+        # permit a trade when the cap can't be computed. Skip the call + log.
         try:
             from bot.decision_engine.risk_gate import MAX_OPEN_EXPOSURE_USD
             open_exposure = sum(float(p.get("entry_usd") or p.get("size_usd") or 0)
@@ -461,8 +463,10 @@ def _auto_buy_locked():
                 b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                                     "why": f"exposure_cap_${open_exposure + size:.0f}"})
                 continue  # keep scanning; cap only blocks THIS call
-        except Exception:
-            pass
+        except Exception as _cap_err:
+            b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                "why": f"exposure_cap_uncomputable_{type(_cap_err).__name__}"})
+            continue  # fail CLOSED: cannot prove under cap -> do not enter
         # Resolve real symbol from market data when the call record lacks one
         if sym == "?" or sym == "None":
             sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
@@ -666,6 +670,7 @@ def _entry_call_locked(d, b=None, aegis_score=None):
     # P11 (Oct 20): close the risk-gate bypass — the instant_trigger path called
     # entry_call directly and never consulted the exposure cap that risk_gate
     # enforces on the cron path. Same $200 face exposure limit here.
+    # Oct 22 ext-audit P1: FAIL CLOSED — uncomputable cap = no entry.
     try:
         from bot.decision_engine.risk_gate import MAX_OPEN_EXPOSURE_USD
         open_exposure = sum(float(p.get("entry_usd") or p.get("size_usd") or 0)
@@ -675,8 +680,11 @@ def _entry_call_locked(d, b=None, aegis_score=None):
                                                 "why": f"exposure_cap_${open_exposure + size:.0f}"})
             save_book(b)
             return None, f"exposure_cap_${open_exposure + size:.0f}"
-    except Exception:
-        pass
+    except Exception as _cap_err:
+        b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                            "why": f"exposure_cap_uncomputable_{type(_cap_err).__name__}"})
+        save_book(b)
+        return None, f"exposure_cap_uncomputable_{type(_cap_err).__name__}"
     age = (time.time() - float(d.get("ts") or time.time())) / 60
     b["positions"][mint] = {"mint": mint, "symbol": sym, "entry_px": float(px), "size_usd": size,
                            "entry_usd": size, "initial_usd": size, "opened": time.time(),

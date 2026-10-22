@@ -122,6 +122,14 @@ def apply_trade(e):
         row["px_sol"] = px
         row["px_usd"] = px * _SOL_USD
         row["t"] = ts_ms
+        # Oct 21 POOL-ROTATION GUARD: persist a short (ts_ms, px) sample tail so
+        # subprocess exits can detect the rotation step (a claim of -90% that
+        # contradicts the coin's own price 60-300s ago = residual/thin pool).
+        tail = row.setdefault("pxs_tail", [])
+        tail.append((ts_ms, px))
+        _cut = (ts_ms or 0) - 1_200_000  # 20 min cap, 90 samples max
+        while len(tail) > 90 or (tail and tail[0][0] < _cut):
+            tail.pop(0)
         if isinstance(B, (int, float)) and isinstance(Q, (int, float)):
             row["B"] = float(B)
             row["Q"] = float(Q)

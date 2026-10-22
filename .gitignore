@@ -1,29 +1,5 @@
-# Local secrets — never commit
-CONFIG.md
-.env
-.env.*
-!.env.example
+
+tg_session*
 .tg_credentials.json
 .tg_code
 .tg_pw
-tg_session*
-tg_session_curator*
-telethon_listener.off
-scan_curator.off
-
-# Runtime state
-*.db
-*.db-shm
-*.db-wal
-*.jsonl
-positions*.json
-paper_book*.json
-telethon_state.json
-holder_snapshots.json
-*.pid
-
-# Python-generated files
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/

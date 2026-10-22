@@ -11,9 +11,13 @@ def schedule_followup(mint, kind, hours, note=""):
                 (mint, time.time() + hours * 3600, kind, note))
     con.commit(); con.close()
 
-def run_followups(verbose=True):
+def run_followups(verbose=True, limit=None, deadline_s=75):
     """Check due followups: is the token dead/alive? Record outcome.
 
+    limit: bound rows per run so the supervisor batch never exceeds its
+    subprocess timeout (F2, Oct 19); None = all due.
+    deadline_s: stop after this many seconds (provider calls can take 20s x 3
+    retries each); remaining rows are picked up by the next batch.
     Doc1-5 + Doc2-9 (Blix-parity replay + shadow portfolio): for mints that were
     scanned/called but are NOT currently held, also replay the FIXED paper exit rule
     over the observed move (entry MC from call_metrics/coins) so rejected/observed
@@ -22,7 +26,11 @@ def run_followups(verbose=True):
     trajectory) instead of only judging picks we actually took.
     """
     con = db()
-    due = con.execute("SELECT * FROM followups WHERE done=0 AND due_ts<=?", (time.time(),)).fetchall()
+    due = con.execute("SELECT * FROM followups WHERE done=0 AND due_ts<=? ORDER BY due_ts ASC", (time.time(),)).fetchall()
+    if limit:
+        due = due[:limit]
+    deadline = time.time() + deadline_s
+    processed = 0
     # fixed rule thresholds (match paper_tick tier + Blix pick rule)
     FIXED_TP = 2.0
     FIXED_STOP = 0.6
@@ -31,8 +39,11 @@ def run_followups(verbose=True):
     except Exception:
         held = set()
     for f in due:
+        if time.time() > deadline:
+            break
+        processed += 1
         try:
-            pair = dex_pair(f["mint"])
+            pair = dex_pair(f["mint"], allow_fallback=False, timeout=8, retries=1)
         except Exception:
             pair = None
         if pair:
@@ -70,7 +81,7 @@ def run_followups(verbose=True):
         if verbose:
             print(f"  [{f['kind']}] {f['mint'][:12]}... -> {outcome}: {result}")
     con.commit(); con.close()
-    return len(due)
+    return processed
 
 def trade_stats(days=14):
     """Aggregate POSITION_CLOSE events + paper_book trades (audit P2-7: the two
