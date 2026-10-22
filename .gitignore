@@ -1,5 +1,44 @@
-
-tg_session*
+# Secrets and local credentials
+CONFIG.md
+.env
+.env.*
+!.env.example
 .tg_credentials.json
 .tg_code
 .tg_pw
+tg_session*
+tg_session_curator*
+
+# Runtime state and ledgers
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+paper_book*.json
+positions*.json
+notifier_state.json
+telethon_state.json
+whale_watch_state.json
+calls.trigger
+*.pid
+*.lock
+*.tmp
+.audit_scoring_cache.json
+
+# Python/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local caches, logs, and generated reports
+*_cache/
+*.log
+journal/
+
+# Unrelated local source trees accidentally present in the desk workspace
+blixtrade/
+nought/
+Solana-Forensic-Analysis-Tool/
