@@ -97,9 +97,17 @@ def audit(mint, call_ts, call_mc, sym, chan):
     row["fill_mc"] = round(fill_mcq, 2) if fill_mcq else None
     if call_mc:
         row["entry_gap_pct"] = round((fill_mcq - call_mc) / call_mc * 100, 1) if fill_mcq else None
-    # window metrics 0..2h
+    # P12/P5 (Oct 20): metrics OUTCOME walk must start at FILL (not call0) — the
+    # desk buys at the modeled fill; pre-fill prices are not tradeable. Metrics
+    # (bs5m/act60) use pre-fill window only (no look-ahead; see deep_audit P5).
     t0 = call_ts * 1000
     t2h = t0 + 7200_000
+    fill_ts = None
+    for ts, px, mcq, action, qa in g:
+        if ts >= call_ts * 1000 + LATENCY_MS:
+            fill_ts = ts
+            break
+    t_st = fill_ts if fill_ts is not None else t0
     max_mc = 0.0
     max_mult = 1.0
     buys = sells = 0
@@ -107,7 +115,7 @@ def audit(mint, call_ts, call_mc, sym, chan):
     buys5 = sells5 = act60 = 0
     end_ts = end_px = None
     for ts, px, mcq, action, qa in g:
-        if ts < t0 or ts > t2h:
+        if ts < t_st or ts > t2h:
             continue
         m = mcq * SOLUSD if mcq else 0.0
         max_mc = max(max_mc, m)
@@ -116,11 +124,11 @@ def audit(mint, call_ts, call_mc, sym, chan):
         vol_usd += qa * SOLUSD
         if action == "buy":
             buys += 1
-            if ts <= t0 + 300_000: buys5 += 1
+            if ts <= t_st + 300_000: buys5 += 1
         elif action == "sell":
             sells += 1
-            if ts <= t0 + 300_000: sells5 += 1
-        if ts <= t0 + 60_000:
+            if ts <= t_st + 300_000: sells5 += 1
+        if ts <= t_st + 60_000:
             act60 += 1
         end_ts, end_px = ts, px
     row["max_mc"] = round(max_mc, 2)
@@ -135,7 +143,7 @@ def audit(mint, call_ts, call_mc, sym, chan):
     tp1, tp2, stop = 1.10, 1.30, 0.15
     outcome = "OPEN"
     for ts, px, mcq, action, qa in g:
-        if ts < t0:
+        if ts < t_st:
             continue
         mult = px / fill
         if mult >= tp2:

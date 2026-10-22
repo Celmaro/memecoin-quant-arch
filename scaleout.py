@@ -9,6 +9,7 @@ stage automatically corrects onto the curve instead of compounding the error.
 """
 import os, sys, time, json
 sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
+from desk_common import book_lock  # Oct 22 ext audit P1#1: same cross-process book write lock
 
 STAGES = {  # stage -> (target_remaining_ratio, default_trigger_mult)
     1: (0.50, 1.15),
@@ -107,10 +108,50 @@ MAX_BOOKED_GAIN_MULT = 10.0
 
 def _confirm_gain(mint, mult, entry_px=None):
     """Oct 21 CORRUPTION CAP: a claimed gain mult > MAX_BOOKED_GAIN_MULT must be
-    re-confirmed by a fresh live read (glitch-guarded dex_pair) before booking.
-    Returns the capped mult: live-confirmed if it really is that high, else
-    MAX_BOOKED_GAIN_MULT (a $20 position can NEVER book a 29,988x close on a
-    single unconfirmed provider snapshot)."""
+    re-confirmed by fresh live reads before booking.
+
+    Oct 22 HARDENING (CLIP1 booked 12,977x -> +$125,868): the original check only
+    re-read dex_pair — the SAME provider whose $1.00 glitch produced the 12,977x
+    (entry 7.697e-05 x 12977 = 0.9987). A glitching provider confirms its own
+    glitch on the second read. The coin's OWN feed samples (pumdata pxs_tail,
+    60-300s old) are the independent hot-path truth: if the claimed fill is
+    >2.5x above the coin's own recent tape, it is a provider artifact — cap at
+    MAX_BOOKED_GAIN_MULT. The dex re-read stays as the SECOND confirmation.
+
+    Returns the capped mult: tape-confirmed + live-confirmed if it really is
+    that high, else MAX_BOOKED_GAIN_MULT (a $20 position can NEVER book a
+    29,988x close on unconfirmed/self-confirming provider snapshots)."""
+    try:
+        # 1) the coin's OWN recent tape (independent of the glitching provider)
+        import json as _j, os as _os, time as _time
+        _cache_path = _os.path.expanduser("~/memecoin-quant/pumpdata_cache.json")
+        if _os.path.exists(_cache_path) and entry_px:
+            try:
+                _body = _j.load(open(_cache_path))
+            except Exception:
+                _body = {}
+            _rm = (_body.get("mints") or {}).get(mint) or {}
+            _tail = _rm.get("pxs_tail") or []
+            if _tail:
+                _now_ms = _time.time() * 1000
+                _stable = [p for ts, p in _tail
+                           if ts and (_now_ms - 300_000) <= ts <= (_now_ms - 60_000)]
+                if len(_stable) >= 3:
+                    _stable_med = sorted(_stable)[len(_stable) // 2]
+                    _sol_usd = float(_body.get("sol_usd") or 104.0)
+                    _ep = float(entry_px)
+                    if _stable_med > 0 and _ep > 0:
+                        _stable_mult = (_stable_med * _sol_usd) / _ep
+                        # claimed >2.5x the coin's own tape = glitch (12,977x vs 0.17x)
+                        if _stable_mult > 0 and float(mult) > _stable_mult * 2.5:
+                            return min(float(mult or 0), MAX_BOOKED_GAIN_MULT)
+            else:
+                # NO independent tape: a claimed >10x unconfirmed by the coin's
+                # OWN recent samples gets capped WITHOUT the dex re-read (the
+                # provider that glitched will confirm its own glitch on retry).
+                return min(float(mult or 0), MAX_BOOKED_GAIN_MULT)
+    except Exception:
+        pass
     try:
         from desk_common import dex_pair
         mkt = dex_pair(mint, allow_fallback=True, timeout=8, retries=1) or {}
@@ -134,7 +175,40 @@ def _onchain_mult(mint, mult, entry_px=None):
     entry at exit time, the emergency exit's fill is capped at that level
     instead of a deeper phantom dump. Returns (capped_mult, source) where
     capped_mult is None when no evidence (then caller keeps the raw mult).
+
+    Oct 21 POOL-ROTATION GUARD (METOO class): a residual/thin pool after a
+    rotation can poison BOTH the feed AND DexScreener with a 10x-lower price
+    (METOO booked -91% at 0.087x while the archived tape median at the exit
+    minute was 0.914x). The feed's own pxs_tail (60-300s old samples) stays at
+    the stable level for ~1 min after the step — if the claimed crash is >3x
+    below the coin's own recent samples, that is the rotation signature, and
+    the fill is floored at the stable mult."
     """
+    # --- FEED-ROTATION CHECK (no network; the desk's own WS cache) ---
+    try:
+        import json as _j
+        _cache_path = os.path.expanduser("~/memecoin-quant/pumpdata_cache.json")
+        if os.path.exists(_cache_path):
+            _body = _j.load(open(_cache_path))
+            _rm = (_body.get("mints") or {}).get(mint) or {}
+            _tail = _rm.get("pxs_tail") or []
+            if _tail and entry_px:
+                _now_ms = time.time() * 1000
+                # stable = samples 60-300s old (the pre-step pool level)
+                _stable = [p for ts, p in _tail
+                           if ts and (_now_ms - 300_000) <= ts <= (_now_ms - 60_000)]
+                _cur_sol = _rm.get("px_sol")
+                if len(_stable) >= 3 and _cur_sol:
+                    _stable_med = sorted(_stable)[len(_stable) // 2]
+                    _sol_usd = float(_body.get("sol_usd") or 104.0)
+                    if _stable_med > 0 and float(_cur_sol) > 0:
+                        ratio = float(_cur_sol) / _stable_med
+                        if ratio < 1.0 / 3.0:  # >3x step below the coin's own tape
+                            stable_mult = (_stable_med * _sol_usd) / float(entry_px)
+                            if stable_mult >= MAX_BOOKED_DUMP_MULT and stable_mult > float(mult or 0):
+                                return stable_mult, "feed-rotation"
+    except Exception:
+        pass
     try:
         import urllib.request, json as _j
         from desk_common import dex_pair
@@ -158,6 +232,13 @@ def load_book():
     return json.load(open(os.path.expanduser("~/memecoin-quant/paper_book.json")))
 
 def save_book(b):
+    # Oct 22 ext audit P1#1: serialize with the SAME cross-process book lock —
+    # scaleout is the SECOND writer of paper_book.json (sell path), and must not
+    # interleave with paper_tick/entry_call writers. Reentrant within a process.
+    with book_lock():
+        return _save_book_raw(b)
+
+def _save_book_raw(b):
     import tempfile
     p = os.path.expanduser("~/memecoin-quant/paper_book.json")
     tmp = p + ".tmp"
@@ -251,6 +332,18 @@ def execute_stage(book, sym, stage, mult, reason="", how="stage", liq=None, fee_
     # corrupted the book to $31.4M on a single unconfirmed provider snapshot).
     if float(mult or 0) > MAX_BOOKED_GAIN_MULT:
         mult = _confirm_gain(p.get("mint") or sym, mult, p.get("entry_px"))
+    # Oct 21 POOL-ROTATION FILL FLOOR: a claimed deep dump (< 0.72x) that
+    # contradicts the coin's OWN feed samples (60-300s ago) is the residual-pool
+    # signature (METOO booked -91% at 0.087x while its own tape was 0.914x).
+    # Floor the fill at the stable mult — every sell path funnels through here.
+    if float(mult or 1) < MAX_BOOKED_DUMP_MULT:
+        try:
+            _fm, _src = _onchain_mult(p.get("mint") or sym, float(mult), p.get("entry_px"))
+            if _fm is not None and _fm > float(mult):
+                mult = _fm
+                reason = reason + "+ROT_FLOOR"
+        except Exception:
+            pass
     done = set(p.get("stages_done") or [])
     if stage in done:
         # P2 (Oct 20): a "done" stage must still re-enter when there is sellable
@@ -406,6 +499,16 @@ def execute_fraction(book, sym, frac, mult, reason="", how="frac", liq=None, fee
     # Oct 21 CORRUPTION CAP (same as execute_stage): re-confirm absurd gains.
     if float(mult or 0) > MAX_BOOKED_GAIN_MULT:
         mult = _confirm_gain(p.get("mint") or sym, mult, p.get("entry_px"))
+    # Oct 21 POOL-ROTATION FILL FLOOR (same as execute_stage): never book a
+    # deep dump that contradicts the coin's own feed samples 60-300s ago.
+    if float(mult or 1) < MAX_BOOKED_DUMP_MULT:
+        try:
+            _fm, _src = _onchain_mult(p.get("mint") or sym, float(mult), p.get("entry_px"))
+            if _fm is not None and _fm > float(mult):
+                mult = _fm
+                reason = reason + "+ROT_FLOOR"
+        except Exception:
+            pass
     current = float(p.get("entry_usd") or 0)
     reserved = float(p.get("reserved_exit_usd") or 0)
     sellable = max(0.0, current - reserved)

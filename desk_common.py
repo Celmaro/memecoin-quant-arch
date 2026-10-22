@@ -1,12 +1,43 @@
 #!/usr/bin/env python3
 """Memecoin Quant Desk — shared utilities & config (stdlib only)."""
 import json, os, re, time, sqlite3, socket, urllib.request, urllib.error
+import fcntl, contextlib
 
 DESK = os.path.expanduser("~/memecoin-quant")
 AEGIS_DB = os.path.join(DESK, "aegis.db")
 JOURNAL_DIR = os.path.join(DESK, "journal")
 CALLS_FILE = os.path.join(DESK, "calls.jsonl")
 CONFIG = os.path.join(DESK, "CONFIG.md")
+
+# BOOK WRITER LOCK (Oct 22, ext audit P1#1): paper_tick's supervisor subprocess
+# (auto_buy + sell loop) and the call_notifier/instant_trigger processes
+# (entry_call) are SEPARATE processes writing the SAME paper_book.json.
+# load->mutate->save was not atomic -> lost buys/sells when two writers
+# overlapped. flock serializes ALL book writers (writes are ms, so contention
+# is negligible). Reentrancy: a module-level flag lets nested writers (e.g.
+# entry_call called from inside a locked helper) skip re-acquisition — flock on
+# a second fd in the SAME process would block.
+_BOOK_LOCK_FILE = os.path.join(DESK, ".paper_book.lock")
+_BOOK_LOCK_HELD = False
+
+@contextlib.contextmanager
+def book_lock():
+    """Serialize all paper_book.json writers across processes (fcntl flock)."""
+    global _BOOK_LOCK_HELD
+    if _BOOK_LOCK_HELD:  # already held by THIS process — reentrant skip
+        yield
+        return
+    fd = open(_BOOK_LOCK_FILE, "a+")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+        _BOOK_LOCK_HELD = True
+        yield
+    finally:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            fd.close()
+            _BOOK_LOCK_HELD = False
 
 CHANNELS = [
     "sol_trend", "solwhaletrending", "solearlytrending",
@@ -170,12 +201,20 @@ set_rate_limits(DEFAULT_RATE_LIMITS)
 # ---------------- Helius outage cooldown (Oct 21 latency fix) ----------------
 # Helius quota exhaustion was costing every deep scan ~196s of retry sleeps and
 # every paper_tick a 30s timeout per forensic call. Once the keyed endpoint
-# fails, skip it for HELIUS_COOLDOWN_S (120s). The marker is FILE-BACKED so the
+# fails, skip it for HELIUS_COOLDOWN_S. The marker is FILE-BACKED so the
 # supervisor's fresh subprocesses (paper_tick, instant_trigger) inherit the
 # known-dead state at import instead of each paying the discovery cost from 0.
-HELIUS_COOLDOWN_S = 120
+# Oct 21 second round: cooldown was 120s — a monthly-quota 429 does NOT recover
+# in 2 minutes, so the desk re-paid the discovery cost on EVERY tick (profile:
+# 70s of retry sleeps in estimate_fill_time alone, over the 120s tick budget).
+# Now 1h, and helius_down() probes the endpoint once when the marker goes stale
+# (file-throttled to 1 probe/min) so real recovery is still detected.
+HELIUS_COOLDOWN_S = 3600
 _HELIUS_DEAD_FILE = os.path.join(DESK, ".helius_dead_at")
+_HELIUS_PROBE_FILE = os.path.join(DESK, ".helius_probe_at")
 _HELIUS_DEAD_AT = 0.0
+_HELIUS_PROBE_AT = 0.0
+_HELIUS_PROBE_RESULT = True  # assume dead until first probe proves otherwise
 
 def _helius_dead_from_disk():
     try:
@@ -186,9 +225,54 @@ def _helius_dead_from_disk():
 
 _HELIUS_DEAD_AT = _helius_dead_from_disk()
 
+def _helius_probe_ok(timeout=4):
+    """Cheap getHealth against the KEYED endpoint. Short timeout, no retries —
+    this is the recovery probe, not a data call. File-throttled by caller."""
+    try:
+        cfg = load_config()
+        body = json.dumps({"jsonrpc": "2.0", "id": "probe", "method": "getHealth", "params": []}).encode()
+        _limiter.acquire("mainnet.helius-rpc.com")
+        req = urllib.request.Request(
+            f"https://mainnet.helius-rpc.com/?api-key={cfg['HELIUS_KEY']}",
+            data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            res = json.loads(r.read().decode())
+            return "error" not in res and res.get("result") == "ok"
+    except Exception:
+        return False
+
 def helius_down():
-    """True while the keyed Helius endpoint is in cooldown (skip its calls)."""
-    return time.time() - _HELIUS_DEAD_AT < HELIUS_COOLDOWN_S
+    """True while the keyed Helius endpoint should be skipped.
+
+    Marker fresh (< HELIUS_COOLDOWN_S) → known dead, skip. Marker stale →
+    probe once (file-throttled, ≤1/min globally) — success clears the marker
+    (real recovery detected), failure refreshes the cooldown. The result is
+    memoized for 60s so concurrent callers don't each probe."""
+    global _HELIUS_DEAD_AT, _HELIUS_PROBE_AT, _HELIUS_PROBE_RESULT
+    if time.time() - _HELIUS_DEAD_AT < HELIUS_COOLDOWN_S:
+        return True
+    # Marker stale — probe if the global throttle allows
+    try:
+        with open(_HELIUS_PROBE_FILE) as f:
+            disk_probe = float(f.read().strip() or 0.0)
+    except Exception:
+        disk_probe = 0.0
+    if time.time() - _HELIUS_PROBE_AT < 60 and time.time() - disk_probe < 60:
+        return _HELIUS_PROBE_RESULT
+    _HELIUS_PROBE_AT = time.time()
+    try:
+        with open(_HELIUS_PROBE_FILE, "w") as f:
+            f.write(str(_HELIUS_PROBE_AT))
+    except Exception:
+        pass
+    ok = _helius_probe_ok()
+    if ok:
+        mark_helius_alive()
+        _HELIUS_PROBE_RESULT = False
+    else:
+        mark_helius_dead()
+        _HELIUS_PROBE_RESULT = True
+    return _HELIUS_PROBE_RESULT
 
 def mark_helius_dead():
     global _HELIUS_DEAD_AT

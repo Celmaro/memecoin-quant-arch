@@ -117,9 +117,12 @@ except Exception as e:
     check("P0.1/P0.2 source checks", "ERR " + str(e)[:60], "no-exception")
 
 # --- audit P1.6 (Oct 18): exit_intel uses a SELL-route quote, not a buy quote ---
+# Oct 22 ext-audit P2 fix: quote_sell now receives the ACTUAL raw token qty
+# (qty_raw), not usd/decimals nonsense. Assert the corrected signature.
 try:
     ei_src = open("/home/agentuser/memecoin-quant/bot/intelligence/exit_intel.py").read()
-    check("P1.6 sell-route quote wired", "quote_sell" in ei_src and "token->SOL" in ei_src, True)
+    check("P1.6 sell-route quote wired",
+          "def _jupiter_impact(mint, qty_raw)" in ei_src and "quote_sell(mint, int(round(qty_raw))" in ei_src, True)
 except Exception as e:
     check("P1.6 source check", "ERR " + str(e)[:60], "no-exception")
 
@@ -475,6 +478,31 @@ try:
     _F["priceUsd"] = 1.2e-6
 except Exception as e:
     check("R3 ladder-execution test", "ERR " + str(e)[:80], "no-exception")
+
+# --- Oct 22 EXT AUDIT ROUND (external audit verify + fix lock) ---
+# Pins: P1#1 book writer lock wired everywhere; P1#3 auto_buy exposure cap;
+# P1#4 pre-grad needs zero-liq (MC alone insufficient); P1#5 missing ts rejected;
+# P2 Jupiter impact passes raw qty (not usd/decimals).
+try:
+    import re as _re22
+    # P1#1: book_lock must exist in desk_common AND be used by both save_book impls
+    _dc22 = open("/home/agentuser/memecoin-quant/desk_common.py").read()
+    _pt22 = open("/home/agentuser/memecoin-quant/paper_tick.py").read()
+    _so22 = open("/home/agentuser/memecoin-quant/bot/position_manager/scaleout.py").read()
+    check("R22 book_lock in desk_common", "def book_lock" in _dc22, True)
+    check("R22 paper_tick uses book_lock", "from desk_common import book_lock" in _pt22, True)
+    check("R22 scaleout uses book_lock", "from desk_common import book_lock" in _so22, True)
+    # P1#3: auto_buy body must contain the exposure-cap guard
+    check("R22 auto_buy exposure cap wired", "MAX_OPEN_EXPOSURE_USD" in _pt22, True)
+    # P1#4: pre-grad must require zero/unknown liq (not MC alone)
+    check("R22 pre-grad requires zero liq", "liq in (None, \"\", 0)" in _pt22, True)
+    # P1#5: entry_call must reject missing ts outright
+    check("R22 missing-ts rejected", "no_valid_ts" in _pt22, True)
+    # P2: exit_intel impact uses raw qty signature
+    _ei22 = open("/home/agentuser/memecoin-quant/bot/intelligence/exit_intel.py").read()
+    check("R22 Jupiter impact raw-qty signature", "def _jupiter_impact(mint, qty_raw)" in _ei22, True)
+except Exception as e:
+    check("R22 ext-audit lock", "ERR " + str(e)[:80], "no-exception")
 
 print()
 print("FAILURES:", failures if failures else "NONE — all decision-engine regressions pass")

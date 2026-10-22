@@ -14,17 +14,27 @@ CONSUMED_FILE = "/home/agentuser/memecoin-quant/consumed_calls.jsonl"
 CURVE_FILL_MC_USD = 69_000
 CURVE_GRAD_LIQ_MIN = 10_000
 
-def _is_curve_pre_grad(mkt):
+def _is_curve_pre_grad(mkt, liq=None):
     """True for a pump.fun mint still on the bonding curve (MC < fill) where a
-    liq=0 read is EXPECTED, not evidence of death. Those coins report liq $0 until
-    the curve fills, so the liq gate must not reject them on liq alone."""
+    liq=0/None read is EXPECTED, not evidence of death. Those coins report liq $0
+    until the curve fills, so the liq gate must not reject them on liq alone.
+
+    Audit P1#4 (Oct 22): the OLD check used MC < fill ONLY — a migrated coin
+    that dumped below $69K MC with a real (thin) pool was still exempted from
+    the $10K liq gate. Require the actual pre-grad signature: no pool liquidity
+    AND sub-fill MC. A migrated coin with $1-10K real pool liq now hits the
+    thin_liquidity gate like any other thin coin."""
     if not mkt:
         return False
     mc = float((mkt.get("marketCap") or mkt.get("marketCapQuote") or 0) or 0)
     if mc <= 0:
         return False
-    # if MC is already above fill, it's graduated (has real pool liq) — gate applies
-    return mc < CURVE_FILL_MC_USD
+    if mc >= CURVE_FILL_MC_USD:
+        return False  # graduated — gate applies
+    if liq is None:
+        liq = ((mkt.get("liquidity") or {}).get("usd"))
+    # pre-grad = NO pool yet (0 or unknown), NOT a thin-but-real pool
+    return liq in (None, "", 0) or float(liq or 0) <= 0
 
 def _note_fill(mint, age_min, ts=None):
     """Record fill-time (call→entry minutes) in the coins table. Oct 20 audit:
@@ -59,7 +69,24 @@ def _consumed_mints(max_age_s=86400):
 def load_book():
     return json.load(open(BOOK))
 
+# BOOK WRITER LOCK shared via desk_common.book_lock (Oct 22, ext audit P1#1):
+# paper_tick's supervisor subprocess (auto_buy + sell loop) and the
+# call_notifier/instant_trigger processes (entry_call) are SEPARATE processes
+# writing the SAME paper_book.json. load->mutate->save was not atomic -> lost
+# buys/sells when two writers overlapped. desk_common.book_lock serializes ALL
+# book writers (writes are ms, so contention is negligible) and is reentrant
+# within a process.
+from desk_common import book_lock
+
 def save_book(b):
+    # GUARD + WRITER LOCK (Oct 22, ext audit P1#1): serialize the atomic write
+    # with the cross-process book lock (desk_common). load->mutate->save spans in
+    # entry_call/auto_buy/main also run inside book_lock() so the WHOLE
+    # read-modify-write is atomic across processes, not just the write itself.
+    with book_lock():
+        return _save_book_guarded(b)
+
+def _save_book_guarded(b):
     # GUARD (Oct 19, clobber-incident): refuse to write a structurally invalid
     # book. A synthetic/test book missing required keys (start/cash/positions) was
     # once written over the live $92.40 book by a verification test's save_book
@@ -276,6 +303,13 @@ def tier_exits(mc):
     return (0.50, tp1, tp2, -stop)
 
 def auto_buy():
+    """Cross-process writer wrapper (Oct 22, ext audit P1#1): the whole
+    load->mutate->save span runs under desk_common.book_lock so this process and
+    the call_notifier/instant_trigger process never interleave book writes."""
+    with book_lock():
+        return _auto_buy_locked()
+
+def _auto_buy_locked():
     """Buy NEW calls (<5m since channel post) with available cash.
 
     Doc1-6 (Blix-parity, verified by both systems' own measurements): NO model grade /
@@ -377,7 +411,7 @@ def auto_buy():
         # (bonding curve has no pool until $69K fill) — the $10K gate rejected
         # 22/33 of the best GRAD-DURING cohort. Only enforce the gate for coins
         # that should ALREADY have a pool (MC >= fill) or have real liq data.
-        if liq < 10000 and not _is_curve_pre_grad(mkt):
+        if liq < 10000 and not _is_curve_pre_grad(mkt, liq):
             b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                                 "why": f"thin_liquidity_${liq:,.0f}"})
             continue
@@ -416,6 +450,19 @@ def auto_buy():
             b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                                 "why": f"insufficient_cash_${b['cash']:.2f}"})
             break
+        # Audit P1#3 (Oct 22): auto_buy NEVER consulted the exposure cap that
+        # risk_gate/entry_call enforce — a cap-rejected signal stayed buyable here.
+        # Same $200 face-exposure limit, computed BEFORE the fill quote.
+        try:
+            from bot.decision_engine.risk_gate import MAX_OPEN_EXPOSURE_USD
+            open_exposure = sum(float(p.get("entry_usd") or p.get("size_usd") or 0)
+                                for p in b["positions"].values())
+            if open_exposure + size > MAX_OPEN_EXPOSURE_USD:
+                b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
+                                                    "why": f"exposure_cap_${open_exposure + size:.0f}"})
+                continue  # keep scanning; cap only blocks THIS call
+        except Exception:
+            pass
         # Resolve real symbol from market data when the call record lacks one
         if sym == "?" or sym == "None":
             sym = ((mkt.get("baseToken") or {}).get("symbol")) or sym
@@ -475,6 +522,14 @@ def auto_buy():
 
 
 def entry_call(d, b=None, aegis_score=None):
+    """Cross-process writer wrapper (Oct 22, ext audit P1#1): same book_lock
+    span guard as auto_buy — entry_call is invoked by the call_notifier and
+    instant_trigger PROCESSES, which must not interleave with paper_tick's main
+    subprocess (both read-modify-write paper_book.json)."""
+    with book_lock():
+        return _entry_call_locked(d, b, aegis_score)
+
+def _entry_call_locked(d, b=None, aegis_score=None):
     """Oct 19: DIRECT single-call paper entry (used by notifier after AEGIS card).
 
     Applies the same guards as auto_buy's loop (liq >= $10K gate, no 5m dump, no
@@ -506,10 +561,15 @@ def entry_call(d, b=None, aegis_score=None):
     # old) were being bought hours after the channel posted — after the pump died,
     # straight into UNSELLABLE full losses. Only calls <5 min old may enter.
     ts = d.get("ts")
-    if isinstance(ts, (int, float)) and ts > 1000000000:
-        age = time.time() - ts
-        if age > 300:
-            return None, f"stale_call_{age/60:.0f}m"
+    if not (isinstance(ts, (int, float)) and ts > 1000000000):
+        # Audit P1#5 (Oct 22): a missing/invalid ts means freshness is UNKNOWN —
+        # the OLD code skipped the age check entirely and bought stale calls
+        # (up to 241m old per the Oct 20 analysis). Reject the call outright;
+        # auto_buy's dt-fallback parser is the only freshness source of truth.
+        return None, "no_valid_ts"
+    age = time.time() - ts
+    if age > 300:
+        return None, f"stale_call_{age/60:.0f}m"
     # dedupe: open positions + consumed ledger — SEPARATE reasons (Oct 21, user:
     # "Separate them") so the card says WHICH guard fired: still holding the coin
     # vs already traded+exited it once. Both are no-rebuy, but they answer
@@ -544,7 +604,7 @@ def entry_call(d, b=None, aegis_score=None):
         pass
     # FIX 3a (Oct 20): same pre-graduation exemption as auto_buy — sub-$69K curve
     # coins legitimately report liq=0; the gate must not kill the best cohort.
-    if liq < 10000 and not _is_curve_pre_grad(mkt):
+    if liq < 10000 and not _is_curve_pre_grad(mkt, liq):
         b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
                                             "why": f"thin_liquidity_${liq:,.0f}"})
         save_book(b)
@@ -647,6 +707,14 @@ def entry_call(d, b=None, aegis_score=None):
 
 
 def main():
+    """Cross-process book serialization (Oct 22, ext audit P1#1): the whole tick
+    holds desk_common.book_lock. entry_call/auto_buy from OTHER processes wait;
+    buys are never lost because THIS process's auto_buy() (called at the top of
+    the tick, same reentrant lock) covers the same fresh calls first."""
+    with book_lock():
+        return _main_locked()
+
+def _main_locked():
     # F4 (Oct 19): global tick budget. Each provider call can burn 20s x 3 retries;
     # under position load the old code blew the supervisor's 120s subprocess timeout
     # and exits never executed. Now: hard deadline for the whole tick — positions past
