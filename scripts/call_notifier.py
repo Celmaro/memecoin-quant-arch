@@ -195,7 +195,14 @@ def main():
         print(blob)
         print(f"\n[delivery: dm_direct={'ok' if sent else 'FAILED — check bot token / DM chat'}]")
     if delivered or not out:
-        st["last_ts"] = max(st.get("last_ts", 0), max_fresh_ts)
+        # P9 + 3rd audit 2.4: when MAX_POST capped the run, do NOT advance the
+        # watermark past the consumed prefix — the skipped same-ts tail would
+        # fail the strict `ts > last` filter next run and be lost forever.
+        # Keeping last_ts unchanged makes the next run re-scan: already-delivered
+        # rows are deduped by handled_keys (capped durability, recent keys
+        # survive), and the unconsumed tail is finally picked up. The watermark
+        # only advances to max_fresh_ts when the cap did NOT bind.
+        st["last_ts"] = max(st.get("last_ts", 0), max_fresh_ts if (not out or len(out) < MAX_POST) else st.get("last_ts", 0))
         st["handled_keys"] = sorted(handled)[-400:]  # capped durability
         save_state(st)
     else:
