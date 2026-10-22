@@ -50,18 +50,25 @@ _watch = set()                # mints to track
 _state = {}                   # mint -> market dict
 _last_block = 0               # last seen Solana slot for sinceSlot resume
 _changed = False
+_PLAN_REQUIRED_LOGGED = False  # Shrine trade-stream paywall (Oct 22): log once
 _cache_lock = threading.Lock()
 
 
 def read_watchlist():
-    """Open paper positions (mint keys) + recent curated calls -> mint set."""
-    out = set()
+    """Open paper positions (mint keys) + recent curated calls -> ORDERED list.
+
+    Positions always come first (they're live money), then calls newest-first.
+    This lets the MAX_MINTS cap keep open positions and the freshest signals
+    instead of trimming by arbitrary set order (3rd audit 8.4).
+    """
+    positions = []
+    calls = []
     try:
         b = json.load(open(BOOK))
         if isinstance(b.get("positions"), dict):
             for mint in b["positions"].keys():
                 if isinstance(mint, str) and len(mint) > 20:
-                    out.add(mint)
+                    positions.append(mint)
     except Exception:
         pass
     try:
@@ -77,10 +84,11 @@ def read_watchlist():
                     continue
                 ts = c.get("ts") or 0
                 if isinstance(ts, (int, float)) and ts > 1000000000 and (t0 - ts) < FRESH_CALL_S:
-                    out.add(m)
+                    calls.append((ts, m))
     except Exception:
         pass
-    return out
+    calls.sort(reverse=True)  # newest first
+    return positions + [m for _, m in calls]
 
 
 def sol_price():
@@ -209,7 +217,22 @@ def run():
             seen["last_evt"] = time.time()
             def ack(resp):
                 if isinstance(resp, dict) and resp.get("error"):
-                    _log(f"sub ack err: {str(resp)[:120]}")
+                    err = str(resp.get("error"))
+                    if err == "plan_required":
+                        # Shrine paywalled the trade stream (Oct 22, AM): "Advanced
+                        # Data Stream" needs Lite/Developer. REPORT ONCE + keep the
+                        # free SOL-price channel; paper_tick falls back to the free
+                        # DexScreener/Gecko polling path (desk_common.dex_pair).
+                        global _PLAN_REQUIRED_LOGGED
+                        if not _PLAN_REQUIRED_LOGGED:
+                            _PLAN_REQUIRED_LOGGED = True
+                            _log("TRADE STREAM PAYWALLED (plan_required — Shrine needs "
+                                 "Lite/Developer for subscribe_stream). Watching free "
+                                 "SOL-price channel only; paper_tick uses free "
+                                 "DexScreener/Gecko polling for mint prices. "
+                                 f"upgrade: {resp.get('upgrade')}")
+                    else:
+                        _log(f"sub ack err: {str(resp)[:120]}")
             sio.emit("subscribe_stream",
                      {"protocols": ["PUMPFUN", "PUMPSWAP"],
                       "sinceSlot": _last_block or None}, callback=ack)
@@ -254,10 +277,9 @@ def run():
     while True:
         _watch = read_watchlist() or _watch
         if len(_watch) > MAX_MINTS:
-            # 3rd audit 8.4: arbitrary set order could evict an OPEN POSITION or
-            # the freshest signal under cap pressure. Keep open positions first,
-            # then recent calls (read_watchlist order is positions-then-calls,
-            # but the set loses it) — sort by age so the newest survive.
+            # 3rd audit 8.4: read_watchlist now returns ordered (positions-first,
+            # then newest calls); the cap keeps the first MAX_MINTS — open
+            # positions can never be evicted by arbitrary set order.
             _watch = set(list(_watch)[:MAX_MINTS])
         sio = None
         try:
