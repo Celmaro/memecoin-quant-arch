@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """pumpdata_feed.py — live market cache daemon for the paper desk.
 
-Consumes the free keyless PumpData websocket (sol.shrine.trade, see ToolStacks.md
-PumpData entry) and maintains a small atomic JSON cache of the desk's WATCHLIST
-mints (open paper positions + recent curated calls). paper_tick reads this cache
-as its PRIMARY market source and falls back to DexScreener/Gecko when absent or
-stale — killing the 429s / wrong-pool / dead-DNS fragility of polling.
+Consumes the PumpData socket (sol.shrine.trade, see ToolStacks.md PumpData
+entry) and maintains a small atomic JSON cache of the desk's WATCHLIST mints
+(open paper positions + recent curated calls). paper_tick reads this cache
+when fresh and falls back to DexScreener/Gecko polling otherwise.
 
-Feed: socket.io subscribe_stream (protocols PUMPFUN+PUMPSWAP). We receive every
-trade on the network and keep only mints in the watchlist (typically < 30).
-Each watched mint's row carries the SAME fields paper_tick's dex_pair dict uses:
-  priceUsd, marketCap, liquidity.usd, priceChange.m5, txns.m5.{buys,sells},
-  volume.m5, plus px_sol/reserves for future constant-product fills.
+STATUS (Oct 22-23): Shrine PAYWALLED the trade stream (subscribe_stream answers
+plan_required — Lite/Developer required). paper_tick's market_for() therefore
+runs in FALLBACK mode in practice: DexScreener/Gecko polling is the live price
+path, and this daemon holds the socket for the free SOL-price channel (kept
+alive via periodic subscribe_sol_price; no stall-reconnect churn — see 4th
+audit 3.4) + keeps the cache warm for the day the stream comes back or a
+cheaper provider replaces it. No reconnect loop against the paywall.
 
-Write cadence: every 5s (or on any watched-mint change), atomic rename.
+Feed: socket.io subscribe_stream (protocols PUMPFUN+PUMPSWAP), trade rows as
+documented below. Each watched mint's row carries the SAME fields paper_tick's
+dex_pair dict uses: priceUsd, marketCap, liquidity.usd, priceChange.m5,
+txns.m5.{buys,sells}, volume.m5, plus px_sol/reserves for future fills.
+
+Write cadence: every 5s (or on any watched-mint change), atomic rename;
+unwatched/unheld rows pruned after a 10-min TTL (4th audit 3.4).
 Reconnect: socket.io auto-reconnect; sinceSlot = last seen block so nothing is
 lost across a drop (24h replay per docs).
 
@@ -183,6 +190,18 @@ def write_cache():
     """Atomic JSON cache: {updated, sol_usd, mints:{mint: market}}."""
     global _changed
     with _cache_lock:
+        if not _state:
+            return
+        # 4th audit 3.4 (Oct 23): prune rows for mints no longer watched or
+        # held. The trade stream is paywalled so _state only fills from
+        # whatever events remain; without pruning a long-running daemon
+        # accumulates one row per mint ever touched. Keep a 10-min TTL grace
+        # so a quiet coin still watched (feed silent) is not dropped mid-watch.
+        now = time.time()
+        stale = [m for m in _state if m not in _watch
+                 and now - float(_state[m].get("_t") or 0) / 1000.0 > 600]
+        for m in stale:
+            _state.pop(m, None)
         if not _state:
             return
         body = {"updated": time.time(), "sol_usd": _SOL_USD,

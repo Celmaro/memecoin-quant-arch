@@ -16,6 +16,12 @@ CREATE TABLE IF NOT EXISTS wallet_history(
     event TEXT, PRIMARY KEY(wallet, mint, ts));
 CREATE INDEX IF NOT EXISTS idx_decisions_mint ON decision_audit(mint);
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decision_audit(ts);
+-- 4th audit 9.2/9.4 (Oct 23): cohort_signal_for filters wallet_history by
+-- (mint, ts >= ?) — the PK (wallet,mint,ts) does NOT serve a mint-first hot
+-- query and the table grows unbounded. This index belongs HERE next to its
+-- table's owner (desk_common.init_schema() also adds it IF the table exists,
+-- but wallet_history's schema owner is this module — single-owner principle).
+CREATE INDEX IF NOT EXISTS idx_wh_mint_ts ON wallet_history(mint, ts DESC);
 CREATE TABLE IF NOT EXISTS evidence_events(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mint TEXT NOT NULL, ts REAL NOT NULL, observed_at REAL NOT NULL,

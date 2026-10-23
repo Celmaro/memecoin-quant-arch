@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Memecoin Quant Desk — shared utilities & config (stdlib only)."""
 import json, os, re, time, sqlite3, socket, urllib.request, urllib.error
-import fcntl, contextlib
+import fcntl, contextlib, threading
 
 DESK = os.path.expanduser("~/memecoin-quant")
 AEGIS_DB = os.path.join(DESK, "aegis.db")
@@ -18,26 +18,40 @@ CONFIG = os.path.join(DESK, "CONFIG.md")
 # entry_call called from inside a locked helper) skip re-acquisition — flock on
 # a second fd in the SAME process would block.
 _BOOK_LOCK_FILE = os.path.join(DESK, ".paper_book.lock")
-_BOOK_LOCK_HELD = False
+# 4th audit 2.3 (Oct 23): _BOOK_LOCK_HELD was a PROCESS-global boolean — if
+# thread A held the flock, thread B in the SAME process saw True and skipped
+# the file lock entirely, racing thread A on the book. Ownership must be
+# per-THREAD (nested same-thread writers skip; any other thread takes the flock).
+_BOOK_LOCK_OWNER = {}  # thread ident -> depth
 
 @contextlib.contextmanager
 def book_lock():
-    """Serialize all paper_book.json writers across processes (fcntl flock)."""
-    global _BOOK_LOCK_HELD
-    if _BOOK_LOCK_HELD:  # already held by THIS process — reentrant skip
-        yield
+    """Serialize all paper_book.json writers across processes (fcntl flock).
+
+    Reentrant per thread: a nested writer on the SAME thread skips the flock;
+    a DIFFERENT thread takes the flock (and thus blocks until the owner is done).
+    """
+    tid = threading.get_ident()
+    depth = _BOOK_LOCK_OWNER.get(tid, 0)
+    if depth > 0:
+        # same thread already holds — reentrant skip (nested helper)
+        _BOOK_LOCK_OWNER[tid] = depth + 1
+        try:
+            yield
+        finally:
+            _BOOK_LOCK_OWNER[tid] = depth
         return
     fd = open(_BOOK_LOCK_FILE, "a+")
     try:
         fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
-        _BOOK_LOCK_HELD = True
+        _BOOK_LOCK_OWNER[tid] = 1
         yield
     finally:
         try:
             fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
         finally:
             fd.close()
-            _BOOK_LOCK_HELD = False
+            _BOOK_LOCK_OWNER.pop(tid, None)
 
 CHANNELS = [
     "sol_trend", "solwhaletrending", "solearlytrending",
@@ -124,10 +138,12 @@ def http_json(url, timeout=20, retries=3, backoff=2.0, headers=None, method=None
     if data is not None:
         h.setdefault("Content-Type", "application/json")
     last = None
-    # Oct 21 audit: range(retries) never executed ANY attempt when retries=0
-    # (loop body skipped -> `raise last` of None -> TypeError on every retries=0
-    # call, masking real provider status). `retries` = ADDITIONAL attempts past
-    # the first, so retries=0 must still make ONE request.
+    # retries = TOTAL attempts, minimum 1 (4th audit 3.5 normalization — the old
+    # comment called it "additional attempts" but the loop always ran `retries`
+    # TOTAL times; callers budget on that (paper_tick passes (10, 1) as a tight
+    # one-shot cap). retries=0 must still make ONE request (Oct 21 fix: the old
+    # range(retries) loop body was skipped -> `raise last` of None -> TypeError
+    # on every retries=0 call, masking real provider status).
     for attempt in range(max(retries, 1)):
         try:
             req = urllib.request.Request(url, headers=h, data=data, method=method)
@@ -156,27 +172,34 @@ class _RateLimiter:
         self._tokens = {}
         self._rates = {}
         self._last = {}
+        # 4th audit 3.5 (Oct 23): concurrent callers (threaded quote_fill,
+        # followups, paper_tick subprocess vs notifier process) shared the
+        # token/rate/last dicts with no mutex — two threads could both pass
+        # the cap and race the refill. One lock serializes acquire().
+        self._lock = threading.Lock()
     def set_limit(self, host, per_min):
-        self._rates[host] = max(per_min, 1) / 60.0  # tokens/sec
-        self._tokens[host] = self._rates[host] * 10  # start with a FULL bucket (10s worth)
-        self._last[host] = time.time()
+        with self._lock:
+            self._rates[host] = max(per_min, 1) / 60.0  # tokens/sec
+            self._tokens[host] = self._rates[host] * 10  # start with a FULL bucket (10s worth)
+            self._last[host] = time.time()
     def acquire(self, host, burst=1):
         key = host
-        if key not in self._tokens:
-            return  # unknown host: no throttle (don't break new callers)
-        rate = self._rates[key]
-        cap = rate * 10  # burst capacity = 10s worth of tokens
-        now = time.time()
-        # refill
-        if self._last.get(key, 0) > 0:
-            self._tokens[key] = min(self._tokens[key] + (now - self._last[key]) * rate, cap)
-        self._last[key] = now
-        if self._tokens[key] >= burst:
-            self._tokens[key] -= burst
-        else:
-            wait = (burst - self._tokens[key]) / rate if rate else 1.0
-            time.sleep(wait)
-            self._tokens[key] = max(self._tokens[key] - burst, 0)
+        with self._lock:
+            if key not in self._tokens:
+                return  # unknown host: no throttle (don't break new callers)
+            rate = self._rates[key]
+            cap = rate * 10  # burst capacity = 10s worth of tokens
+            now = time.time()
+            # refill
+            if self._last.get(key, 0) > 0:
+                self._tokens[key] = min(self._tokens[key] + (now - self._last[key]) * rate, cap)
+            self._last[key] = now
+            if self._tokens[key] >= burst:
+                self._tokens[key] -= burst
+            else:
+                wait = (burst - self._tokens[key]) / rate if rate else 1.0
+                time.sleep(wait)
+                self._tokens[key] = max(self._tokens[key] - burst, 0)
 
 _limiter = _RateLimiter()
 
@@ -1536,10 +1559,15 @@ def init_schema():
         pass
     # 4th audit 9.2 (Oct 23): cohort_signal_for filters wallet_history by
     # (mint, ts >= ?) — the PK (wallet, mint, ts) does NOT support a mint-first
-    # hot query and the table grows unbounded. Without this index the cohort
-    # signal was a full table scan.
+    # hot query and the table grows unbounded. The index's TRUE owner is
+    # bot/persistence (it creates wallet_history); this copy is for the case
+    # where init_schema() runs FIRST — guard on table existence so a fresh DB
+    # never swallows an OperationalError into `except Exception: pass` (9.4).
     try:
-        con.execute("CREATE INDEX IF NOT EXISTS idx_wh_mint_ts ON wallet_history(mint, ts DESC)")
+        _has_wh = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wallet_history'").fetchone()
+        if _has_wh:
+            con.execute("CREATE INDEX IF NOT EXISTS idx_wh_mint_ts ON wallet_history(mint, ts DESC)")
     except Exception:
         pass
     con.commit(); con.close()

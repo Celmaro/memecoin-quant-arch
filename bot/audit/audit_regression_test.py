@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Regression tests for decision-engine fixes from the Oct-17 audits (findings F1/F3-F5)."""
 import sys, os
-sys.path.insert(0, "/home/agentuser/memecoin-quant")
+# 4th audit §13 gate 23 (Oct 23): the desk root was hardcoded to the live path,
+# so the suite could not run from a clean checkout / CI. MQE_DESK_ROOT env
+# overrides; defaults to the live tree so existing callers keep working.
+DESK_ROOT = os.environ.get("MQE_DESK_ROOT", "/home/agentuser/memecoin-quant")
+sys.path.insert(0, DESK_ROOT)
 from bot.decision_engine import decide
 
 pos = {"entry_px": 1e-6, "size": 20, "entry_usd": 20}
@@ -109,7 +113,7 @@ except Exception as e:
 try:
     import os
     # paper_tick's auto_buy writes consumed_calls.jsonl — verify the ledger logic exists
-    pt_src = open("/home/agentuser/memecoin-quant/paper_tick.py").read()
+    pt_src = open(os.path.join(DESK_ROOT, "paper_tick.py")).read()
     check("P0.2 consumed-call ledger present", "CONSUMED_FILE" in pt_src and "_consumed_mints" in pt_src, True)
     # book keyed by mint: auto_buy writes b["positions"][mint]
     check("P0.1 book keyed by mint", 'b["positions"][mint] = {' in pt_src or "b[\"positions\"][mint] = {" in pt_src, True)
@@ -120,7 +124,7 @@ except Exception as e:
 # Oct 22 ext-audit P2 fix: quote_sell now receives the ACTUAL raw token qty
 # (qty_raw), not usd/decimals nonsense. Assert the corrected signature.
 try:
-    ei_src = open("/home/agentuser/memecoin-quant/bot/intelligence/exit_intel.py").read()
+    ei_src = open(os.path.join(DESK_ROOT, "bot/intelligence/exit_intel.py")).read()
     check("P1.6 sell-route quote wired",
           "def _jupiter_impact(mint, qty_raw)" in ei_src and "quote_sell(mint, int(round(qty_raw))" in ei_src, True)
 except Exception as e:
@@ -128,7 +132,7 @@ except Exception as e:
 
 # --- audit P1.3 (Oct 18): allowlist parser tolerates trailing (private) annotation ---
 try:
-    sys.path.insert(0, "/home/agentuser/memecoin-quant")
+    sys.path.insert(0, " + DESK_ROOT + ")
     import telethon_listener as tl
     # feed a fake CONFIG section with the OLD (broken) example format; the parser
     # reads os.path.join(DESK, "CONFIG.md"), so write there and patch DESK.
@@ -486,9 +490,9 @@ except Exception as e:
 try:
     import re as _re22
     # P1#1: book_lock must exist in desk_common AND be used by both save_book impls
-    _dc22 = open("/home/agentuser/memecoin-quant/desk_common.py").read()
-    _pt22 = open("/home/agentuser/memecoin-quant/paper_tick.py").read()
-    _so22 = open("/home/agentuser/memecoin-quant/bot/position_manager/scaleout.py").read()
+    _dc22 = open(os.path.join(DESK_ROOT, "desk_common.py")).read()
+    _pt22 = open(os.path.join(DESK_ROOT, "paper_tick.py")).read()
+    _so22 = open(os.path.join(DESK_ROOT, "bot/position_manager/scaleout.py")).read()
     check("R22 book_lock in desk_common", "def book_lock" in _dc22, True)
     check("R22 paper_tick uses book_lock", "from desk_common import book_lock" in _pt22, True)
     check("R22 scaleout uses book_lock", "from desk_common import book_lock" in _so22, True)
@@ -499,7 +503,7 @@ try:
     # P1#5: entry_call must reject missing ts outright
     check("R22 missing-ts rejected", "no_valid_ts" in _pt22, True)
     # P2: exit_intel impact uses raw qty signature
-    _ei22 = open("/home/agentuser/memecoin-quant/bot/intelligence/exit_intel.py").read()
+    _ei22 = open(os.path.join(DESK_ROOT, "bot/intelligence/exit_intel.py")).read()
     check("R22 Jupiter impact raw-qty signature", "def _jupiter_impact(mint, qty_raw)" in _ei22, True)
 except Exception as e:
     check("R22 ext-audit lock", "ERR " + str(e)[:80], "no-exception")
@@ -511,7 +515,7 @@ except Exception as e:
 # Also: fail-closed exposure cap wired in BOTH entry paths.
 try:
     import inspect as _in22
-    sys.path.insert(0, "/home/agentuser/memecoin-quant")
+    sys.path.insert(0, " + DESK_ROOT + ")
     from bot.position_manager.scaleout import release, save_book as _so_save, load_book as _so_load
     _sig22 = _in22.signature(release)
     check("R23 release() accepts intent_key", "intent_key" in _sig22.parameters, True)
@@ -539,7 +543,7 @@ try:
           float(_b22["positions"]["T22"].get("reserved_exit_usd") or 0), 0.0)
 
     # fail-closed exposure cap in BOTH entry paths (auto_buy + entry_call)
-    _pt23 = open("/home/agentuser/memecoin-quant/paper_tick.py").read()
+    _pt23 = open(os.path.join(DESK_ROOT, "paper_tick.py")).read()
     check("R23 auto_buy cap FAIL-CLOSED", "exposure_cap_uncomputable" in _pt23, True)
     check("R23 entry_call cap FAIL-CLOSED", (_pt23.count("exposure_cap_uncomputable") >= 2), True)
 except Exception as e:
@@ -549,30 +553,30 @@ except Exception as e:
 #     cohort vocab, notifier burst cursor, GoPlus parser, clean-snapshot list ---
 try:
     # 2.1: daily stop is a PERSISTED kill-switch checked in every entry path
-    _pt24 = open("/home/agentuser/memecoin-quant/paper_tick.py").read()
+    _pt24 = open(os.path.join(DESK_ROOT, "paper_tick.py")).read()
     check("R24 daily-stop helper persists stop_until", "stop_until" in _pt24, True)
     check("R24 auto_buy checks daily stop", _pt24.count("daily_stop_active(") >= 2, True)
     check("R24 entry_call checks daily stop", "daily_stop_active(b)" in _pt24, True)
 
     # 5.6: micro buy concentration = top-5 wallets' share of buy USD (>=0.6 reachable)
-    _mic24 = open("/home/agentuser/memecoin-quant/bot/intelligence/microstructure.py").read()
+    _mic24 = open(os.path.join(DESK_ROOT, "bot/intelligence/microstructure.py")).read()
     check("R24 micro concentration = top-5 USD share", "top5_share" in _mic24, True)
 
     # 5.7: cohort consumer accepts producer vocabulary (buy_usd_notional)
-    _coh24 = open("/home/agentuser/memecoin-quant/bot/intelligence/cohort.py").read()
+    _coh24 = open(os.path.join(DESK_ROOT, "bot/intelligence/cohort.py")).read()
     check("R24 cohort buys buy_usd_notional", "buy_usd_notional" in _coh24, True)
 
     # 2.4: notifier must NOT advance watermark when MAX_POST capped the run
-    _nt24 = open("/home/agentuser/.hermes/profiles/profile-b4632e6cdb854166b696555ae7ff4239/scripts/call_notifier.py").read()
+    _nt24 = open(os.path.join(os.environ.get("MQE_NOTIFIER_DIR", "/home/agentuser/.hermes/profiles/profile-b4632e6cdb854166b696555ae7ff4239/scripts"), "call_notifier.py")).read()
     check("R24 notifier capped-run watermark guard", "calls_delivered < MAX_POST" in _nt24, True)
 
     # 5.1: GoPlus transfer_hook routed through _gp_flag (no '0'-string truthiness)
-    _dc24 = open("/home/agentuser/memecoin-quant/desk_common.py").read()
+    _dc24 = open(os.path.join(DESK_ROOT, "desk_common.py")).read()
     check("R24 transfer_hook uses _gp_flag",
           "transfer_hook\": _gp_flag" in _dc24, True)
 
     # 3.1: clean-snapshot negative list is case-insensitive + covers ws_dumping
-    _ae24 = open("/home/agentuser/memecoin-quant/aegis.py").read()
+    _ae24 = open(os.path.join(DESK_ROOT, "aegis.py")).read()
     check("R24 clean-snapshot case-insensitive", "_fl[i].startswith" in _ae24, True)
     check("R24 clean-snapshot covers ws_dumping/transfer_hook",
           ("ws_dumping" in _ae24 and "transfer_hook" in _ae24), True)
@@ -586,11 +590,11 @@ try:
     check("R24 deployer unique-mint ledger", "deployer_mints" in _ae24, True)
 
     # 5.2: fragility derives top10 from topHolders (not a non-existent raw key)
-    _sig24 = open("/home/agentuser/memecoin-quant/signals.py").read()
+    _sig24 = open(os.path.join(DESK_ROOT, "signals.py")).read()
     check("R24 fragility top10 from topHolders", "_rc_top10_pct" in _sig24, True)
 
     # 6.7: zero-decimal mints keep dec=0 (is not None, not truthiness)
-    _ju24 = open("/home/agentuser/memecoin-quant/jupiter_estimator.py").read()
+    _ju24 = open(os.path.join(DESK_ROOT, "jupiter_estimator.py")).read()
     check("R24 token_decimals None-check", "dec is not None" in _ju24, True)
 
     # 6.3: dead /swap/v2/quote PROBE removed (comment text may mention the route)
@@ -601,21 +605,21 @@ try:
     check("R24 quote pool slot released by worker", "_Q.release()" in _ju24, True)
 
     # 6.8: research ladders derive from live EXIT_TIERS (no 1.10/1.30/0.15 literals)
-    _da24 = open("/home/agentuser/memecoin-quant/bot/audit/deep_audit.py").read()
+    _da24 = open(os.path.join(DESK_ROOT, "bot/audit/deep_audit.py")).read()
     check("R24 deep_audit live ladder", ("EXIT_TIERS[0]" in _da24 and "1.10, 1.30" not in _da24), True)
-    _ff24 = open("/home/agentuser/memecoin-quant/bot/audit/flow_filter_audit.py").read()
+    _ff24 = open(os.path.join(DESK_ROOT, "bot/audit/flow_filter_audit.py")).read()
     check("R24 flow_filter live proxies", ("EXIT_TIERS" in _ff24 and "return 19.4" not in _ff24 and "return -14.55" not in _ff24), True)
-    _tc24 = open("/home/agentuser/memecoin-quant/bot/audit/tape_coins_audit.py").read()
+    _tc24 = open(os.path.join(DESK_ROOT, "bot/audit/tape_coins_audit.py")).read()
     check("R24 tape_coins tier-at-fill", "tier_for(" in _tc24, True)
-    _rp24 = open("/home/agentuser/memecoin-quant/bot/audit/replay_backtest.py").read()
+    _rp24 = open(os.path.join(DESK_ROOT, "bot/audit/replay_backtest.py")).read()
     check("R24 replay imports live EXIT_TIERS", "from position_monitor import EXIT_TIERS" in _rp24, True)
 
     # 7.6: entity-label CLI queries real columns
-    _el24 = open("/home/agentuser/memecoin-quant/aegis_entity_labels.py").read()
+    _el24 = open(os.path.join(DESK_ROOT, "aegis_entity_labels.py")).read()
     check("R24 entity CLI real columns", "fb.coin_mint" in _el24 and "c.call_ts" in _el24, True)
 
     # 7.2: maintenance initializes schema + checks learner returncode
-    _am24 = open("/home/agentuser/memecoin-quant/aegis_maintenance.py").read()
+    _am24 = open(os.path.join(DESK_ROOT, "aegis_maintenance.py")).read()
     check("R24 maintenance ensure_schema", "ensure_schema" in _am24, True)
     check("R24 maintenance learner returncode", "p.returncode != 0" in _am24, True)
 
@@ -630,7 +634,7 @@ except Exception as e:
 #     lease, learner point-in-time/shadow, fee-on-proceeds research math,
 #     wallet_history index, cohort AND-eligibility, exit fee single source. ---
 try:
-    _dc25 = open("/home/agentuser/memecoin-quant/desk_common.py").read()
+    _dc25 = open(os.path.join(DESK_ROOT, "desk_common.py")).read()
     # 3.1: no substring mint heuristic — discriminator-only (assert on code
     # fragments; the comment documenting the old bug legitimately quotes it)
     check("R25 mint discriminator-only",
@@ -645,7 +649,7 @@ try:
     # 9.2: wallet_history (mint, ts DESC) hot index
     check("R25 wallet_history mint_ts index", "idx_wh_mint_ts" in _dc25, True)
 
-    _pt25 = open("/home/agentuser/memecoin-quant/paper_tick.py").read()
+    _pt25 = open(os.path.join(DESK_ROOT, "paper_tick.py")).read()
     # 4.1: unified buy-all policy — no AEGIS veto/boost in CODE (comments may
     # document the history; assert on the executable statements only)
     check("R25 no aegis veto", 'return None, f"aegis_veto_score' not in _pt25
@@ -656,18 +660,18 @@ try:
     check("R25 equity last-mark", "last_mark_px" in _pt25 and "equity_quality" in _pt25
           and "unmarked" in _pt25, True)
 
-    _nt25 = open("/home/agentuser/.hermes/profiles/profile-b4632e6cdb854166b696555ae7ff4239/scripts/call_notifier.py").read()
+    _nt25 = open(os.path.join(os.environ.get("MQE_NOTIFIER_DIR", "/home/agentuser/.hermes/profiles/profile-b4632e6cdb854166b696555ae7ff4239/scripts"), "call_notifier.py")).read()
     # 4.2: cap counts CALLS not lines; keys retained in add order
     check("R25 notifier calls-cap", "calls_delivered >= MAX_POST" in _nt25
           and "len(out) >= MAX_POST" not in _nt25, True)
     check("R25 notifier recency keys", "st[\"handled_keys\"] = ordered[-400:]" in _nt25
           and "st[\"handled_keys\"] = sorted(handled)[-400:]" not in _nt25, True)
 
-    _it25 = open("/home/agentuser/memecoin-quant/instant_trigger.py").read()
+    _it25 = open(os.path.join(DESK_ROOT, "instant_trigger.py")).read()
     # 4.3: IN_PROGRESS lease, CARD_SENT commit only after DM confirms
     check("R25 instant lease", "instant_in_progress" in _it25 and "ok = send_dm" in _it25, True)
 
-    _al25 = open("/home/agentuser/memecoin-quant/aegis_learn.py").read()
+    _al25 = open(os.path.join(DESK_ROOT, "aegis_learn.py")).read()
     # 7.1: point-in-time EARLIEST scan; labels separated; shadow mode default
     check("R25 learner point-in-time", "v_sorted[0]  # earliest" in _al25, True)
     check("R25 learner separated labels", "paper, shadow = {}, {}" in _al25
@@ -675,39 +679,39 @@ try:
     check("R25 learner shadow-mode", "SHADOW MODE" in _al25 and "shadow_path" in _al25, True)
     check("R25 learner holdout", "cut = max(1, int(len(joined) * 0.7))" in _al25, True)
 
-    _am25 = open("/home/agentuser/memecoin-quant/aegis_maintenance.py").read()
+    _am25 = open(os.path.join(DESK_ROOT, "aegis_maintenance.py")).read()
     check("R25 maintenance shadow-only", '"aegis_learn.py"), "--apply"' not in _am25
           and "SHADOW MODE" in _am25, True)
 
     # 8.1/8.2: research scripts consume live tiers + fee-on-PROCEEDS math
-    _da25 = open("/home/agentuser/memecoin-quant/bot/audit/deep_audit.py").read()
+    _da25 = open(os.path.join(DESK_ROOT, "bot/audit/deep_audit.py")).read()
     check("R25 deep_audit tier_at_fill", "tier_for(float(row.get(\"call_mc\") or 0))" in _da25, True)
     check("R25 deep_audit proceeds fee", "tp1 * (1 - FEE) - 1.0" in _da25, True)
-    _ff25 = open("/home/agentuser/memecoin-quant/bot/audit/flow_filter_audit.py").read()
+    _ff25 = open(os.path.join(DESK_ROOT, "bot/audit/flow_filter_audit.py")).read()
     check("R25 flow_filter proceeds fee", "stop_mult * (1 - FEE) - 1.0" in _ff25
           and "tier_for(float(call_mc)" in _ff25, True)
-    _tc25 = open("/home/agentuser/memecoin-quant/bot/audit/tape_coins_audit.py").read()
+    _tc25 = open(os.path.join(DESK_ROOT, "bot/audit/tape_coins_audit.py")).read()
     check("R25 tape_coins explicit USD", "fill_mc_usd" in _tc25 and "fill_mc_unit" in _tc25, True)
 
     # 5.2: exit-intel consumes the executor fee (single source)
-    _ei25 = open("/home/agentuser/memecoin-quant/bot/intelligence/exit_intel.py").read()
+    _ei25 = open(os.path.join(DESK_ROOT, "bot/intelligence/exit_intel.py")).read()
     check("R25 exit fee single source", "from bot.position_manager.scaleout import PAPER_FEE_PCT" in _ei25
           and "FEE_BPS = 1.7" not in _ei25, True)
 
     # 5.3: max-hold honest naming; 5.8: cohort AND-eligibility
-    _pm25 = open("/home/agentuser/memecoin-quant/position_monitor.py").read()
+    _pm25 = open(os.path.join(DESK_ROOT, "position_monitor.py")).read()
     check("R25 MAX_LOSER_HOLD alias", "MAX_LOSER_HOLD_S = MAX_HOLD_S" in _pm25, True)
-    _coh25 = open("/home/agentuser/memecoin-quant/bot/intelligence/cohort.py").read()
+    _coh25 = open(os.path.join(DESK_ROOT, "bot/intelligence/cohort.py")).read()
     check("R25 cohort AND-eligibility",
           ">= FILTERS[\"min_win_rate\"] and (w[\"realized_pnl_usd\"] or 0) > 0" in _coh25, True)
 
     # 3.4: pumpdata paywall skips stall circuit
-    _pf25 = open("/home/agentuser/memecoin-quant/pumpdata_feed.py").read()
+    _pf25 = open(os.path.join(DESK_ROOT, "pumpdata_feed.py")).read()
     check("R25 pumpdata paywall stall skip", "_STREAM_PAYWALLED" in _pf25
           and "if not _STREAM_PAYWALLED and time.time() - seen" in _pf25, True)
 
     # 6.2: good-prefix registry covers real positive emitters
-    _ag25 = open("/home/agentuser/memecoin-quant/aegis.py").read()
+    _ag25 = open(os.path.join(DESK_ROOT, "aegis.py")).read()
     check("R25 good-prefix positives", "holder_growth_" in _ag25 and "trusted_token" in _ag25
           and "micro_cvd_pos_" in _ag25, True)
 except Exception as e:
