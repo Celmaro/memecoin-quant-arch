@@ -49,13 +49,13 @@ CONVICTION_MULT = 1.45
 CONVICTION_STOP_WIDEN = 1.15
 
 # TIME EXITS (Oct 21, CHARON A4/4.1 — validated externally and on our own tape):
-# MAX_HOLD_S: hard time exit — sell at market once a position is this old.
-# FIX 2 (Oct 21): winners are NEVER time-exited early (the 5-min MAX_HOLD
-# strangled 11 winners at 1.04-1.73x, leaving +$157 on the table — vi2zUPH
-# +2.50 cut at 1.16x after 6min, BAkdiNu +0.09 at 1.04x after 8min). MAX_HOLD
-# now defaults to 30 min (quick-flip horizon) and only fires when NOT in profit
-# (mult <= 1.0); green positions ride to TP2/clips instead.
+# 4th audit 5.3 (Oct 23): the old comment called MAX_HOLD a "hard time exit" but
+# the code fires it ONLY when mult <= 1.0 — winners ride to TP2/clips by design
+# (the Oct 21 tape showed early time-exits strangling winners: vi2zUPH +2.50 cut
+# at 1.16x after 6min, BAkdiNu +0.09 at 1.04x after 8min). Renamed alias
+# MAX_LOSER_HOLD_S documents the actual contract so research/replay match code.
 MAX_HOLD_S = 1800   # 30 min — quick flip; RULE: only fires when mult <= 1.0
+MAX_LOSER_HOLD_S = MAX_HOLD_S  # explicit honest name (4th audit 5.3)
 MAX_HOLD_CONVICTION_S = 7200   # 2h = user's max horizon for conviction holds
 MAX_HOLD_TIER_S = {150_000: 3600, 1_500_000: 5400}  # higher MC = slower flips
 SIDEWAYS_S = 600
@@ -275,11 +275,12 @@ def analyze(mint, pos):
         if action == "HOLD": action = "CLIP_50"
 
     # --- TIME EXITS (Oct 21, Charon A4/4.1) ---
-    # MAX_HOLD: hard time exit for the quick-flip horizon; conviction holds get
-    # the 2h user horizon. SIDEWAYS is the smarter EARLY exit (flat + old enough
-    # frees capital) so it is checked FIRST; MAX_HOLD is the hard cap for
-    # positions that are still moving. Sticky floors (hard stop / emergency)
-    # already fired above and must NOT be downgraded.
+    # MAX_LOSER_HOLD_S (was MAX_HOLD): the loser quick-flip horizon; conviction
+    # holds get the 2h user horizon. SIDEWAYS is the smarter EARLY exit (flat +
+    # old enough frees capital) so it is checked FIRST; MAX_LOSER_HOLD_S is the
+    # cap for losers still moving. Winners are never time-exited (4th audit 5.3).
+    # Sticky floors (hard stop / emergency) already fired above and must NOT be
+    # downgraded.
     hold_s = MAX_HOLD_CONVICTION_S if conviction else max_hold_for(mc)
     age_s = age_min * 60
     if action in ("HOLD", "CLIP_50"):

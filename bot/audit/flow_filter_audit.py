@@ -24,19 +24,28 @@ ROWS = json.load(open(os.path.join(DESK, "tape_coins_rows.json")))
 
 # outcome pnl proxy — 3rd audit 6.8: derive from the LIVE base tier (EXIT_TIERS),
 # not the dead 1.10/1.30/0.85 ladder (+19.4%/−14.55% belonged to the old policy).
-# Same math as deep_audit: 50% clip at tp1, rest at tp2 or stop, 3% fee.
-def outcome_pnl(outcome):
+# 4th audit 8.2 (Oct 23): fee applies to PROCEEDS, not profits. For a sold unit
+# of basis: net = mult*(1-fee) - 1. With a 0.75x stop and 3% fee the true loss is
+# 0.75*0.97-1 = -27.25%, NOT (0.75-1)*0.97 = -24.25%. Staged TP uses each basis
+# fraction: basis_fraction * (mult*(1-fee)-1). Tier is selected at the call's
+# USD market cap (row["call_mc"]) so research matches the live MC-adaptive policy.
+FEE = 0.03
+def outcome_pnl(outcome, call_mc=0):
     try:
         sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
-        from position_monitor import EXIT_TIERS
-        _t0 = EXIT_TIERS[0]
-        tp1, tp2, stop_frac = float(_t0[1]), float(_t0[2]), float(_t0[3])
+        from position_monitor import EXIT_TIERS, tier_for
+        _t = tier_for(float(call_mc) or 0)
+        tp1, tp2, stop_frac = float(_t[1]), float(_t[2]), float(_t[3])
     except Exception:
         tp1, tp2, stop_frac = 2.00, 2.50, 0.25
     if outcome == "TP2":
-        return round((0.5 * (tp1 - 1.0) + 0.5 * (tp2 - 1.0)) * (1 - 0.03) * 100, 2)
+        # 50% clips at tp1, rest exits at tp2 — fee on PROCEEDS of each clip
+        clip = 0.5 * (tp1 * (1 - FEE) - 1.0)
+        rest = 0.5 * (tp2 * (1 - FEE) - 1.0)
+        return round((clip + rest) * 100, 2)
     if outcome == "STOP":
-        return round(((1 - stop_frac) - 1.0) * (1 - 0.03) * 100, 2)
+        stop_mult = 1 - stop_frac
+        return round((stop_mult * (1 - FEE) - 1.0) * 100, 2)
     return 0.0
 
 def load_tape():
@@ -96,7 +105,7 @@ def main():
         rows.append({**r, **f})
     print(f"audited calls with pre-call tape: {len(rows)} / {len(ROWS)}")
 
-    base_pnl = sum(outcome_pnl(r["outcome"]) for r in rows) / len(rows)
+    base_pnl = sum(outcome_pnl(r["outcome"], r.get("call_mc") or 0) for r in rows) / len(rows)
     base_wr = sum(1 for r in rows if r["outcome"] == "TP2") / len(rows)
     print(f"BASELINE: n={len(rows)}  win%={base_wr:.1%}  mean pnl={base_pnl:+.2f}%")
 
@@ -107,7 +116,7 @@ def main():
 
     def stats(rows):
         if not rows: return (None, None, 0)
-        pnl = sum(outcome_pnl(r["outcome"]) for r in rows) / len(rows)
+        pnl = sum(outcome_pnl(r["outcome"], r.get("call_mc") or 0) for r in rows) / len(rows)
         wr = sum(1 for r in rows if r["outcome"] == "TP2") / len(rows)
         return (pnl, wr, len(rows))
 

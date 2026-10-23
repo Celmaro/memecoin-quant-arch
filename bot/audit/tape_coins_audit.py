@@ -89,19 +89,20 @@ def audit(mint, call_ts, call_mc, sym, chan):
         row["outcome"] = "NO_TAPE"
         return row
     # fill at call+latency
-    fill = fill_mcq = None
+    fill = fill_mc_usd = None
     for ts, px, mcq, action, qa in g:
         if ts >= call_ts * 1000 + LATENCY_MS:
             fill = px
-            fill_mcq = mcq * SOLUSD
+            fill_mc_usd = mcq * SOLUSD   # marketCapQuote is SOL; USD for tier_for (4th audit 8.3 — unit EXPLICIT)
             row["fill_s"] = (ts - call_ts * 1000) / 1000.0
             break
     if fill is None:
         row["outcome"] = "NO_FILL"
         return row
-    row["fill_mc"] = round(fill_mcq, 2) if fill_mcq else None
+    row["fill_mc"] = round(fill_mc_usd, 2) if fill_mc_usd else None
+    row["fill_mc_unit"] = "USD"
     if call_mc:
-        row["entry_gap_pct"] = round((fill_mcq - call_mc) / call_mc * 100, 1) if fill_mcq else None
+        row["entry_gap_pct"] = round((fill_mc_usd - call_mc) / call_mc * 100, 1) if fill_mc_usd else None
     # P12/P5 (Oct 20): metrics OUTCOME walk must start at FILL (not call0) — the
     # desk buys at the modeled fill; pre-fill prices are not tradeable. Metrics
     # (bs5m/act60) use pre-fill window only (no look-ahead; see deep_audit P5).
@@ -151,7 +152,7 @@ def audit(mint, call_ts, call_mc, sym, chan):
     try:
         sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
         from position_monitor import EXIT_TIERS, tier_for
-        _t = tier_for(fill_mcq or row.get("call_mc") or 0)
+        _t = tier_for(fill_mc_usd or row.get("call_mc") or 0)
         tp1, tp2 = float(_t[1]), float(_t[2])
         stop = float(_t[3])  # stop FRACTION below entry (0.25 = 0.75x stop)
     except Exception:

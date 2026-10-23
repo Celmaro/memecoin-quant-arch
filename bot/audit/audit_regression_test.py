@@ -564,7 +564,7 @@ try:
 
     # 2.4: notifier must NOT advance watermark when MAX_POST capped the run
     _nt24 = open("/home/agentuser/.hermes/profiles/profile-b4632e6cdb854166b696555ae7ff4239/scripts/call_notifier.py").read()
-    check("R24 notifier capped-run watermark guard", "len(out) < MAX_POST" in _nt24, True)
+    check("R24 notifier capped-run watermark guard", "calls_delivered < MAX_POST" in _nt24, True)
 
     # 5.1: GoPlus transfer_hook routed through _gp_flag (no '0'-string truthiness)
     _dc24 = open("/home/agentuser/memecoin-quant/desk_common.py").read()
@@ -624,6 +624,94 @@ try:
     check("R24 scan_log index migration", "idx_scan_log_mint_ts" in _dc24, True)
 except Exception as e:
     check("R24 third-audit lock", "ERR " + str(e)[:80], "no-exception")
+
+# --- Oct 23 FOURTH AUDIT (R25): mint/account classification, pool fallback,
+#     unified entry policy, non-zero equity, notifier per-call cap, instant
+#     lease, learner point-in-time/shadow, fee-on-proceeds research math,
+#     wallet_history index, cohort AND-eligibility, exit fee single source. ---
+try:
+    _dc25 = open("/home/agentuser/memecoin-quant/desk_common.py").read()
+    # 3.1: no substring mint heuristic — discriminator-only (assert on code
+    # fragments; the comment documenting the old bug legitimately quotes it)
+    check("R25 mint discriminator-only",
+          'is_mint = (parsed_type == "mint")' in _dc25
+          and 'and "mint" in str(data)' not in _dc25, True)
+    # 3.2: all-candidates-rejected returns UNKNOWN (None), never restored
+    check("R25 dex_pair all-rejected unknown",
+          "    if not sane:\n        return None" in _dc25
+          and "    pairs = sane or pairs" not in _dc25, True)
+    # 3.3: source observation time exposed on pumpdata snapshots
+    check("R25 pumpdata observed_at", '"observed_at": row_t' in _dc25, True)
+    # 9.2: wallet_history (mint, ts DESC) hot index
+    check("R25 wallet_history mint_ts index", "idx_wh_mint_ts" in _dc25, True)
+
+    _pt25 = open("/home/agentuser/memecoin-quant/paper_tick.py").read()
+    # 4.1: unified buy-all policy — no AEGIS veto/boost in CODE (comments may
+    # document the history; assert on the executable statements only)
+    check("R25 no aegis veto", 'return None, f"aegis_veto_score' not in _pt25
+          and "size *= aegis_boost" not in _pt25, True)
+    # 4.4: retraction pre-scan covers ALL lines, tail only for candidates
+    check("R25 retraction all-lines prescan", "all_lines = lines" in _pt25 and "for line in all_lines:" in _pt25, True)
+    # 5.1: equity never values unmarked position at zero
+    check("R25 equity last-mark", "last_mark_px" in _pt25 and "equity_quality" in _pt25
+          and "unmarked" in _pt25, True)
+
+    _nt25 = open("/home/agentuser/.hermes/profiles/profile-b4632e6cdb854166b696555ae7ff4239/scripts/call_notifier.py").read()
+    # 4.2: cap counts CALLS not lines; keys retained in add order
+    check("R25 notifier calls-cap", "calls_delivered >= MAX_POST" in _nt25
+          and "len(out) >= MAX_POST" not in _nt25, True)
+    check("R25 notifier recency keys", "st[\"handled_keys\"] = ordered[-400:]" in _nt25
+          and "st[\"handled_keys\"] = sorted(handled)[-400:]" not in _nt25, True)
+
+    _it25 = open("/home/agentuser/memecoin-quant/instant_trigger.py").read()
+    # 4.3: IN_PROGRESS lease, CARD_SENT commit only after DM confirms
+    check("R25 instant lease", "instant_in_progress" in _it25 and "ok = send_dm" in _it25, True)
+
+    _al25 = open("/home/agentuser/memecoin-quant/aegis_learn.py").read()
+    # 7.1: point-in-time EARLIEST scan; labels separated; shadow mode default
+    check("R25 learner point-in-time", "v_sorted[0]  # earliest" in _al25, True)
+    check("R25 learner separated labels", "paper, shadow = {}, {}" in _al25
+          and "shadow_outcomes" in _al25, True)
+    check("R25 learner shadow-mode", "SHADOW MODE" in _al25 and "shadow_path" in _al25, True)
+    check("R25 learner holdout", "cut = max(1, int(len(joined) * 0.7))" in _al25, True)
+
+    _am25 = open("/home/agentuser/memecoin-quant/aegis_maintenance.py").read()
+    check("R25 maintenance shadow-only", '"aegis_learn.py"), "--apply"' not in _am25
+          and "SHADOW MODE" in _am25, True)
+
+    # 8.1/8.2: research scripts consume live tiers + fee-on-PROCEEDS math
+    _da25 = open("/home/agentuser/memecoin-quant/bot/audit/deep_audit.py").read()
+    check("R25 deep_audit tier_at_fill", "tier_for(float(row.get(\"call_mc\") or 0))" in _da25, True)
+    check("R25 deep_audit proceeds fee", "tp1 * (1 - FEE) - 1.0" in _da25, True)
+    _ff25 = open("/home/agentuser/memecoin-quant/bot/audit/flow_filter_audit.py").read()
+    check("R25 flow_filter proceeds fee", "stop_mult * (1 - FEE) - 1.0" in _ff25
+          and "tier_for(float(call_mc)" in _ff25, True)
+    _tc25 = open("/home/agentuser/memecoin-quant/bot/audit/tape_coins_audit.py").read()
+    check("R25 tape_coins explicit USD", "fill_mc_usd" in _tc25 and "fill_mc_unit" in _tc25, True)
+
+    # 5.2: exit-intel consumes the executor fee (single source)
+    _ei25 = open("/home/agentuser/memecoin-quant/bot/intelligence/exit_intel.py").read()
+    check("R25 exit fee single source", "from bot.position_manager.scaleout import PAPER_FEE_PCT" in _ei25
+          and "FEE_BPS = 1.7" not in _ei25, True)
+
+    # 5.3: max-hold honest naming; 5.8: cohort AND-eligibility
+    _pm25 = open("/home/agentuser/memecoin-quant/position_monitor.py").read()
+    check("R25 MAX_LOSER_HOLD alias", "MAX_LOSER_HOLD_S = MAX_HOLD_S" in _pm25, True)
+    _coh25 = open("/home/agentuser/memecoin-quant/bot/intelligence/cohort.py").read()
+    check("R25 cohort AND-eligibility",
+          ">= FILTERS[\"min_win_rate\"] and (w[\"realized_pnl_usd\"] or 0) > 0" in _coh25, True)
+
+    # 3.4: pumpdata paywall skips stall circuit
+    _pf25 = open("/home/agentuser/memecoin-quant/pumpdata_feed.py").read()
+    check("R25 pumpdata paywall stall skip", "_STREAM_PAYWALLED" in _pf25
+          and "if not _STREAM_PAYWALLED and time.time() - seen" in _pf25, True)
+
+    # 6.2: good-prefix registry covers real positive emitters
+    _ag25 = open("/home/agentuser/memecoin-quant/aegis.py").read()
+    check("R25 good-prefix positives", "holder_growth_" in _ag25 and "trusted_token" in _ag25
+          and "micro_cvd_pos_" in _ag25, True)
+except Exception as e:
+    check("R25 fourth-audit lock", "ERR " + str(e)[:80], "no-exception")
 
 print()
 print("FAILURES:", failures if failures else "NONE — all decision-engine regressions pass")

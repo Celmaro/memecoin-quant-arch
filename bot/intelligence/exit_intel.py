@@ -11,7 +11,15 @@ import os, sys, time
 sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
 from desk_common import dex_pair
 
-FEE_BPS = 1.7  # desk execution estimate (%.3f = ~1.7%)
+# 4th audit 5.2 (Oct 23): FEE_BPS used to be a hardcoded 1.7 while the paper
+# EXECUTOR books PAPER_FEE_PCT=3.0 — exit-intel's executable-value estimate and
+# the book's PnL disagreed by 1.3% on every exit. ONE fee source: the executor.
+try:
+    sys.path.insert(0, os.path.expanduser("~/memecoin-quant"))
+    from bot.position_manager.scaleout import PAPER_FEE_PCT
+    FEE_BPS = PAPER_FEE_PCT
+except Exception:
+    FEE_BPS = 3.0  # mirror scaleout.PAPER_FEE_PCT fallback
 
 def _jupiter_impact(mint, qty_raw):
     """Best-effort SELL-side price impact for the ACTUAL raw token quantity held.

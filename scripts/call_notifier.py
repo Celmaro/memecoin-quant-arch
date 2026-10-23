@@ -128,9 +128,15 @@ def main():
     # MAX_POST capped it this run.
     fresh.sort(key=lambda c: float(c.get("ts") or 0))
     handled = set(st.get("handled_keys") or [])
+    # 4th audit 4.2 (Oct 23): retain handled keys by ADD ORDER (recency), not
+    # lexical sort — sorted(handled)[-400:] could drop the most-recently processed
+    # keys and redeliver them on a held-watermark burst. Order list mirrors the
+    # set; saved slice keeps the newest 400.
+    handled_order = list(st.get("handled_keys") or [])
     out = []
     instant = set(st.get("instant_sent") or [])
     max_fresh_ts = max(float(c.get("ts") or 0) for c in fresh)
+    calls_delivered = 0  # 4th audit 4.2: cap counts CALLS, not output lines
     for c in fresh:
         mint = c.get("mint") or "?"
         key = f"{mint}:{c.get('msg_id') or c.get('ts') or ''}"
@@ -138,9 +144,9 @@ def main():
             continue
         if mint in instant:
             # already carded instantly — mark handled, never re-deliver
-            handled.add(key)
+            handled.add(key); handled_order.append(key)
             continue
-        if len(out) >= MAX_POST:
+        if calls_delivered >= MAX_POST:
             break  # leave the rest for the next run (watermark only max_fresh_ts)
         chan = (c.get("channel") or "?").replace("Trending", "").replace("trending", "")
         sym, mc = c.get("symbol"), None
@@ -176,6 +182,8 @@ def main():
         # P9: this call is fully handled (carded + entry attempted) — mark it so a
         # future run never re-delivers it, even if the watermark sits at the same ts.
         handled.add(key)
+        handled_order.append(key)
+        calls_delivered += 1
 
     # P9: watermark advances to the max ts of ALL fresh rows — a >4 same-ts burst
     # keeps the unconsumed tail eligible next run (they were NOT marked handled).
@@ -202,8 +210,14 @@ def main():
         # rows are deduped by handled_keys (capped durability, recent keys
         # survive), and the unconsumed tail is finally picked up. The watermark
         # only advances to max_fresh_ts when the cap did NOT bind.
-        st["last_ts"] = max(st.get("last_ts", 0), max_fresh_ts if (not out or len(out) < MAX_POST) else st.get("last_ts", 0))
-        st["handled_keys"] = sorted(handled)[-400:]  # capped durability
+        st["last_ts"] = max(st.get("last_ts", 0), max_fresh_ts if (not out or calls_delivered < MAX_POST) else st.get("last_ts", 0))
+        # 4th audit 4.2: keep the newest 400 keys IN ADD ORDER (dedupe), not the
+        # lexically-highest 400. Lexical sort dropped recent keys on bursts.
+        _seen, ordered = set(), []
+        for _k in handled_order:
+            if _k not in _seen:
+                _seen.add(_k); ordered.append(_k)
+        st["handled_keys"] = ordered[-400:]
         save_state(st)
     else:
         print("[delivery FAILED — watermark NOT advanced; retrying next run]")

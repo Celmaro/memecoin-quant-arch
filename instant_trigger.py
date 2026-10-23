@@ -74,14 +74,27 @@ def main():
         # consumed check: was this mint already carded?
         sys.path.insert(0, "/home/agentuser/.hermes/profiles/profile-b4632e6cdb854166b696555ae7ff4239/scripts")
         from call_notifier import deep_aegis_card, send_dm, load_state, save_state
-        # mark consumed BEFORE the slow AEGIS build so the 1m cron never double-sends
+        # 4th audit 4.3 (Oct 23): the OLD code appended to instant_sent BEFORE the
+        # slow AEGIS build + DM send. A crash/provider hang between the state write
+        # and the send made later runs believe the card was already delivered —
+        # at-most-once mistaken for reliable delivery. Now: claim an IN_PROGRESS
+        # lease (with expiry) for concurrent dedupe, and only commit CARD_SENT
+        # AFTER Telegram confirms. A stale IN_PROGRESS lease (crash) expires and
+        # is reclaimed by the next run; entry idempotency is independent and stays
+        # in paper_tick's consumed ledger.
         st = load_state()
         st.setdefault("instant_sent", [])
+        st.setdefault("instant_in_progress", {})   # mint14 -> lease_expiry_ts
+        now_t = time.time()
+        _in_prog = st["instant_in_progress"]
+        # reclaim crashed leases older than 15 min
+        for _k in [k for k, v in _in_prog.items() if (v or 0) < now_t - 900]:
+            _in_prog.pop(_k, None)
         if mint[:14] in st["instant_sent"][-200:]:
             return 0
-        st["instant_sent"].append(mint[:14])   # normalize: dedupe lookup uses raw mint
-        st["instant_sent"] = [m[:14] for m in st["instant_sent"] if m]
-        st["instant_sent"] = st["instant_sent"][-200:]
+        if mint[:14] in _in_prog:
+            return 0  # another worker is mid-flight (lease alive)
+        _in_prog[mint[:14]] = now_t + 900  # 15-min lease
         save_state(st)
 
         # find the call record (symbol/mc/ts) from calls.jsonl
@@ -115,9 +128,27 @@ def main():
         except Exception as e:
             out.append(f"⚠ auto-buy error {mint[:8]}: {str(e)[:60]}")
 
-        send_dm("\n\n".join(out))
+        ok = send_dm("\n\n".join(out))
+        if ok:
+            # COMMIT only after Telegram confirmed — the card is truly delivered.
+            st = load_state()  # reload: another worker may have saved since
+            st.setdefault("instant_sent", [])
+            st.setdefault("instant_in_progress", {})
+            st["instant_sent"] = [m[:14] for m in st["instant_sent"] + [mint[:14]] if m][-200:]
+            st["instant_in_progress"].pop(mint[:14], None)
+            save_state(st)
+        else:
+            # send failed — leave a fresh lease so a retry is possible and the
+            # cron notifier can re-card. Drop the claim from instant_sent.
+            st = load_state()
+            st.setdefault("instant_in_progress", {})
+            st["instant_in_progress"].pop(mint[:14], None)
+            save_state(st)
+            print("instant_trigger: DM send FAILED — card NOT committed; retry possible", file=sys.stderr)
         return 0
     finally:
+        # release the concurrency slot (not the delivery lease — that was handled
+        # above, or expires) so a fresh claim can run
         try:
             os.remove(slot)
             # also drop any stale legacy single-lock file from the pre-slot era

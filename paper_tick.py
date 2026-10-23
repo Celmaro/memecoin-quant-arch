@@ -128,11 +128,27 @@ def _save_book_guarded(b):
 # could still be bought right after the -$20 day. Persist stop_until in the book
 # and gate BOTH entry paths on it (checked before any quote/network work).
 STOP_HOURS = 24.0
+# Oct 22 USER RESET: manual_stop_reset lifts the armed stop, but only for a
+# window (24h) — after that the -$20/day protection resumes. A permanent
+# disable would silently delete the approved 3rd-audit 2.1 kill-switch.
+RESET_OVERRIDE_S = 24 * 3600
+
+def _reset_fresh(b):
+    """True when a manual user reset is currently in its override window."""
+    try:
+        r = float(b.get("manual_stop_reset") or 0)
+        return 0 < r and (time.time() - r) < RESET_OVERRIDE_S
+    except Exception:
+        return False
 
 def daily_stop_active(b=None):
     """True while the daily-loss stop is in effect (stop_until in the future)."""
     try:
         b = b if b is not None else load_book()
+        # USER RESET (Oct 22): manual_stop_reset (epoch ts) disables the stop —
+        # the engine must NOT re-arm over a user override mid-day.
+        if _reset_fresh(b):
+            return False
         until = float(b.get("stop_until") or 0)
         return until > time.time()
     except Exception:
@@ -354,24 +370,31 @@ def _auto_buy_locked():
     # audit P0.2: also skip mints already consumed as entries (durable ledger)
     consumed = _consumed_mints()
     try:
-        lines = open("/home/agentuser/memecoin-quant/calls.jsonl").read().strip().split("\n")[-80:]
+        lines = open("/home/agentuser/memecoin-quant/calls.jsonl").read().strip().split("\n")
     except FileNotFoundError:
         return []
-    # FIX #7: calls.jsonl is NOT chronological (54 order violations in last 100).
-    # Sort ALL candidate lines by post time descending, then walk newest-first with a
-    # proper age cutoff — never `break` on a stray old line in the middle.
+    # 4th audit 4.4 (Oct 23): the old code read ONLY the last 80 lines and then
+    # built the retracted-mint set from that slice — a retraction marker older
+    # than 80 rows back could be missed while its related original call (inside
+    # the slice) stayed buyable. Retraction is a correctness contract: pre-scan
+    # ALL lines for markers (cheap, one pass), keep the 80-line tail for the
+    # age-gated CALL candidates below. JSONL is an audit log, not our canonical
+    # mutable store — this is the belt for the current file shape.
+    all_lines = lines
+    tail = lines[-80:] if len(lines) > 80 else lines
     # P8 (Oct 20): retraction markers carry ts but NO dt — the old `if d.get("dt")`
     # filter silently dropped the marker and kept the ORIGINAL row buyable in the
     # cron path. Pre-scan ALL lines for retraction markers FIRST and build a
     # retracted-mint set; any call for those mints is skipped regardless of row.
     retracted_mints = set()
-    for line in lines:
+    for line in all_lines:
         try:
             _r = _j.loads(line)
         except Exception:
             continue
         if (_r.get("retracted") or _r.get("dead")) and _r.get("mint"):
             retracted_mints.add(_r["mint"])
+    lines = tail  # age-gated candidates below use the fresh tail only
     def _ts(d):
         # Prefer the epoch `ts` field (telethon writes msg.date.timestamp() — unambiguous).
         # Fall back to parsing `dt` (crawler records may only have dt).
@@ -582,14 +605,14 @@ def _entry_call_locked(d, b=None, aegis_score=None):
     AEGIS deep card, without waiting for paper_tick's next cron.
     Returns (bought_line, skip_reason|None)."""
 
-    # Oct 20 audit policy: AEGIS is a veto/boost ONLY (never a rank filter).
-    # score < 30 = hard veto (the only band with real predictive power);
-    # score >= 70 = mild size boost; the 30-70 zone changes nothing.
-    if aegis_score is not None:
-        try:
-            aegis_score = float(aegis_score)
-        except Exception:
-            aegis_score = None
+    # AEGIS policy (4th audit 4.1, Oct 23): UNIFIED with auto_buy — AEGIS never
+    # gates an entry. The user's mandate is buy-all-curated-calls; auto_buy's
+    # documented policy is "NO model grade / AI score ever gates an entry".
+    # Round 3 wired aegis_score into the instant path but left a <30 VETO and a
+    # 70+ BOOST here, creating a silent split: the instant path could report
+    # "aegis_veto_score_29" while the cron path bought the same call minutes
+    # later. AEGIS is alert/exit CONTEXT only (still passed for the card); the
+    # score never changes the buy decision or the size in either path now.
     import json as _j
     b = b if b is not None else load_book()
     if not b.get("autobuy", True):
@@ -628,11 +651,8 @@ def _entry_call_locked(d, b=None, aegis_score=None):
         return None, "already_consumed"
     # AEGIS veto (audit policy Oct 20): <30 = hard veto, 70+ = mild size boost.
     # Applies AFTER dedupe so consumed/holding mints aren't double-logged.
-    if aegis_score is not None and aegis_score < 30:
-        return None, f"aegis_veto_score_{aegis_score:.0f}"
-    aegis_boost = 1.0
-    if aegis_score is not None and aegis_score >= 70:
-        aegis_boost = 1.25  # mild position-size boost on strong contract/live signals
+    # AEGIS policy unified (4th audit 4.1): buy-all mandate — NO veto, NO size
+    # boost from AEGIS in either entry path. aegis_score stays as card context.
     mkt = market_for(mint) or {}
     liq = ((mkt.get("liquidity") or {}).get("usd")) or 0
     # P12 (Oct 20): first-seen MC extension gate — never chase a coin that has
@@ -702,7 +722,7 @@ def _entry_call_locked(d, b=None, aegis_score=None):
     except Exception:
         conf = 1
     size = 25.0 if conf >= 2 else 20.0
-    size *= aegis_boost  # 70+ AEGIS: +25% position (Oct 20 policy)
+    size *= 1.0  # unified buy-all sizing (4th audit 4.1): no AEGIS size boost
     size = min(size, b["cash"])
     if size < 10:
         b.setdefault("skipped", []).append({"ts": time.time(), "symbol": sym, "mint": mint,
@@ -817,6 +837,12 @@ def _main_locked():
             continue
         px = float(px)
         _prices[mint] = px
+        # 4th audit 5.1 (Oct 23): persist last-valid mark on the position, so a
+        # deferred/no-market/tick-timeout position still contributes its last
+        # knowable value to equity instead of being silently valued at ZERO.
+        p["last_mark_px"] = px
+        p["last_mark_ts"] = time.time()
+        p["last_mark_source"] = mkt.get("source") or "dex"
         mc = mkt.get("marketCap") or 0
         mult = px / p["entry_px"]
         entry_usd = p["size_usd"]
@@ -1072,16 +1098,32 @@ def _main_locked():
     # position with NO deadline — with 74 open positions it blew the supervisor's
     # 120s subprocess timeout on every tick (desk silent for hours, heartbeats
     # stale). Now reuse the prices already fetched in the main loop.
+    # 4th audit 5.1 (Oct 23): NEVER value an open position at zero just because
+    # it had no mark THIS tick (deferred/no-market/deadline). Use the persisted
+    # last-valid mark; flag equity quality so a partial-mark account is never
+    # presented as one exact-looking value.
     openval = 0.0
+    unmarked = 0
+    oldest_mark_age = 0.0
     for mint, p in b["positions"].items():
         px = _prices.get(mint)
         if px and p.get("entry_px"):
             openval += p["size_usd"] * float(px) / p["entry_px"]
+        elif p.get("last_mark_px") and p.get("entry_px"):
+            openval += p["size_usd"] * float(p["last_mark_px"]) / p["entry_px"]
+            age = time.time() - float(p.get("last_mark_ts") or time.time())
+            oldest_mark_age = max(oldest_mark_age, age)
+        else:
+            unmarked += 1
+            # no mark EVER recorded — zero contribution but COUNTED, never silent
     cash = b.get("cash", 0.0)
     eq = cash + openval
     b["realized"] = round(b.get("realized", 0.0), 2)
     b["cash"] = round(cash, 2)
     b["equity"] = round(eq, 2)
+    b["equity_quality"] = "COMPLETE" if unmarked == 0 else "PARTIAL"
+    b["unmarked_positions"] = unmarked
+    b["oldest_mark_age_s"] = round(oldest_mark_age, 0)
     save_book(b)
     gain = eq - b["start"]
     gpct = gain / b["start"] * 100
@@ -1116,7 +1158,8 @@ def _main_locked():
         # first tick that crosses -$20 arms stop_until (24h); entry paths
         # (auto_buy/entry_call) check it before any quote work. Only re-arm
         # (extend) when still bleeding — do NOT shrink an existing stop.
-        if day_pnl <= -20:
+        # Oct 22 USER RESET: manual_stop_reset set → do not re-arm either.
+        if day_pnl <= -20 and not _reset_fresh(b):
             day_note += " 🛑 DAILY STOP — no new entries 24h"
             if float(b.get("stop_until") or 0) < time.time() + STOP_HOURS * 3600:
                 b["stop_until"] = time.time() + STOP_HOURS * 3600

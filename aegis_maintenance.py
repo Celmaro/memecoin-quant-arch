@@ -91,14 +91,18 @@ def main():
         con.commit()
     con.close()
 
-    # 7. LEARNING REFRESH (Oct 19): recompute empirical weight overrides from the
-    # latest outcomes. aegis_learn.py is read-only except the overrides file; a
-    # failure here never blocks the rest of maintenance.
+    # 7. LEARNING REFRESH (Oct 19 → 4th audit 6.5/7.1, Oct 23): recompute empirical
+    # weight overrides from the latest outcomes, but ONLY in SHADOW MODE — the
+    # learner had target leakage (post-entry scans) + mixed label sources, so its
+    # deltas are not trusted for auto-application. Shadow file is written; the
+    # LIVE overrides stay frozen until a human reviews holdout agreement and
+    # runs `aegis_learn.py --apply` explicitly. aegis_learn.py is read-only
+    # except the shadow file; a failure here never blocks the rest of maintenance.
     lr = "not_run"
     if not DRY:
         try:
             import subprocess
-            p = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "aegis_learn.py"), "--apply"],
+            p = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "aegis_learn.py")],
                                capture_output=True, text=True, timeout=70)
             # 3rd audit 7.2: check returncode — a crashed learner (missing table,
             # traceback) used to be parsed as "no deltas written" = silent success
@@ -109,7 +113,7 @@ def main():
                 report["learning_error"] = (p.stderr or p.stdout or "")[-200:]
             else:
                 for ln in (p.stdout or "").splitlines():
-                    if "wrote" in ln:
+                    if "SHADOW MODE" in ln or "wrote" in ln:
                         lr = ln.strip()
                     if "delta=" in ln:
                         n += 1

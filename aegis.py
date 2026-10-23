@@ -885,7 +885,14 @@ def score_coin(mint, deep=False):
                       "ws_hot_buys", "ws_buy_pressure", "fill_people", "fill_very_slow",
                       "churn_retention_high", "fresh_wallet_power_", "cohort_accumulation",
                       "deployer_wi_strong", "blix_dev_board", "blix_sniper_board", "ave_wallets",
-                      "whale_holds_accum", "blix_sol_strong", "deep_pool_liq")
+                      "whale_holds_accum", "blix_sol_strong",
+                      # 4th audit 6.2 (Oct 23): positive-weighted flags missing from the
+                      # registry were counted in cat_bad even though score_coin ADDS points
+                      # for them — the explanation card contradicted the score. Additions
+                      # verified against score_coin's actual `flags.append` sites below:
+                      #   deep_pool_liq_mc_* (+3 liq), holder_growth_* (+5),
+                      #   trusted_token (+10), micro_cvd_pos_* (+6)
+                      "deep_pool_liq_mc_", "holder_growth_", "trusted_token", "micro_cvd_pos_")
     cat_bad = {k: sum(1 for f in flags if any(f.startswith(p) for p in CAT[k])
                       and not any(f.startswith(g) for g in _GOOD_PREFIXES))
                for k in CAT}

@@ -51,6 +51,7 @@ _state = {}                   # mint -> market dict
 _last_block = 0               # last seen Solana slot for sinceSlot resume
 _changed = False
 _PLAN_REQUIRED_LOGGED = False  # Shrine trade-stream paywall (Oct 22): log once
+_STREAM_PAYWALLED = False      # 4th audit 3.4: true = trade stream paywalled → skip stall circuit
 _cache_lock = threading.Lock()
 
 
@@ -223,7 +224,10 @@ def run():
                         # Data Stream" needs Lite/Developer. REPORT ONCE + keep the
                         # free SOL-price channel; paper_tick falls back to the free
                         # DexScreener/Gecko polling path (desk_common.dex_pair).
-                        global _PLAN_REQUIRED_LOGGED
+                        # 4th audit 3.4: mark the paywall so the stall circuit is
+                        # skipped — a 60s-reconnect loop against a paywall is churn.
+                        global _PLAN_REQUIRED_LOGGED, _STREAM_PAYWALLED
+                        _STREAM_PAYWALLED = True
                         if not _PLAN_REQUIRED_LOGGED:
                             _PLAN_REQUIRED_LOGGED = True
                             _log("TRADE STREAM PAYWALLED (plan_required — Shrine needs "
@@ -258,6 +262,22 @@ def run():
         def on_any(ev, data):
             if ev not in ("stream", "connect", "disconnect", "sol_price"):
                 _log(f"ev {ev}: {str(data)[:120]}")
+
+        @sio.on("sol_price")
+        def on_sol_price(data):
+            # 4th audit 3.4 (Oct 23): the stall watchdog refreshed ONLY on
+            # trade-stream events. With the trade stream paywalled (plan_required)
+            # the free SOL-price channel is our only live signal — it must keep
+            # the heartbeat alive or the daemon reconnects every 60s forever.
+            seen["last_evt"] = time.time()
+            try:
+                v = (data or {}).get("snapshot") or {}
+                if v.get("priceUSD"):
+                    global _SOL_USD, _changed
+                    _SOL_USD = float(v["priceUSD"])
+                    _changed = True
+            except Exception:
+                pass
 
         return sio, seen
 
@@ -299,7 +319,13 @@ def run():
                 # stall watchdog (Oct 20): the transport can die silently
                 # ("packet queue is empty" without a disconnect event) — if no
                 # stream event for 60s, break out and force a fresh cycle.
-                if time.time() - seen["last_evt"] > 60:
+                # 4th audit 3.4 (Oct 23): when the trade stream is PAYWALLED the
+                # stream is legitimately event-silent forever (probe: Shrine does
+                # NOT push periodic sol_price events — one snapshot per subscribe
+                # emit). Reconnecting every 60s is pure churn against a paywall:
+                # skip the stall circuit while plan_required is known and keep
+                # feeding the keepalive (which also re-acknowledges SOL price).
+                if not _STREAM_PAYWALLED and time.time() - seen["last_evt"] > 60:
                     _log("stall watchdog — no stream event for 60s, reconnecting")
                     break
         except Exception as ex:

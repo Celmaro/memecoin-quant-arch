@@ -104,24 +104,38 @@ def derive_flags(checks):
 
 
 def load_outcomes():
-    """Map mint -> outcome label from paper attribution + shadow followups."""
+    """Map mint -> (entry_anchor_ts, label) from paper attribution ONLY.
+
+    4th audit 7.1 (Oct 23): the old trainer majority-voted INCOMPATIBLE labels
+    (paper position_attribution + followups SURVIVED/DRAINED shadow rules with a
+    different horizon) into one win/loss, and treated ANY positive partial PnL as
+    a full win. Now:
+      - PRIMARY label = position_attribution.realized_pnl (one position-level
+        realized result; partial fills are aggregated by attribution at write time).
+      - paper_outcomes: {mint: (closed_at, label)} for the training signal.
+      - shadow_outcomes: followups SURVIVED/DRAINED kept SEPARATE and reported as
+        a shadow-only delta set — never mixed into the applied weights.
+      - win = realized_pnl > 0; losses and UNSELLABLE count as loss (realized<=0).
+    """
     db = sqlite3.connect(DB)
     cur = db.cursor()
-    out = {}
-    # paper outcomes: win = realized_pnl > 0
-    for mint, pnl in cur.execute(
-            "SELECT mint, realized_pnl FROM position_attribution"):
-        if mint:
-            out.setdefault(mint, []).append(1 if (pnl or 0) > 0 else 0)
-    # shadow outcomes: SURVIVED = win, DRAINED = loss
+    paper, shadow = {}, {}
+    for mint, pnl, closed_at in cur.execute(
+            "SELECT mint, realized_pnl, closed_at FROM position_attribution"):
+        if not mint:
+            continue
+        try:
+            label = 1 if (pnl or 0) > 0 else 0
+        except Exception:
+            continue
+        # one entry event per mint in this ledger — last close wins (idempotent)
+        paper[mint] = (float(closed_at or 0), label)
     for mint, oc in cur.execute(
             "SELECT mint, outcome FROM followups WHERE outcome IS NOT NULL"):
         if mint and oc in ("SURVIVED", "DRAINED"):
-            out.setdefault(mint, []).append(1 if oc == "SURVIVED" else 0)
+            shadow[mint] = 1 if oc == "SURVIVED" else 0
     db.close()
-    # multiple labels per mint: majority vote
-    return {m: (1 if sum(v) >= (len(v) + 1) // 2 else 0)
-            for m, v in out.items()}
+    return paper, shadow
 
 
 def load_scans():
@@ -153,37 +167,75 @@ def main():
         if a == "--min-n" and i + 1 < len(sys.argv):
             min_n = int(sys.argv[i + 1])
 
-    outcomes = load_outcomes()
+    paper_outcomes, shadow_outcomes = load_outcomes()
     scans = load_scans()
-    # use the MOST RECENT scan per mint (closest to entry); prefer stored flags
-    per_mint = {m: sorted(v, key=lambda x: x[0])[-1] for m, v in scans.items()}
+    # 4th audit 7.1: POINT-IN-TIME anchoring. The old code picked the MOST
+    # RECENT scan per mint — that scan can be AFTER entry or after meaningful
+    # market moves (monitoring rescan), leaking post-entry information into the
+    # feature vector. The desk scans a call when it arrives (pre-entry), so the
+    # EARLIEST scan per mint is the pre-decision snapshot. If a mint has only
+    # post-entry scans, we cannot build a point-in-time vector: skip it.
+    per_mint = {}
+    for m, v in scans.items():
+        v_sorted = sorted(v, key=lambda x: x[0])
+        per_mint[m] = v_sorted[0]  # earliest = pre-entry feature snapshot
 
-    joined = [(m, outcomes[m],
-               (per_mint[m][2] if per_mint[m][2] is not None else derive_flags(per_mint[m][1])))
-              for m in per_mint if m in outcomes]
-    base = sum(1 for _, w, _ in joined if w) / max(1, len(joined))
-    print(f"joined samples: {len(joined)}  base win rate: {base:.0%}")
+    joined = [(m, paper_outcomes[m][1],
+               (per_mint[m][2] if per_mint[m][2] is not None else derive_flags(per_mint[m][1])),
+               paper_outcomes[m][0])
+              for m in per_mint if m in paper_outcomes]
+    base = sum(1 for _, w, _, _ in joined if w) / max(1, len(joined))
+    print(f"joined paper samples: {len(joined)}  base win rate: {base:.0%}")
 
-    stats = defaultdict(lambda: [0, 0])  # flag -> [n, wins]
-    for _, win, flags in joined:
-        for f in set(flags):
-            stats[f][0] += 1
-            if win:
-                stats[f][1] += 1
+    # CHRONOLOGICAL HOLDOUT (4th audit 7.1): train on the first 70% by close
+    # time, validate sign-agreement on the last 30%. No shuffle — time order is
+    # the only honest split for adaptive weights.
+    joined.sort(key=lambda r: r[3])
+    cut = max(1, int(len(joined) * 0.7))
+    train, valid = joined[:cut], joined[cut:]
 
+    def lift_stats(sample):
+        st = defaultdict(lambda: [0, 0])
+        b = sum(1 for _, w, _, _ in sample if w) / max(1, len(sample))
+        for _, win, flags, _ in sample:
+            for f in set(flags):
+                st[f][0] += 1
+                if win:
+                    st[f][1] += 1
+        return st, b
+
+    stats, _ = lift_stats(train)
+    vstats, vbase = lift_stats(valid)
     deltas = {}
-    print(f"\n=== per-flag empirical lift (min_n={min_n}) ===")
+    shadow = {}
+    print(f"\n=== per-flag empirical lift (paper labels, min_n={min_n}, "
+          f"train={len(train)} / valid={len(valid)}) ===")
     for f, (n, w) in sorted(stats.items(), key=lambda kv: kv[1][1] / max(1, kv[1][0])):
         rate = w / max(1, n)
         if n >= min_n:
             lift = rate - base
-            # shrink toward 0 for small samples: n=8 -> 8/20 weight
             shrink = n / (n + 12)
-            delta = lift * 100 * shrink * 0.5  # half-scale; keep conservative
+            delta = lift * 100 * shrink * 0.5
             delta = max(-CLIP, min(CLIP, round(delta, 1)))
-            if abs(delta) >= 1.0:  # only material deltas
+            if abs(delta) >= 1.0:
                 deltas[f] = delta
-            print(f"  {f:38} n={n:3} win={rate*100:4.0f}% lift={lift*100:+5.1f}% delta={delta:+5.1f}")
+                # holdout agreement: does the sign hold on unseen time?
+                vn, vw = vstats.get(f, [0, 0])
+                vrate = vw / max(1, vn)
+                agree = "?"
+                if vn >= 3:
+                    vlift = vrate - vbase
+                    agree = "MATCH" if (delta > 0) == (vlift > 0) else "FLIP"
+                shadow[f] = {"delta": delta, "train_n": n, "train_win": round(rate, 3),
+                             "valid_n": vn, "valid_win": round(vrate, 3), "agree": agree}
+                print(f"  {f:38} n={n:3} win={rate*100:4.0f}% lift={lift*100:+5.1f}% "
+                      f"delta={delta:+5.1f}  valid_n={vn:3} valid_win={vrate*100:3.0f}% {agree}")
+
+    # shadow labels reported SEPARATELY, never mixed into deltas
+    if shadow_outcomes:
+        sbase = sum(1 for w in shadow_outcomes.values() if w) / max(1, len(shadow_outcomes))
+        print(f"\nshadow followup labels (NOT applied — separate horizon): n={len(shadow_outcomes)} "
+              f"base win={sbase:.0%}")
 
     if apply_overrides:
         with open(OVERRIDES, "w") as f:
@@ -192,8 +244,19 @@ def main():
                       f, indent=1)
         print(f"\nwrote {OVERRIDES} with {len(deltas)} deltas")
     else:
-        print(f"\n(no --apply: {len(deltas)} deltas computed, not written)")
-        print("run with --apply to write aegis_weight_overrides.json")
+        # 4th audit 6.5/7.1: SHADOW MODE default — the live overrides stay
+        # frozen until a human reviews the holdout agreement and runs --apply
+        # explicitly. Maintenance no longer auto-applies.
+        shadow_path = os.path.join(DESK, "aegis_weight_overrides.shadow.json")
+        with open(shadow_path, "w") as f:
+            json.dump({"generated_ts": __import__("time").time(),
+                       "mode": "SHADOW — NOT applied",
+                       "base_win": base, "train_n": len(train), "valid_n": len(valid),
+                       "flags": shadow, "deltas": deltas}, f, indent=1)
+        print(f"\n(SHADOW MODE: {len(deltas)} deltas computed, NOT applied. "
+              f"Reviewed output: {shadow_path})")
+        print("run with --apply to write aegis_weight_overrides.json (only after "
+              "reviewing holdout agreement)")
 
 
 if __name__ == "__main__":

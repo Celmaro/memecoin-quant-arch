@@ -261,7 +261,7 @@ def qualifying_cohort(snapshot_time=None, source="solanatracker", freshness_s=6 
     # intersection with doc filters: PnL>0 (all), win rate >= 45% (7d best proxy)
     set24 = {a for a, w in rows["24H_ROLLING"].items() if (w["realized_pnl_usd"] or 0) > 0}
     set7 = {a for a, w in rows["7D_ROLLING"].items()
-            if (w["win_rate"] or 0) >= FILTERS["min_win_rate"] or (w["realized_pnl_usd"] or 0) > 0}
+            if (w["win_rate"] or 0) >= FILTERS["min_win_rate"] and (w["realized_pnl_usd"] or 0) > 0}
     set30 = {a for a, w in rows["30D_ROLLING"].items() if (w["realized_pnl_usd"] or 0) > 0}
     inter = set24 & set7 & set30
     # enrich intersection candidates with wallet summaries for the hold-time filter

@@ -662,7 +662,14 @@ def dex_pair(mint, allow_fallback=True, timeout=20, retries=3):
         if med_px > 0 and px > 0 and px / med_px > 1000:
             continue  # cross-pair price outlier — mismatched pool artifact
         sane.append(p)
-    pairs = sane or pairs
+    # 4th audit 3.2 (Oct 23): NEVER restore the rejected list when every
+    # candidate fails the suspicious-pool filter (`pairs = sane or pairs`
+    # silently re-accepted the largest-liquidity rejected pool). An all-bad
+    # answer must be UNKNOWN so callers fall back or fail closed, not a
+    # plausible-looking poisoned price.
+    if not sane:
+        return None
+    pairs = sane
     pairs.sort(key=lambda p: (p.get("liquidity", {}).get("usd") or 0) + (p.get("volume", {}).get("h24") or 0), reverse=True)
     return pairs[0]
 
@@ -719,6 +726,10 @@ def pumpdata_market(mint, max_age_s=CACHE_TTL_S):
         "tokensInPool": row.get("B"),
         "quoteInPool": row.get("Q"),
         "source": "pumpdata",
+        # 4th audit 3.3 (Oct 23): expose the SOURCE observation time so consumers
+        # can compute true age instead of stamping request-start as fresh.
+        "observed_at": row_t,
+        "received_at": time.time(),
     }
 
 
@@ -879,14 +890,23 @@ def is_token_mint(address, timeout_cache=300):
         # 'parsed': {'info': {'decimals': N, 'isInitialized': bool}, 'type': 'mint'|'account'}}
         if isinstance(data, dict):
             parsed_type = (data.get("parsed") or {}).get("type")
-            prog = data.get("program") or ""
-            is_mint = parsed_type == "mint" or (prog in ("spl-token", "spl-token-2022") and "mint" in str(data))
+            # 4th audit 3.1 (Oct 23): trust the discriminator ONLY. A token
+            # ACCOUNT's parsed.info.mint field also contains the word "mint",
+            # so the old substring fallback `"mint" in str(data)` classified
+            # ATAs/token accounts as mints. A parsed account type is NOT a mint.
+            if parsed_type in ("mint", "account"):
+                is_mint = (parsed_type == "mint")
+            else:
+                # parsed_type unknown/missing — do not guess from a string search.
+                is_mint = None
             ttl_cache_put(("mint?", address), is_mint)
             return is_mint
-        # No parsed data (raw/base64) — fall back to owner check but exclude Metaplex
-        # metadata (which is NOT a mint) as a conservative guard.
-        ttl_cache_put(("mint?", address), False)
-        return False
+        # No parsed data (raw/base64) — UNKNOWN, not false: we cannot confirm a
+        # mint layout from the raw bytes here, and a wrong False freezes intake
+        # (Oct 20 lesson). Callers treat None as "unknown" and stay permissive;
+        # the freshness gate + scanner path still catch true wallets.
+        ttl_cache_put(("mint?", address), None)
+        return None
     except Exception:
         return False
 
@@ -1512,6 +1532,14 @@ def init_schema():
     # 3rd audit 7.4 (Oct 22): coverage indexes for the learner/holder-growth queries.
     try:
         con.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_mint_ts ON scan_log(mint, ts)")
+    except Exception:
+        pass
+    # 4th audit 9.2 (Oct 23): cohort_signal_for filters wallet_history by
+    # (mint, ts >= ?) — the PK (wallet, mint, ts) does NOT support a mint-first
+    # hot query and the table grows unbounded. Without this index the cohort
+    # signal was a full table scan.
+    try:
+        con.execute("CREATE INDEX IF NOT EXISTS idx_wh_mint_ts ON wallet_history(mint, ts DESC)")
     except Exception:
         pass
     con.commit(); con.close()

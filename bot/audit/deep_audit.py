@@ -107,7 +107,8 @@ def audit_call(c):
     entry_ts = c.get("ts") or 0
     raw = gather_tape(mint, entry_ts)
     g = clean(raw)
-    row = {"mint": mint, "sym": c.get("symbol"), "chan": c.get("channel") or c.get("source") or "", "ts": entry_ts}
+    row = {"mint": mint, "sym": c.get("symbol"), "chan": c.get("channel") or c.get("source") or "", "ts": entry_ts,
+           "call_mc": float(c.get("mc") or 0)}
     if not g:
         row.update({"outcome": "NO_TAPE", "lag_s": None, "push60": None, "act60": 0,
                     "first_trade_s": None, "fill_s": None, "pnl": None})
@@ -154,11 +155,13 @@ def audit_call(c):
     # the ladder runs forward). The old walk started at call0 (pre-fill prices).
     # 3rd audit 6.8: this file imported EXIT_TIERS but STILL hardcoded the dead
     # 1.10/1.30/0.15 ladder — the walk and the pnl proxy were both stale.
-    # Use the live base tier (single source of truth) for both.
+    # 4th audit 8.1 (Oct 23): round 3 left `EXIT_TIERS[0]` for EVERY trade; the
+    # LIVE monitor picks the tier from CURRENT MC each evaluation (tier_for).
+    # Select at the call's USD market cap so research matches the live policy.
     try:
-        from position_monitor import EXIT_TIERS
-        _t0 = EXIT_TIERS[0]  # (mc_min, tp1, tp2, stop_frac)
-        tp1, tp2, stop_frac = float(_t0[1]), float(_t0[2]), float(_t0[3])
+        from position_monitor import EXIT_TIERS, tier_for
+        _t = tier_for(float(row.get("call_mc") or 0))
+        tp1, tp2, stop_frac = float(_t[1]), float(_t[2]), float(_t[3])
     except Exception:
         tp1, tp2, stop_frac = 2.00, 2.50, 0.25  # fallback mirrors live base tier
     stop_mult = 1 - stop_frac
@@ -175,13 +178,15 @@ def audit_call(c):
     # pnl proxy from outcome — P10 (Oct 20) + 3rd audit 6.8: mirror the LIVE
     # ladder exactly. STOP pnl is stop_frac below entry (mult 1-stop_frac), not
     # (stop−1) = −85%: the old proxy booked every stop as an −82% catastrophe.
-    # Ladder: 50% clips at tp1, rest exits at tp2 or stop, 3% fee on proceeds.
+    # Ladder: 50% clips at tp1, rest exits at tp2, 3% fee on PROCEEDS (4th
+    # audit 8.2 — (mult-1)*(1-fee) overstates; correct is mult*(1-fee)-1).
+    FEE = 0.03
     if outcome == "TP2":
-        clip = 0.5 * (tp1 - 1.0) * (1 - 0.03)          # first half @ +tp1
-        rest = 0.5 * (tp2 - 1.0) * (1 - 0.03)          # second half @ +tp2
+        clip = 0.5 * (tp1 * (1 - FEE) - 1.0)      # first half sold at +tp1
+        rest = 0.5 * (tp2 * (1 - FEE) - 1.0)      # second half sold at +tp2
         row["pnl"] = round((clip + rest) * 100, 2)
     elif outcome == "STOP":
-        row["pnl"] = round((1.0 * (stop_mult - 1.0) * (1 - 0.03)) * 100, 2)
+        row["pnl"] = round((stop_mult * (1 - FEE) - 1.0) * 100, 2)
     else:
         row["pnl"] = 0.0   # OPEN — no realized exit in window
     return row
